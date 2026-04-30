@@ -25,9 +25,6 @@ from .config import (
 from .models import Location, WeatherMarket
 from .weather_client import WeatherClient
 
-# Celsius to Fahrenheit for normalisation
-_C_TO_F = lambda c: c * 9 / 5 + 32
-
 # Patterns for extracting weather signal from market titles
 _DEGREE_PATTERN = re.compile(
     r"(\d+(?:\.\d+)?)\s*°?\s*([CF])\b", re.IGNORECASE
@@ -68,7 +65,18 @@ _MONTH_NAME = re.compile(
     re.IGNORECASE,
 )
 
+_BELOW_WORDS = {"below", "under", "lower", "less"}
+
 UNPARSEABLE_LOG = Path("logs/unparseable_markets.csv")
+
+
+def _extract_direction(above_below_match) -> str:
+    """Return "below" or "above" from a matched _ABOVE_BELOW regex group."""
+    if above_below_match:
+        word = above_below_match.group(1).lower()
+        if any(w in word for w in _BELOW_WORDS):
+            return "below"
+    return "above"
 
 
 class WeatherMarketScanner:
@@ -151,6 +159,7 @@ class WeatherMarketScanner:
 
         threshold_high: float | None = None
         forecast_start_date: date | None = None
+        above_below = _ABOVE_BELOW.search(title)
 
         if is_precip and not is_temp:
             metric = "precipitation_sum"
@@ -158,8 +167,7 @@ class WeatherMarketScanner:
             if range_match:
                 lo_raw = float(range_match.group(1))
                 hi_raw = float(range_match.group(2))
-                unit = range_match.group(3).lower()
-                factor = 25.4 if unit.startswith("in") else 1.0
+                factor = 25.4 if range_match.group(3).lower().startswith("in") else 1.0
                 threshold = lo_raw * factor
                 threshold_high = hi_raw * factor
                 direction = "range"
@@ -167,18 +175,10 @@ class WeatherMarketScanner:
                 single_match = _PRECIP_THRESHOLD.search(title)
                 if not single_match:
                     return None
-                threshold_raw = float(single_match.group(1))
-                unit = single_match.group(2).lower()
-                factor = 25.4 if unit.startswith("in") else 1.0
-                threshold = threshold_raw * factor
-                above_below = _ABOVE_BELOW.search(title)
-                if above_below:
-                    word = above_below.group(1).lower()
-                    direction = "below" if any(w in word for w in ["below", "under", "lower", "less", "or below"]) else "above"
-                else:
-                    direction = "above"
+                factor = 25.4 if single_match.group(2).lower().startswith("in") else 1.0
+                threshold = float(single_match.group(1)) * factor
+                direction = _extract_direction(above_below)
         else:
-            # Temperature markets: extract °C/°F threshold
             exact_match = _EXACT_TEMP.search(title)
             degree_match = exact_match or _DEGREE_PATTERN.search(title)
             if not degree_match:
@@ -186,19 +186,14 @@ class WeatherMarketScanner:
 
             threshold_raw = float(degree_match.group(1))
             unit = degree_match.group(2).upper()
-            threshold_c = threshold_raw if unit == "C" else (threshold_raw - 32) * 5 / 9
+            threshold = threshold_raw if unit == "C" else (threshold_raw - 32) * 5 / 9
 
-            above_below = _ABOVE_BELOW.search(title)
             if exact_match and not above_below:
                 direction = "equal"
-            elif above_below:
-                word = above_below.group(1).lower()
-                direction = "below" if any(w in word for w in ["below", "under", "lower", "less", "or below"]) else "above"
             else:
-                direction = "above"
+                direction = _extract_direction(above_below)
 
             metric = "temperature_2m_max" if "high" in title.lower() else "temperature_2m_min"
-            threshold = threshold_c  # Store in Celsius
 
         # City extraction — try pattern match first, fall back to first capitalized sequence
         location = self._extract_location(title)
@@ -225,11 +220,8 @@ class WeatherMarketScanner:
         if days_out > 7 and metric == "precipitation_sum":
             month_m = _MONTH_NAME.search(title)
             if month_m:
-                month_names = ["january","february","march","april","may","june",
-                               "july","august","september","october","november","december"]
-                mo = month_names.index(month_m.group(1).lower()) + 1
-                yr = res_date.year
-                forecast_start_date = date(yr, mo, 1)
+                mo = datetime.strptime(month_m.group(1), "%B").month
+                forecast_start_date = date(res_date.year, mo, 1)
 
         return WeatherMarket(
             market_id=m.market_id,
@@ -250,7 +242,6 @@ class WeatherMarketScanner:
 
     def _extract_location(self, title: str) -> Location | None:
         """Try to find a city name in the title and geocode it."""
-        # Find all occurrences — use the last one (sub-market part is more specific)
         matches = _CITY_CANDIDATES.findall(title)
         if matches:
             city = matches[-1].strip()
@@ -258,7 +249,6 @@ class WeatherMarketScanner:
             if loc:
                 return loc
 
-        # Fallback: look for a capitalized word sequence before degree sign
         before_degree = title.split("°")[0] if "°" in title else title
         words = before_degree.split()
         for i, w in enumerate(words):

@@ -45,6 +45,7 @@ def run_scan(scanner: WeatherMarketScanner, generator: SignalGenerator, paper: P
     print(f"  [2/3] Evaluating {len(markets)} markets...", end=" ", flush=True)
     signals = [generator.evaluate(m) for m in markets]
     actionable = [s for s in signals if s.quality_gate_passed]
+    rejected = [s for s in signals if not s.quality_gate_passed]
     print(f"{len(actionable)} signals pass quality gates")
 
     if paper and actionable:
@@ -52,15 +53,12 @@ def run_scan(scanner: WeatherMarketScanner, generator: SignalGenerator, paper: P
         logged = [paper.log_trade(s) for s in actionable]
         print(f"{sum(1 for t in logged if t)} logged")
 
-    _print_scan_summary(signals)
+    _print_scan_summary(signals, actionable, rejected)
     return signals
 
 
-def _print_scan_summary(signals: list[Signal]) -> None:
+def _print_scan_summary(signals: list[Signal], actionable: list[Signal], rejected: list[Signal]) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
-    actionable = [s for s in signals if s.quality_gate_passed]
-    rejected = [s for s in signals if not s.quality_gate_passed]
-
     print(f"\n[{ts}] {len(signals)} evaluated  |  {len(actionable)} actionable  |  {len(rejected)} rejected")
 
     if actionable:

@@ -75,30 +75,8 @@ class ProbabilityModel:
         # Raw probability from full member pool
         raw_p = _fraction_satisfying(members, threshold, direction, threshold_high)
 
-        # KDE smoothing — skip for range markets (two-sided integral is handled separately)
-        if len(members) >= 10 and direction != "range":
-            try:
-                kde = gaussian_kde(members, bw_method="scott")
-                x_eval = np.linspace(min(members) - 20, max(members) + 20, 500)
-                density = kde(x_eval)
-                density /= density.sum()
-                if direction == "above":
-                    raw_p = float(density[x_eval >= threshold].sum())
-                elif direction == "below":
-                    raw_p = float(density[x_eval <= threshold].sum())
-                raw_p = float(np.clip(raw_p, 0.001, 0.999))
-            except Exception:
-                pass  # Fall back to raw fraction if KDE fails
-        elif len(members) >= 10 and direction == "range" and threshold_high is not None:
-            try:
-                kde = gaussian_kde(members, bw_method="scott")
-                x_eval = np.linspace(min(members) - 20, max(members) + 20, 500)
-                density = kde(x_eval)
-                density /= density.sum()
-                raw_p = float(density[(x_eval >= threshold) & (x_eval <= threshold_high)].sum())
-                raw_p = float(np.clip(raw_p, 0.001, 0.999))
-            except Exception:
-                pass
+        if len(members) >= 10:
+            raw_p = _apply_kde(members, threshold, direction, threshold_high, raw_p)
 
         calibrated_p = self._apply_calibration(raw_p)
 
@@ -187,6 +165,32 @@ class ProbabilityModel:
                 "model_p": round(model_p, 4),
                 "actual_outcome": int(actual_outcome),
             })
+
+
+def _apply_kde(
+    members: list[float],
+    threshold: float,
+    direction: str,
+    threshold_high: float | None,
+    fallback: float,
+) -> float:
+    """KDE-smoothed probability estimate. Returns fallback if KDE fails."""
+    try:
+        kde = gaussian_kde(members, bw_method="scott")
+        x_eval = np.linspace(min(members) - 20, max(members) + 20, 500)
+        density = kde(x_eval)
+        density /= density.sum()
+        if direction == "above":
+            p = float(density[x_eval >= threshold].sum())
+        elif direction == "below":
+            p = float(density[x_eval <= threshold].sum())
+        elif direction == "range" and threshold_high is not None:
+            p = float(density[(x_eval >= threshold) & (x_eval <= threshold_high)].sum())
+        else:
+            return fallback
+        return float(np.clip(p, 0.001, 0.999))
+    except Exception:
+        return fallback
 
 
 def _fraction_satisfying(

@@ -8,8 +8,9 @@ satisfying the condition — no assumptions about the distribution shape.
 
 from __future__ import annotations
 
+import calendar
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from functools import lru_cache
 from typing import Any
 
@@ -91,8 +92,6 @@ class WeatherClient:
             if totals:
                 model_means[model] = sum(totals) / len(totals)
 
-        # resolution_date isn't a single day — use end of month as target_date
-        import calendar
         last_day = calendar.monthrange(month_start.year, month_start.month)[1]
         target_date = date(month_start.year, month_start.month, last_day)
 
@@ -204,14 +203,8 @@ class WeatherClient:
         r.raise_for_status()
         data = r.json()
 
-        # Ensemble endpoint returns member columns: "temperature_2m_max_member01", etc.
         daily = data.get("daily", {})
-        target_str = target_date.isoformat()
-        time_index = None
-        if "time" in daily:
-            times = daily["time"]
-            if target_str in times:
-                time_index = times.index(target_str)
+        time_index = _find_time_index(daily, target_date)
 
         members: list[float] = []
         for key, values in daily.items():
@@ -251,9 +244,8 @@ class WeatherClient:
                                  timeout=OPEN_METEO_REQUEST_TIMEOUT)
                 r.raise_for_status()
                 daily = r.json().get("daily", {})
-                times = daily.get("time", [])
-                if target_str in times:
-                    idx = times.index(target_str)
+                idx = _find_time_index(daily, target_date)
+                if idx is not None:
                     vals = daily.get(metric, [])
                     if idx < len(vals) and vals[idx] is not None:
                         means[model] = float(vals[idx])
@@ -289,9 +281,6 @@ class WeatherClient:
         daily = r.json().get("daily", {})
         times = daily.get("time", [])
 
-        # Find indices for the requested date range
-        end_date = start_date
-        from datetime import timedelta
         date_strs = [(start_date + timedelta(days=i)).isoformat() for i in range(days)]
         indices = [times.index(d) for d in date_strs if d in times]
         if not indices:
@@ -319,7 +308,6 @@ class WeatherClient:
         Estimate full_month_total / first_7_days_total using historical archive data.
         Falls back to 30/7 naive ratio if archive lookup fails.
         """
-        import calendar
         last_day = calendar.monthrange(month_start.year, month_start.month)[1]
         naive_ratio = last_day / 7.0
 
@@ -355,6 +343,12 @@ class WeatherClient:
         avg_monthly = sum(monthly_totals) / len(monthly_totals)
         avg_first7 = sum(first7_totals) / len(first7_totals)
         return avg_monthly / avg_first7 if avg_first7 > 0 else naive_ratio
+
+
+def _find_time_index(daily: dict, target_date: date) -> int | None:
+    times = daily.get("time", [])
+    target_str = target_date.isoformat()
+    return times.index(target_str) if target_str in times else None
 
 
 @lru_cache(maxsize=256)
