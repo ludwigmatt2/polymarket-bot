@@ -1,0 +1,142 @@
+"""
+Shared dataclasses for the weather bot.
+Kept in one file to avoid circular imports.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import date, datetime
+from typing import Any
+
+
+@dataclass
+class Location:
+    city: str
+    lat: float
+    lon: float
+    timezone: str = "auto"
+    country: str = ""
+
+
+@dataclass
+class WeatherMarket:
+    market_id: str
+    title: str
+    yes_price: float        # Current market-implied P(YES)
+    liquidity_usd: float
+    resolution_date: datetime
+    resolution_source: str  # e.g. "NOAA", "Weather Underground"
+    location: Location
+    metric: str             # "temperature_2m_max", "precipitation_sum", etc.
+    threshold: float        # lower bound (or only bound for above/below markets)
+    threshold_high: float | None  # upper bound for range markets ("between X and Y")
+    direction: str          # "above", "below", "equal", or "range"
+    url: str
+    raw_title: str = ""     # Original title before parsing
+    # For monthly aggregate markets (>7d horizon), forecast is summed over a date window
+    forecast_start_date: "date | None" = None  # set for monthly markets
+
+
+@dataclass
+class EnsembleForecast:
+    lat: float
+    lon: float
+    target_date: date
+    metric: str
+    # Per-model member arrays: {"gfs_seamless": [88.1, 89.4, ...], ...}
+    member_arrays: dict[str, list[float]] = field(default_factory=dict)
+    # Deterministic per-model values for spread calculation
+    model_means: dict[str, float] = field(default_factory=dict)
+    fetched_at: datetime = field(default_factory=datetime.utcnow)
+
+    @property
+    def all_members(self) -> list[float]:
+        """Flat list of all ensemble member values across all models."""
+        result = []
+        for vals in self.member_arrays.values():
+            result.extend(vals)
+        return result
+
+    @property
+    def n_members(self) -> int:
+        return len(self.all_members)
+
+    @property
+    def ensemble_mean(self) -> float:
+        members = self.all_members
+        return sum(members) / len(members) if members else 0.0
+
+    @property
+    def ensemble_std(self) -> float:
+        """Spread across model means — proxy for forecast uncertainty."""
+        if len(self.model_means) < 2:
+            return 0.0
+        vals = list(self.model_means.values())
+        mean = sum(vals) / len(vals)
+        variance = sum((v - mean) ** 2 for v in vals) / len(vals)
+        return variance ** 0.5
+
+
+@dataclass
+class RawProbabilityResult:
+    raw_p: float                        # Fraction of ensemble members satisfying condition
+    calibrated_p: float                 # After isotonic correction (== raw_p if uncalibrated)
+    ensemble_spread: float              # Std of model means (uncertainty proxy)
+    n_members: int
+    is_calibrated: bool
+    model_breakdown: dict[str, float]   # Per-model sub-probabilities
+    threshold: float
+    direction: str
+    metric: str
+
+
+@dataclass
+class Signal:
+    market: WeatherMarket
+    model_p: float          # Calibrated model probability
+    market_p: float         # Current market price
+    edge_pp: float          # abs(model_p - market_p) — always positive
+    direction: str          # "YES" or "NO" (which contract to buy)
+    ensemble_spread: float
+    confidence_score: float # 1 - (spread / MAX_ENSEMBLE_SPREAD), for sizing
+    quality_gate_passed: bool
+    rejection_reason: str | None
+    signal_time: datetime
+    forecast: EnsembleForecast
+    prob_result: RawProbabilityResult
+
+
+@dataclass
+class PaperTrade:
+    trade_id: str
+    market_id: str
+    market_title: str
+    signal_time: datetime
+    entry_price: float      # Market price at signal time
+    model_p: float
+    direction: str          # "YES" or "NO"
+    size_usd: float
+    edge_pp: float
+    ensemble_spread: float
+    confidence_score: float
+    resolution_date: datetime
+    actual_outcome: bool | None = None
+    resolved_at: datetime | None = None
+    pnl_usd: float | None = None
+    brier_score: float | None = None
+
+
+@dataclass
+class PaperTradingStats:
+    total_trades: int
+    resolved_trades: int
+    win_rate: float
+    profit_factor: float        # sum(wins) / sum(losses) in USD
+    mean_brier_score: float
+    brier_skill_score: float    # 1 - (mean_brier / 0.25); 0 = climatology
+    total_paper_pnl: float
+    avg_edge_pp: float
+    max_drawdown_pct: float
+    ready_for_live: bool
+    failure_reasons: list[str]  # Why not ready, if applicable
