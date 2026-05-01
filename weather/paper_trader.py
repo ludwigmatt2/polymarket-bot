@@ -44,10 +44,15 @@ class PaperTrader:
     def log_trade(self, signal: Signal) -> PaperTrade | None:
         """
         Record a hypothetical trade entry. Returns the PaperTrade object.
-        Returns None if the signal gate did not pass.
+        Returns None if the signal gate did not pass or market already logged.
         """
         if not signal.quality_gate_passed:
             return None
+
+        existing = self._load_all()
+        for row in existing:
+            if row["market_id"] == str(signal.market.market_id) and row["direction"] == signal.direction:
+                return None
 
         trade = PaperTrade(
             trade_id=str(uuid.uuid4())[:8],

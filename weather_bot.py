@@ -7,11 +7,14 @@ Modes:
   paper    Continuous paper trading — scan + log signals (default)
   stats    Print paper trading dashboard and go-live gate status
   resolve  Interactively resolve outstanding paper trades with actual outcomes
+  debug    Print full model internals: 7-day ensemble, scaling ratio, projected totals
 
 Run:
   python weather_bot.py --mode scan
   python weather_bot.py --mode paper --interval 3600
   python weather_bot.py --mode stats
+  python weather_bot.py --mode debug
+  python weather_bot.py --mode debug --city Seoul
 """
 
 import argparse
@@ -76,6 +79,60 @@ def _print_scan_summary(signals: list[Signal], actionable: list[Signal], rejecte
         print(f"\n  Rejection reasons: {dict(sorted(reasons.items(), key=lambda x: -x[1]))}")
 
 
+def mode_debug(scanner: WeatherMarketScanner, generator: SignalGenerator, client: WeatherClient, city_filter: str | None) -> None:
+    """
+    Print full model internals for each tradeable market:
+    7-day ensemble sums, historical scaling ratio, projected monthly total, P vs market price.
+    """
+    print("  Scanning markets...", end=" ", flush=True)
+    markets = scanner.scan()
+    print(f"{len(markets)} tradeable\n")
+
+    for market in markets:
+        title = market.title
+        if city_filter and city_filter.lower() not in title.lower():
+            continue
+
+        sig = generator.evaluate(market)
+
+        print(f"{'─'*70}")
+        print(f"  {title[:68]}")
+        print(f"  Market ID : {market.market_id}")
+        print(f"  Metric    : {market.metric}  |  Threshold: {market.threshold}mm  "
+              f"Direction: {market.direction}"
+              + (f"  High: {market.threshold_high}mm" if market.threshold_high else ""))
+        print(f"  Market P  : {market.yes_price:.3f} YES  |  Liquidity: ${market.liquidity_usd:.0f}")
+        print()
+
+        if market.forecast_start_date is not None:
+            dbg = client.debug_monthly_forecast(
+                location=market.location,
+                month_start=market.forecast_start_date,
+                metric=market.metric,
+            )
+            loc = dbg["location"]
+            print(f"  Location  : {loc['city']} ({loc['lat']:.2f}, {loc['lon']:.2f})")
+            print(f"  Scaling   : {dbg['scaling_ratio']}x  "
+                  f"(7-day ensemble × ratio = projected full-month total)")
+            print(f"  Members   : {dbg['total_members']} total")
+            print(f"  Projected : mean={dbg['projected_mean_mm']}mm  "
+                  f"min={dbg['projected_min_mm']}mm  max={dbg['projected_max_mm']}mm")
+            print()
+            for mdl, stats in dbg["per_model"].items():
+                print(f"    {mdl:<20}  n={stats['n_members']}  "
+                      f"7d=[{stats['7d_min_mm']}-{stats['7d_max_mm']}mm avg={stats['7d_mean_mm']}mm]  "
+                      f"proj=[{stats['projected_min_mm']}-{stats['projected_max_mm']}mm avg={stats['projected_mean_mm']}mm]")
+        else:
+            print(f"  Location  : {market.location.city} ({market.location.lat:.2f}, {market.location.lon:.2f})")
+            print(f"  (single-date market, no scaling ratio)")
+
+        print()
+        gate = "PASS" if sig.quality_gate_passed else f"FAIL ({sig.rejection_reason})"
+        print(f"  Model P   : {sig.model_p:.4f}   Edge: {sig.edge_pp:.1%}   Dir: {sig.direction}   "
+              f"Spread: {sig.ensemble_spread:.4f}   Gate: {gate}")
+        print()
+
+
 def mode_stats(paper: PaperTrader) -> None:
     paper.print_dashboard()
 
@@ -105,10 +162,12 @@ def mode_resolve(paper: PaperTrader) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Weather model arbitrage bot")
-    parser.add_argument("--mode", choices=["scan", "paper", "stats", "resolve"],
+    parser.add_argument("--mode", choices=["scan", "paper", "stats", "resolve", "debug"],
                         default="paper", help="Operating mode (default: paper)")
     parser.add_argument("--interval", type=int, default=3600,
                         help="Re-scan interval in seconds for paper mode (default: 3600)")
+    parser.add_argument("--city", type=str, default=None,
+                        help="Filter markets by city name (debug mode only)")
     args = parser.parse_args()
 
     print(f"Weather Bot  [mode={args.mode}]")
@@ -128,6 +187,10 @@ def main() -> None:
     scanner = WeatherMarketScanner()
     generator = SignalGenerator(model=model, client=client)
     paper = PaperTrader() if args.mode == "paper" else None
+
+    if args.mode == "debug":
+        mode_debug(scanner, generator, client, city_filter=args.city)
+        return
 
     if args.mode == "scan":
         run_scan(scanner, generator, paper=None)

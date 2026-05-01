@@ -146,6 +146,59 @@ class WeatherClient:
             fetched_at=datetime.utcnow(),
         )
 
+    def debug_monthly_forecast(
+        self,
+        location: Location,
+        month_start: date,
+        metric: str,
+        models: list[str] | None = None,
+    ) -> dict:
+        """
+        Same computation as get_monthly_aggregate_forecast but returns all intermediate
+        values for inspection: 7-day member sums, scaling ratio, projected totals.
+        """
+        models = models or ENSEMBLE_MODELS
+        raw_member_arrays: dict[str, list[list[float]]] = {}
+        for model in models:
+            try:
+                daily_members = self._fetch_ensemble_members_range(
+                    location, month_start, days=7, metric=metric, model=model
+                )
+                if daily_members:
+                    raw_member_arrays[model] = daily_members
+            except Exception:
+                continue
+
+        ratio = self._compute_monthly_scaling_ratio(location, month_start, metric)
+
+        per_model: dict[str, dict] = {}
+        for model, daily_by_member in raw_member_arrays.items():
+            sums_7d = [sum(m) for m in daily_by_member]
+            projected = [s * ratio for s in sums_7d]
+            per_model[model] = {
+                "n_members": len(sums_7d),
+                "7d_mean_mm": round(sum(sums_7d) / len(sums_7d), 2) if sums_7d else 0,
+                "7d_min_mm": round(min(sums_7d), 2) if sums_7d else 0,
+                "7d_max_mm": round(max(sums_7d), 2) if sums_7d else 0,
+                "projected_mean_mm": round(sum(projected) / len(projected), 2) if projected else 0,
+                "projected_min_mm": round(min(projected), 2) if projected else 0,
+                "projected_max_mm": round(max(projected), 2) if projected else 0,
+            }
+
+        all_projected = [s * ratio for arr in raw_member_arrays.values() for s in (sum(m) for m in arr)]
+
+        return {
+            "location": {"city": location.city, "lat": location.lat, "lon": location.lon},
+            "metric": metric,
+            "month_start": month_start.isoformat(),
+            "scaling_ratio": round(ratio, 3),
+            "total_members": len(all_projected),
+            "projected_mean_mm": round(sum(all_projected) / len(all_projected), 1) if all_projected else 0,
+            "projected_min_mm": round(min(all_projected), 1) if all_projected else 0,
+            "projected_max_mm": round(max(all_projected), 1) if all_projected else 0,
+            "per_model": per_model,
+        }
+
     def get_historical_actual(
         self,
         location: Location,
