@@ -40,6 +40,7 @@ _CLIMATOLOGY_BRIER = 0.25
 class PaperTrader:
     def __init__(self, log_path: Path = PAPER_TRADES_LOG):
         self.log_path = log_path
+        self._existing_keys: set[tuple[str, str]] | None = None
 
     def log_trade(self, signal: Signal) -> PaperTrade | None:
         """
@@ -49,10 +50,12 @@ class PaperTrader:
         if not signal.quality_gate_passed:
             return None
 
-        existing = self._load_all()
-        for row in existing:
-            if row["market_id"] == str(signal.market.market_id) and row["direction"] == signal.direction:
-                return None
+        if self._existing_keys is None:
+            self._existing_keys = {(r["market_id"], r["direction"]) for r in self._load_all()}
+
+        key = (signal.market.market_id, signal.direction)
+        if key in self._existing_keys:
+            return None
 
         trade = PaperTrade(
             trade_id=str(uuid.uuid4())[:8],
@@ -69,6 +72,7 @@ class PaperTrader:
             resolution_date=signal.market.resolution_date,
         )
         self._append_trade(trade)
+        self._existing_keys.add(key)
         return trade
 
     def resolve_trade(self, trade_id: str, actual_outcome: bool) -> PaperTrade | None:

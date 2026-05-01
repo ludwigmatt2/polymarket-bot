@@ -79,54 +79,54 @@ def _print_scan_summary(signals: list[Signal], actionable: list[Signal], rejecte
         print(f"\n  Rejection reasons: {dict(sorted(reasons.items(), key=lambda x: -x[1]))}")
 
 
-def mode_debug(scanner: WeatherMarketScanner, generator: SignalGenerator, client: WeatherClient, city_filter: str | None) -> None:
+def mode_debug(scanner: WeatherMarketScanner, generator: SignalGenerator, city_filter: str | None) -> None:
     """
     Print full model internals for each tradeable market:
-    7-day ensemble sums, historical scaling ratio, projected monthly total, P vs market price.
+    ensemble member arrays, scaling ratio (monthly only), per-model probabilities,
+    and the resulting Signal — all derived from the forecast already attached
+    to the Signal, so no extra API calls are made.
     """
     print("  Scanning markets...", end=" ", flush=True)
     markets = scanner.scan()
     print(f"{len(markets)} tradeable\n")
 
     for market in markets:
-        title = market.title
-        if city_filter and city_filter.lower() not in title.lower():
+        if city_filter and city_filter.lower() not in market.title.lower():
             continue
 
         sig = generator.evaluate(market)
+        unit = WeatherClient.METRIC_UNITS.get(market.metric, "")
+        loc = market.location
+        forecast = sig.forecast
 
-        print(f"{'─'*70}")
-        print(f"  {title[:68]}")
+        print("─" * 70)
+        print(f"  {market.title}")
         print(f"  Market ID : {market.market_id}")
-        print(f"  Metric    : {market.metric}  |  Threshold: {market.threshold}mm  "
-              f"Direction: {market.direction}"
-              + (f"  High: {market.threshold_high}mm" if market.threshold_high else ""))
+        threshold_str = f"{market.threshold}{unit}"
+        if market.threshold_high is not None:
+            threshold_str += f"–{market.threshold_high}{unit}"
+        print(f"  Metric    : {market.metric}  |  Threshold: {threshold_str}  Direction: {market.direction}")
         print(f"  Market P  : {market.yes_price:.3f} YES  |  Liquidity: ${market.liquidity_usd:.0f}")
-        print()
+        print(f"  Location  : {loc.city} ({loc.lat:.2f}, {loc.lon:.2f})")
 
-        if market.forecast_start_date is not None:
-            dbg = client.debug_monthly_forecast(
-                location=market.location,
-                month_start=market.forecast_start_date,
-                metric=market.metric,
-            )
-            loc = dbg["location"]
-            print(f"  Location  : {loc['city']} ({loc['lat']:.2f}, {loc['lon']:.2f})")
-            print(f"  Scaling   : {dbg['scaling_ratio']}x  "
-                  f"(7-day ensemble × ratio = projected full-month total)")
-            print(f"  Members   : {dbg['total_members']} total")
-            print(f"  Projected : mean={dbg['projected_mean_mm']}mm  "
-                  f"min={dbg['projected_min_mm']}mm  max={dbg['projected_max_mm']}mm")
-            print()
-            for mdl, stats in dbg["per_model"].items():
-                print(f"    {mdl:<20}  n={stats['n_members']}  "
-                      f"7d=[{stats['7d_min_mm']}-{stats['7d_max_mm']}mm avg={stats['7d_mean_mm']}mm]  "
-                      f"proj=[{stats['projected_min_mm']}-{stats['projected_max_mm']}mm avg={stats['projected_mean_mm']}mm]")
+        members = forecast.all_members
+        if members:
+            label = "Projected" if forecast.scaling_ratio is not None else "Forecast"
+            mean = sum(members) / len(members)
+            print(f"  Members   : {len(members)} total")
+            if forecast.scaling_ratio is not None:
+                print(f"  Scaling   : {forecast.scaling_ratio:.3f}x  (7-day ensemble × ratio = full-month total)")
+            print(f"  {label} : mean={mean:.1f}{unit}  min={min(members):.1f}{unit}  max={max(members):.1f}{unit}")
+            for mdl, vals in forecast.member_arrays.items():
+                if not vals:
+                    continue
+                m_mean = sum(vals) / len(vals)
+                m_p = sig.prob_result.model_breakdown.get(mdl)
+                p_str = f"  P={m_p:.3f}" if m_p is not None else ""
+                print(f"    {mdl:<20}  n={len(vals)}  range=[{min(vals):.1f}–{max(vals):.1f}{unit}  avg={m_mean:.1f}{unit}]{p_str}")
         else:
-            print(f"  Location  : {market.location.city} ({market.location.lat:.2f}, {market.location.lon:.2f})")
-            print(f"  (single-date market, no scaling ratio)")
+            print("  Members   : 0 (forecast fetch failed)")
 
-        print()
         gate = "PASS" if sig.quality_gate_passed else f"FAIL ({sig.rejection_reason})"
         print(f"  Model P   : {sig.model_p:.4f}   Edge: {sig.edge_pp:.1%}   Dir: {sig.direction}   "
               f"Spread: {sig.ensemble_spread:.4f}   Gate: {gate}")
@@ -189,7 +189,7 @@ def main() -> None:
     paper = PaperTrader() if args.mode == "paper" else None
 
     if args.mode == "debug":
-        mode_debug(scanner, generator, client, city_filter=args.city)
+        mode_debug(scanner, generator, city_filter=args.city)
         return
 
     if args.mode == "scan":

@@ -49,6 +49,9 @@ class EnsembleForecast:
     # Deterministic per-model values for spread calculation
     model_means: dict[str, float] = field(default_factory=dict)
     fetched_at: datetime = field(default_factory=datetime.utcnow)
+    # Historical full_month / first_7_days ratio applied to project monthly aggregates;
+    # None for single-date forecasts.
+    scaling_ratio: float | None = None
 
     @property
     def all_members(self) -> list[float]:
