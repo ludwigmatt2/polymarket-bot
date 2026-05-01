@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from weather.backtest import Backtester, BacktestResult, default_test_suite, summarize
 from weather.market_scanner import WeatherMarketScanner
 from weather.models import Signal
 from weather.paper_trader import PaperTrader
@@ -133,6 +134,89 @@ def mode_debug(scanner: WeatherMarketScanner, generator: SignalGenerator, city_f
         print()
 
 
+def mode_backtest(client: WeatherClient) -> None:
+    """
+    Replay the model against historical months and score it against a
+    climatology baseline. Tests whether the current monthly-aggregate
+    approach has any real skill.
+    """
+    cases = default_test_suite()
+    print(f"  Running {len(cases)} backtest cases (4 cities × ~3 years × 4 months)...")
+    print(f"  Threshold per case: train-year median (climatology forced to ~0.5)\n")
+
+    bt = Backtester(client)
+    results = bt.run_suite(cases)
+
+    if not results:
+        print("  No results — archive fetches failed.")
+        return
+
+    print(f"  {'City':<12} {'Y/M':<8} {'thr':>5}  {'actual':>7}  {'pred':>6}  {'σ':>5}  {'P_clim':>6}  {'P_mod':>6}  {'B_clim':>6}  {'B_mod':>6}  out")
+    print(f"  {'-'*12} {'-'*8} {'-'*5}  {'-'*7}  {'-'*6}  {'-'*5}  {'-'*6}  {'-'*6}  {'-'*6}  {'-'*6}  ---")
+    for r in results:
+        c = r.case
+        print(f"  {c.city:<12} {c.test_year}/{c.month:02d}  "
+              f"{r.threshold_used:>5.0f}  {r.actual_total:>7.1f}  {r.model_point_pred:>6.1f}  {r.sigma:>5.1f}  "
+              f"{r.p_climatology:>6.3f}  {r.p_model:>6.3f}  "
+              f"{r.brier_climatology:>6.3f}  {r.brier_model:>6.3f}  {r.actual_binary}")
+
+    s = summarize(results)
+    print()
+    print("  ═══════════════════════════════════════════════════════════════════")
+    print(f"  N = {s['n']} cases")
+    print(f"  Mean Brier — Climatology : {s['mean_brier_climatology']:.4f}")
+    print(f"  Mean Brier — Model       : {s['mean_brier_model']:.4f}")
+    print(f"  Brier Skill Score        : {s['brier_skill_score_vs_climatology']:+.4f}  "
+          f"(>0 means model beats climatology)")
+    if s['model_beats_clim']:
+        print("  ✓ Model has skill — beats climatology baseline")
+    else:
+        print("  ✗ Model has NO skill — climatology is at least as good")
+    print("  ═══════════════════════════════════════════════════════════════════")
+
+    _print_breakdowns(results)
+    _save_results_csv(results, Path("logs/backtest_results.csv"))
+
+
+def _print_breakdowns(results: list[BacktestResult]) -> None:
+    print()
+    print("  Per-city Brier Skill Score:")
+    by_city: dict[str, list[BacktestResult]] = {}
+    for r in results:
+        by_city.setdefault(r.case.city, []).append(r)
+    for city, rs in by_city.items():
+        s = summarize(rs)
+        flag = "✓" if s["model_beats_clim"] else "✗"
+        print(f"    {flag} {city:<12} n={s['n']:<3}  clim={s['mean_brier_climatology']:.3f}  "
+              f"model={s['mean_brier_model']:.3f}  BSS={s['brier_skill_score_vs_climatology']:+.3f}")
+
+    print("\n  Per-month Brier Skill Score:")
+    by_month: dict[int, list[BacktestResult]] = {}
+    for r in results:
+        by_month.setdefault(r.case.month, []).append(r)
+    for m in sorted(by_month):
+        s = summarize(by_month[m])
+        flag = "✓" if s["model_beats_clim"] else "✗"
+        print(f"    {flag} month={m:<2}     n={s['n']:<3}  clim={s['mean_brier_climatology']:.3f}  "
+              f"model={s['mean_brier_model']:.3f}  BSS={s['brier_skill_score_vs_climatology']:+.3f}")
+
+
+def _save_results_csv(results: list[BacktestResult], path: Path) -> None:
+    import csv
+    path.parent.mkdir(exist_ok=True)
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["city", "metric", "year", "month", "threshold", "actual_total",
+                    "actual_binary", "model_pred", "sigma", "p_climatology", "p_model",
+                    "brier_climatology", "brier_model", "train_n"])
+        for r in results:
+            w.writerow([r.case.city, r.case.metric, r.case.test_year, r.case.month,
+                        r.threshold_used, r.actual_total, r.actual_binary,
+                        r.model_point_pred, r.sigma, r.p_climatology, r.p_model,
+                        r.brier_climatology, r.brier_model, r.train_n])
+    print(f"\n  Full results saved → {path}")
+
+
 def mode_stats(paper: PaperTrader) -> None:
     paper.print_dashboard()
 
@@ -162,7 +246,7 @@ def mode_resolve(paper: PaperTrader) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Weather model arbitrage bot")
-    parser.add_argument("--mode", choices=["scan", "paper", "stats", "resolve", "debug"],
+    parser.add_argument("--mode", choices=["scan", "paper", "stats", "resolve", "debug", "backtest"],
                         default="paper", help="Operating mode (default: paper)")
     parser.add_argument("--interval", type=int, default=3600,
                         help="Re-scan interval in seconds for paper mode (default: 3600)")
@@ -179,6 +263,10 @@ def main() -> None:
 
     if args.mode == "resolve":
         mode_resolve(PaperTrader())
+        return
+
+    if args.mode == "backtest":
+        mode_backtest(WeatherClient())
         return
 
     # Build components

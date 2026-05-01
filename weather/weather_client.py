@@ -183,6 +183,33 @@ class WeatherClient:
         except Exception:
             return None
 
+    def get_archive_daily_values(
+        self,
+        location: Location,
+        start_date: date,
+        end_date: date,
+        metric: str,
+    ) -> list[float]:
+        """
+        Fetch a flat list of daily archive values for [start_date, end_date].
+        Returns empty list on failure. None values are dropped.
+        """
+        params = {
+            "latitude": location.lat,
+            "longitude": location.lon,
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "daily": self.METRIC_DAILY_PARAMS[metric],
+            "timezone": location.timezone,
+        }
+        try:
+            r = requests.get(OPEN_METEO_ARCHIVE_URL, params=params, timeout=OPEN_METEO_REQUEST_TIMEOUT)
+            r.raise_for_status()
+            vals = r.json().get("daily", {}).get(metric, [])
+            return [float(v) for v in vals if v is not None]
+        except Exception:
+            return []
+
     def geocode(self, city_name: str) -> Location | None:
         """Convert a city name to lat/lon via Open-Meteo geocoding API."""
         return _geocode_cached(city_name)
