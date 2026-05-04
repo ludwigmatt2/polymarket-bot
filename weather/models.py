@@ -30,9 +30,9 @@ class WeatherMarket:
     location: Location
     metric: str             # "temperature_2m_max", "precipitation_sum", etc.
     threshold: float        # lower bound (or only bound for above/below markets)
-    threshold_high: float | None  # upper bound for range markets ("between X and Y")
     direction: str          # "above", "below", "equal", or "range"
     url: str
+    threshold_high: float | None = None  # upper bound for range markets ("between X and Y")
     raw_title: str = ""     # Original title before parsing
     # For monthly aggregate markets (>7d horizon), forecast is summed over a date window
     forecast_start_date: "date | None" = None  # set for monthly markets
