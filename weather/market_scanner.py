@@ -36,7 +36,9 @@ _CITY_CANDIDATES = re.compile(
     re.IGNORECASE,
 )
 _ABOVE_BELOW = re.compile(
-    r"\b(above|exceed|over|high(?:er)? than|greater than|below|under|low(?:er)? than|less than|or (?:above|below|more|less))\b",
+    r"\b(above|exceed|over|high(?:er)? than|greater than|below|under|low(?:er)? than|less than|"
+    r"or (?:above|below|more|less|higher|lower)|"
+    r"(?:and|or) (?:higher|lower))\b",
     re.IGNORECASE,
 )
 # "will it be 28°C?" — exact temperature value market

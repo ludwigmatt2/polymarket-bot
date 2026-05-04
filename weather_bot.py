@@ -151,27 +151,24 @@ def mode_backtest(client: WeatherClient) -> None:
         print("  No results — archive fetches failed.")
         return
 
-    print(f"  {'City':<12} {'Y/M':<8} {'thr':>5}  {'actual':>7}  {'pred':>6}  {'σ':>5}  {'P_clim':>6}  {'P_mod':>6}  {'B_clim':>6}  {'B_mod':>6}  out")
-    print(f"  {'-'*12} {'-'*8} {'-'*5}  {'-'*7}  {'-'*6}  {'-'*5}  {'-'*6}  {'-'*6}  {'-'*6}  {'-'*6}  ---")
+    print(f"  {'City':<12} {'Y/M':<8} {'thr':>5} {'actual':>7}  {'P_clim':>6} {'P_old':>6} {'P_bld':>6}  {'B_clim':>6} {'B_old':>6} {'B_bld':>6} out")
+    print(f"  {'-'*12} {'-'*8} {'-'*5} {'-'*7}  {'-'*6} {'-'*6} {'-'*6}  {'-'*6} {'-'*6} {'-'*6} ---")
     for r in results:
         c = r.case
         print(f"  {c.city:<12} {c.test_year}/{c.month:02d}  "
-              f"{r.threshold_used:>5.0f}  {r.actual_total:>7.1f}  {r.model_point_pred:>6.1f}  {r.sigma:>5.1f}  "
-              f"{r.p_climatology:>6.3f}  {r.p_model:>6.3f}  "
-              f"{r.brier_climatology:>6.3f}  {r.brier_model:>6.3f}  {r.actual_binary}")
+              f"{r.threshold_used:>5.0f} {r.actual_total:>7.1f}  "
+              f"{r.p_climatology:>6.3f} {r.p_model_old:>6.3f} {r.p_model_blend:>6.3f}  "
+              f"{r.brier_climatology:>6.3f} {r.brier_model_old:>6.3f} {r.brier_model_blend:>6.3f} {r.actual_binary}")
 
     s = summarize(results)
     print()
     print("  ═══════════════════════════════════════════════════════════════════")
     print(f"  N = {s['n']} cases")
-    print(f"  Mean Brier — Climatology : {s['mean_brier_climatology']:.4f}")
-    print(f"  Mean Brier — Model       : {s['mean_brier_model']:.4f}")
-    print(f"  Brier Skill Score        : {s['brier_skill_score_vs_climatology']:+.4f}  "
-          f"(>0 means model beats climatology)")
-    if s['model_beats_clim']:
-        print("  ✓ Model has skill — beats climatology baseline")
-    else:
-        print("  ✗ Model has NO skill — climatology is at least as good")
+    print(f"  Mean Brier — Climatology       : {s['mean_brier_climatology']:.4f}")
+    print(f"  Mean Brier — Model (old ratio) : {s['mean_brier_model_old']:.4f}    BSS={s['bss_old']:+.4f}  "
+          f"{'✓' if s['old_beats_clim'] else '✗'}")
+    print(f"  Mean Brier — Model (blend)     : {s['mean_brier_model_blend']:.4f}    BSS={s['bss_blend']:+.4f}  "
+          f"{'✓' if s['blend_beats_clim'] else '✗'}")
     print("  ═══════════════════════════════════════════════════════════════════")
 
     _print_breakdowns(results)
@@ -179,26 +176,26 @@ def mode_backtest(client: WeatherClient) -> None:
 
 
 def _print_breakdowns(results: list[BacktestResult]) -> None:
-    print()
-    print("  Per-city Brier Skill Score:")
+    def _row(label: str, s: dict) -> str:
+        old_flag = "✓" if s["old_beats_clim"] else "✗"
+        bld_flag = "✓" if s["blend_beats_clim"] else "✗"
+        return (f"    {label:<14}  n={s['n']:<3}  clim={s['mean_brier_climatology']:.3f}  "
+                f"old={s['mean_brier_model_old']:.3f} {old_flag} BSS={s['bss_old']:+.3f}  "
+                f"blend={s['mean_brier_model_blend']:.3f} {bld_flag} BSS={s['bss_blend']:+.3f}")
+
+    print("\n  Per-city Brier Skill Score:")
     by_city: dict[str, list[BacktestResult]] = {}
     for r in results:
         by_city.setdefault(r.case.city, []).append(r)
     for city, rs in by_city.items():
-        s = summarize(rs)
-        flag = "✓" if s["model_beats_clim"] else "✗"
-        print(f"    {flag} {city:<12} n={s['n']:<3}  clim={s['mean_brier_climatology']:.3f}  "
-              f"model={s['mean_brier_model']:.3f}  BSS={s['brier_skill_score_vs_climatology']:+.3f}")
+        print(_row(city, summarize(rs)))
 
     print("\n  Per-month Brier Skill Score:")
     by_month: dict[int, list[BacktestResult]] = {}
     for r in results:
         by_month.setdefault(r.case.month, []).append(r)
     for m in sorted(by_month):
-        s = summarize(by_month[m])
-        flag = "✓" if s["model_beats_clim"] else "✗"
-        print(f"    {flag} month={m:<2}     n={s['n']:<3}  clim={s['mean_brier_climatology']:.3f}  "
-              f"model={s['mean_brier_model']:.3f}  BSS={s['brier_skill_score_vs_climatology']:+.3f}")
+        print(_row(f"month={m}", summarize(by_month[m])))
 
 
 def _save_results_csv(results: list[BacktestResult], path: Path) -> None:
@@ -207,13 +204,15 @@ def _save_results_csv(results: list[BacktestResult], path: Path) -> None:
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["city", "metric", "year", "month", "threshold", "actual_total",
-                    "actual_binary", "model_pred", "sigma", "p_climatology", "p_model",
-                    "brier_climatology", "brier_model", "train_n"])
+                    "actual_binary", "model_pred", "sigma",
+                    "p_climatology", "p_model_old", "p_model_blend",
+                    "brier_climatology", "brier_model_old", "brier_model_blend", "train_n"])
         for r in results:
             w.writerow([r.case.city, r.case.metric, r.case.test_year, r.case.month,
                         r.threshold_used, r.actual_total, r.actual_binary,
-                        r.model_point_pred, r.sigma, r.p_climatology, r.p_model,
-                        r.brier_climatology, r.brier_model, r.train_n])
+                        r.model_point_pred, r.sigma,
+                        r.p_climatology, r.p_model_old, r.p_model_blend,
+                        r.brier_climatology, r.brier_model_old, r.brier_model_blend, r.train_n])
     print(f"\n  Full results saved → {path}")
 
 

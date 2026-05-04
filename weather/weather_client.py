@@ -55,26 +55,27 @@ class WeatherClient:
         month_start: date,
         metric: str,
         models: list[str] | None = None,
+        climatology_years: int = 5,
     ) -> EnsembleForecast:
         """
-        Build an ensemble forecast for a monthly aggregate metric (e.g. total May precipitation).
+        Build an ensemble forecast for a monthly aggregate (e.g. total May precip)
+        using climatology-blended additive projection:
 
-        Strategy:
-          1. Fetch 7-day ensemble — sums per member give a 7-day partial total.
-          2. Fetch last two years' archive for the same month to compute a
-             scaling ratio: full_month_avg / first_7_days_avg.
-          3. Multiply each member's 7-day sum by the ratio to project the full month.
+           projected_total[m,y] = sum(forecast_member m, days 1..7) + remainder[y]
 
-        The resulting EnsembleForecast has member arrays representing projected
-        monthly totals, not single-day values — the probability model downstream
-        remains unchanged.
+        where remainder[y] = archived total for days 8..end_of_month in year y.
+        Each forecast member crosses with each historical remainder year, so the
+        output ensemble naturally captures both forecast spread and climatological
+        spread for the unobserved tail of the month.
+
+        This replaces the prior multiplicative scaling, which collapsed when the
+        first 7 forecast days happened to be unrepresentative of the month.
         """
         models = models or ENSEMBLE_MODELS
         if metric not in self.METRIC_DAILY_PARAMS:
             raise ValueError(f"Unsupported metric '{metric}'")
 
-        # Step 1: fetch 7-day ensemble member arrays
-        raw_member_arrays: dict[str, list[list[float]]] = {}  # model → [member_i_daily_values]
+        raw_member_arrays: dict[str, list[list[float]]] = {}
         for model in models:
             try:
                 daily_members = self._fetch_ensemble_members_range(
@@ -85,24 +86,48 @@ class WeatherClient:
             except Exception:
                 continue
 
-        # Step 2: compute historical monthly/7day ratio
-        ratio = self._compute_monthly_scaling_ratio(location, month_start, metric)
+        last_day = calendar.monthrange(month_start.year, month_start.month)[1]
+        remainder_totals = self._historical_remainder_totals(
+            location, month_start, metric, start_day=8, last_day=last_day,
+            years_back=climatology_years,
+        )
 
-        # Step 3: project each member's 7-day sum to full month
+        # Cross each forecast member with each historical remainder year.
+        # If we have no remainders, fall back to scaling for safety.
         member_arrays: dict[str, list[float]] = {}
-        for model, daily_by_member in raw_member_arrays.items():
-            projected = [sum(member_vals) * ratio for member_vals in daily_by_member]
-            if projected:
-                member_arrays[model] = projected
+        used_fallback = False
+        if remainder_totals:
+            for model, daily_by_member in raw_member_arrays.items():
+                projected = [
+                    sum(member_vals) + r
+                    for member_vals in daily_by_member
+                    for r in remainder_totals
+                ]
+                if projected:
+                    member_arrays[model] = projected
+        else:
+            used_fallback = True
+            ratio = self._compute_monthly_scaling_ratio(location, month_start, metric)
+            for model, daily_by_member in raw_member_arrays.items():
+                projected = [sum(m) * ratio for m in daily_by_member]
+                if projected:
+                    member_arrays[model] = projected
 
-        # Cross-model means (use the projected totals for spread)
         model_means: dict[str, float] = {}
         for model, totals in member_arrays.items():
             if totals:
                 model_means[model] = sum(totals) / len(totals)
 
-        last_day = calendar.monthrange(month_start.year, month_start.month)[1]
         target_date = date(month_start.year, month_start.month, last_day)
+
+        # For diagnostic display: effective ratio = mean(projection) / mean(forecast_first_7)
+        # Only well-defined when we used the blend path.
+        scaling_ratio = None
+        if not used_fallback and member_arrays and raw_member_arrays:
+            all_first_7 = [sum(m) for arr in raw_member_arrays.values() for m in arr]
+            all_proj = [v for arr in member_arrays.values() for v in arr]
+            if all_first_7 and all_proj and sum(all_first_7) > 0:
+                scaling_ratio = (sum(all_proj) / len(all_proj)) / (sum(all_first_7) / len(all_first_7))
 
         return EnsembleForecast(
             lat=location.lat,
@@ -112,8 +137,37 @@ class WeatherClient:
             member_arrays=member_arrays,
             model_means=model_means,
             fetched_at=datetime.utcnow(),
-            scaling_ratio=ratio,
+            scaling_ratio=scaling_ratio,
         )
+
+    def _historical_remainder_totals(
+        self,
+        location: Location,
+        month_start: date,
+        metric: str,
+        start_day: int,
+        last_day: int,
+        years_back: int,
+    ) -> list[float]:
+        """
+        Fetch full-month-after-start_day archive totals for the prior `years_back` years.
+        Returns one total per year (filtered to non-empty).
+        """
+        out: list[float] = []
+        for offset in range(1, years_back + 1):
+            hist_year = month_start.year - offset
+            try:
+                vals = self.get_archive_daily_values(
+                    location,
+                    date(hist_year, month_start.month, start_day),
+                    date(hist_year, month_start.month, last_day),
+                    metric,
+                )
+                if vals:
+                    out.append(sum(vals))
+            except Exception:
+                continue
+        return out
 
     def get_ensemble_forecast(
         self,
