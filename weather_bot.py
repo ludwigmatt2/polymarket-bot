@@ -134,6 +134,29 @@ def mode_debug(scanner: WeatherMarketScanner, generator: SignalGenerator, city_f
         print()
 
 
+def mode_arb(min_spread: float | None, limit: int) -> None:
+    """
+    Surface cross-venue arbitrage opportunities via the hosted pmxt Router.
+    Requires PMXT_API_KEY in .env. Identity-matched markets only — same
+    question, different venues. Net-profitable threshold is roughly 4%
+    once round-trip fees are included.
+    """
+    import pmxt
+    r = pmxt.Router()
+    arbs = r.fetch_arbitrage(min_spread=min_spread, limit=limit, relations=["identity"])
+    if not arbs:
+        print(f"  No identity-matched arb opportunities found (min_spread={min_spread}).")
+        return
+
+    print(f"  {len(arbs)} cross-venue arb opportunities (identity match):\n")
+    print(f"  {'spread':>7}  {'buy':>10}  {'@':>5}  {'sell':>10}  {'@':>5}  {'conf':>5}  Question")
+    print(f"  {'-'*7}  {'-'*10}  {'-'*5}  {'-'*10}  {'-'*5}  {'-'*5}  {'-'*60}")
+    for a in arbs:
+        print(f"  {a.spread:>6.1%}  {a.buy_venue:>10}  {a.buy_price:>5.3f}  "
+              f"{a.sell_venue:>10}  {a.sell_price:>5.3f}  {a.confidence:>5.2f}  "
+              f"{a.market_a.title[:60]}")
+
+
 def mode_backtest(client: WeatherClient) -> None:
     """
     Replay the model against historical months and score it against a
@@ -245,12 +268,16 @@ def mode_resolve(paper: PaperTrader) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Weather model arbitrage bot")
-    parser.add_argument("--mode", choices=["scan", "paper", "stats", "resolve", "debug", "backtest"],
+    parser.add_argument("--mode", choices=["scan", "paper", "stats", "resolve", "debug", "backtest", "arb"],
                         default="paper", help="Operating mode (default: paper)")
     parser.add_argument("--interval", type=int, default=3600,
                         help="Re-scan interval in seconds for paper mode (default: 3600)")
     parser.add_argument("--city", type=str, default=None,
                         help="Filter markets by city name (debug mode only)")
+    parser.add_argument("--min-spread", type=float, default=None,
+                        help="Minimum cross-venue spread filter for arb mode (e.g. 0.04 for 4%%)")
+    parser.add_argument("--limit", type=int, default=20,
+                        help="Max results for arb mode (default: 20)")
     args = parser.parse_args()
 
     print(f"Weather Bot  [mode={args.mode}]")
@@ -266,6 +293,10 @@ def main() -> None:
 
     if args.mode == "backtest":
         mode_backtest(WeatherClient())
+        return
+
+    if args.mode == "arb":
+        mode_arb(min_spread=args.min_spread, limit=args.limit)
         return
 
     # Build components
