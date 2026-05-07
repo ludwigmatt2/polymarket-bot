@@ -18,6 +18,7 @@ Run:
 """
 
 import argparse
+import calendar
 import sys
 import time
 from datetime import datetime
@@ -27,7 +28,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from weather.backtest import Backtester, BacktestResult, default_test_suite, summarize
+from weather.backtest import (
+    Backtester, BacktestResult, default_test_suite, summarize,
+    TempBacktester, TempBacktestResult, default_temp_test_suite, summarize_temp,
+)
 from weather.market_scanner import WeatherMarketScanner
 from weather.models import Signal
 from weather.paper_trader import PaperTrader
@@ -198,6 +202,90 @@ def mode_backtest(client: WeatherClient) -> None:
     _save_results_csv(results, Path("logs/backtest_results.csv"))
 
 
+def mode_backtest_temp(client: WeatherClient) -> None:
+    """
+    Replay the climatological temperature model against historical daily actuals.
+    Tests whether same-day-of-year historical distributions have skill over a
+    coin-flip baseline — the minimum bar any live model must clear.
+
+    144 cases: 4 cities × 12 months × 3 test years (2022-2024).
+    Uses ±7-day window from prior years as the climatological distribution.
+    Takes ~2-3 min (archive API calls, cached within session).
+    """
+    cases = default_temp_test_suite()
+    print(f"  Running {len(cases)} temperature backtest cases "
+          f"(4 cities × 12 months × 3 years)...")
+    print(f"  Threshold per case: train-year median (balanced test)\n")
+
+    bt = TempBacktester(client)
+    results = bt.run_suite(cases)
+
+    if not results:
+        print("  No results — archive fetches failed.")
+        return
+
+    # Per-case table
+    print(f"  {'City':<15} {'Date':<12} {'thr':>5} {'actual':>7}  "
+          f"{'P_clim':>6}  {'B_clim':>6}  out")
+    print(f"  {'-'*15} {'-'*12} {'-'*5} {'-'*7}  {'-'*6}  {'-'*6}  ---")
+    for r in results:
+        print(f"  {r.case.city:<15} {r.case.target_date.isoformat():<12} "
+              f"{r.threshold_used:>5.1f} {r.actual_value:>7.1f}  "
+              f"{r.p_climatology:>6.3f}  {r.brier_climatology:>6.3f}  {r.actual_binary}")
+
+    s = summarize_temp(results)
+    print()
+    print("  ══════════════════════════════════════════════════════")
+    print(f"  N = {s['n']} cases")
+    print(f"  Mean Brier (climatology) : {s['mean_brier']:.4f}")
+    print(f"  Baseline (coin-flip)     : 0.2500")
+    print(f"  BSS vs coin-flip         : {s['bss_vs_coinflip']:+.4f}  "
+          f"{'✓ beats random' if s['beats_coinflip'] else '✗ worse than random'}")
+    print("  ══════════════════════════════════════════════════════")
+
+    _print_temp_breakdowns(results)
+    _save_temp_results_csv(results, Path("logs/backtest_temp_results.csv"))
+
+
+def _print_temp_breakdowns(results: list[TempBacktestResult]) -> None:
+    def _row(label: str, rs: list[TempBacktestResult]) -> str:
+        s = summarize_temp(rs)
+        flag = "✓" if s["beats_coinflip"] else "✗"
+        return (f"    {label:<15}  n={s['n']:<3}  "
+                f"brier={s['mean_brier']:.3f}  BSS={s['bss_vs_coinflip']:+.3f} {flag}")
+
+    print("\n  Per-city:")
+    by_city: dict[str, list] = {}
+    for r in results:
+        by_city.setdefault(r.case.city, []).append(r)
+    for city, rs in by_city.items():
+        print(_row(city, rs))
+
+    print("\n  Per-month:")
+    by_month: dict[int, list] = {}
+    for r in results:
+        by_month.setdefault(r.case.target_date.month, []).append(r)
+    for m in sorted(by_month):
+        print(_row(f"month={calendar.month_abbr[m]}", by_month[m]))
+
+
+def _save_temp_results_csv(results: list[TempBacktestResult], path: Path) -> None:
+    import csv
+    path.parent.mkdir(exist_ok=True)
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["city", "metric", "target_date", "threshold", "actual_value",
+                    "actual_binary", "p_climatology", "train_n", "brier_climatology"])
+        for r in results:
+            w.writerow([
+                r.case.city, r.case.metric, r.case.target_date.isoformat(),
+                round(r.threshold_used, 2), round(r.actual_value, 2),
+                r.actual_binary, round(r.p_climatology, 4),
+                r.train_n, round(r.brier_climatology, 6),
+            ])
+    print(f"\n  Results saved → {path}")
+
+
 def _print_breakdowns(results: list[BacktestResult]) -> None:
     def _row(label: str, s: dict) -> str:
         old_flag = "✓" if s["old_beats_clim"] else "✗"
@@ -268,7 +356,7 @@ def mode_resolve(paper: PaperTrader) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Weather model arbitrage bot")
-    parser.add_argument("--mode", choices=["scan", "paper", "stats", "resolve", "debug", "backtest", "arb"],
+    parser.add_argument("--mode", choices=["scan", "paper", "stats", "resolve", "auto-resolve", "debug", "backtest", "backtest-temp", "arb"],
                         default="paper", help="Operating mode (default: paper)")
     parser.add_argument("--interval", type=int, default=3600,
                         help="Re-scan interval in seconds for paper mode (default: 3600)")
@@ -291,8 +379,21 @@ def main() -> None:
         mode_resolve(PaperTrader())
         return
 
+    if args.mode == "auto-resolve":
+        paper = PaperTrader()
+        client = WeatherClient()
+        resolved, skipped = paper.auto_resolve(client)
+        print(f"  Auto-resolved {resolved} trade(s).  {skipped} skipped (no archive data or missing fields).")
+        if resolved:
+            paper.print_dashboard()
+        return
+
     if args.mode == "backtest":
         mode_backtest(WeatherClient())
+        return
+
+    if args.mode == "backtest-temp":
+        mode_backtest_temp(WeatherClient())
         return
 
     if args.mode == "arb":
@@ -314,7 +415,11 @@ def main() -> None:
         run_scan(scanner, generator, paper=None)
         return
 
-    # paper mode — continuous
+    # paper mode — one-shot (interval=0) or continuous
+    if args.interval == 0:
+        run_scan(scanner, generator, paper)
+        return
+
     print(f"  Scanning every {args.interval}s. Ctrl+C to stop.\n")
     scan_count = 0
     while True:

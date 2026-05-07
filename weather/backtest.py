@@ -19,7 +19,7 @@ from __future__ import annotations
 import calendar
 import math
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 
 from .weather_client import WeatherClient
 from .models import Location
@@ -213,5 +213,142 @@ def default_test_suite() -> list[BacktestCase]:
                     test_year=ty,
                     train_years=train_years,
                     threshold=default_threshold_mm,
+                ))
+    return cases
+
+
+# ── Daily temperature backtest ────────────────────────────────────────────────
+
+@dataclass
+class TempBacktestCase:
+    city: str
+    target_date: date
+    metric: str               # temperature_2m_max or temperature_2m_min
+    threshold: float | None = None  # None → train-year median (balanced test)
+
+
+@dataclass
+class TempBacktestResult:
+    case: TempBacktestCase
+    actual_value: float
+    actual_binary: int        # 1 if actual > threshold_used
+    threshold_used: float
+    p_climatology: float      # fraction of historical window days above threshold
+    train_n: int              # number of historical days used
+    brier_climatology: float
+
+
+class TempBacktester:
+    """
+    Climatological backtest for daily temperature markets.
+
+    For each test case (city, date, metric) we:
+    1. Fetch the actual value from the archive on that date.
+    2. Build a training distribution from the same ±WINDOW_DAYS day-of-year
+       window across TRAIN_YEARS prior years (no leakage — prior years only).
+    3. Score P(actual > threshold) using the empirical climatological CDF.
+
+    This establishes the baseline that any live ensemble model must beat.
+    """
+
+    WINDOW_DAYS = 7   # ±7 days around target day-of-year
+    TRAIN_YEARS = 7   # how many prior years to pull
+
+    def __init__(self, client: WeatherClient):
+        self.client = client
+
+    def run_case(self, case: TempBacktestCase) -> TempBacktestResult | None:
+        loc = self.client.geocode(case.city)
+        if loc is None:
+            return None
+
+        actual = self.client.get_historical_actual(loc, case.target_date, case.metric)
+        if actual is None:
+            return None
+
+        # Collect training values: same ±WINDOW_DAYS window, prior years only.
+        # One range fetch per year (not per day) to avoid API rate limiting.
+        train_vals: list[float] = []
+        for years_back in range(1, self.TRAIN_YEARS + 1):
+            yr = case.target_date.year - years_back
+            window_start = case.target_date.replace(year=yr) - timedelta(days=self.WINDOW_DAYS)
+            window_end   = case.target_date.replace(year=yr) + timedelta(days=self.WINDOW_DAYS)
+            # Clamp to same month to keep the distribution seasonally tight
+            month_start = date(yr, case.target_date.month, 1)
+            last_day = calendar.monthrange(yr, case.target_date.month)[1]
+            month_end = date(yr, case.target_date.month, last_day)
+            fetch_start = max(window_start, month_start)
+            fetch_end   = min(window_end,   month_end)
+            vals = self.client.get_archive_daily_values(loc, fetch_start, fetch_end, case.metric)
+            train_vals.extend(vals)
+
+        if len(train_vals) < 5:
+            return None
+
+        threshold = case.threshold
+        if threshold is None:
+            sorted_vals = sorted(train_vals)
+            mid = len(sorted_vals) // 2
+            threshold = (sorted_vals[mid] + sorted_vals[~mid]) / 2.0
+
+        actual_binary = 1 if actual > threshold else 0
+        p_clim = sum(1 for v in train_vals if v > threshold) / len(train_vals)
+
+        return TempBacktestResult(
+            case=case,
+            actual_value=actual,
+            actual_binary=actual_binary,
+            threshold_used=threshold,
+            p_climatology=p_clim,
+            train_n=len(train_vals),
+            brier_climatology=(p_clim - actual_binary) ** 2,
+        )
+
+    def run_suite(self, cases: list[TempBacktestCase]) -> list[TempBacktestResult]:
+        results = []
+        for c in cases:
+            r = self.run_case(c)
+            if r is not None:
+                results.append(r)
+        return results
+
+
+def summarize_temp(results: list[TempBacktestResult]) -> dict:
+    if not results:
+        return {"n": 0}
+    n = len(results)
+    mean_b = sum(r.brier_climatology for r in results) / n
+    # BSS vs uninformed baseline (coin-flip = 0.25)
+    bss = 1.0 - (mean_b / 0.25)
+    return {
+        "n": n,
+        "mean_brier": mean_b,
+        "bss_vs_coinflip": bss,
+        "beats_coinflip": mean_b < 0.25,
+    }
+
+
+def default_temp_test_suite() -> list[TempBacktestCase]:
+    """
+    4 cities × 12 months × 3 test years = 144 cases.
+    One date per month (the 15th) to spread across all seasons.
+    Cities match live Polymarket temperature markets.
+    """
+    cities = ["Hong Kong", "New York City", "London", "Seattle"]
+    test_years = [2022, 2023, 2024]
+    months = list(range(1, 13))
+
+    cases = []
+    for city in cities:
+        for ty in test_years:
+            for m in months:
+                try:
+                    d = date(ty, m, 15)
+                except ValueError:
+                    continue
+                cases.append(TempBacktestCase(
+                    city=city,
+                    target_date=d,
+                    metric="temperature_2m_max",
                 ))
     return cases

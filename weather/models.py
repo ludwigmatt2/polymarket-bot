@@ -124,6 +124,13 @@ class PaperTrade:
     ensemble_spread: float
     confidence_score: float
     resolution_date: datetime
+    # Stored at log time so auto-resolve never needs to re-parse the title
+    metric: str = ""
+    threshold: float = 0.0
+    threshold_high: float | None = None
+    weather_direction: str = ""  # "above"/"below"/"equal"/"range"
+    lat: float = 0.0
+    lon: float = 0.0
     actual_outcome: bool | None = None
     resolved_at: datetime | None = None
     pnl_usd: float | None = None
