@@ -76,8 +76,9 @@ class TestQualityGates:
         assert "insufficient_edge" in signal.rejection_reason
 
     def test_rejects_low_liquidity(self):
+        from weather.config import MIN_MARKET_LIQUIDITY_USD
         gen = _make_generator(model_p=0.80)
-        signal = gen.evaluate(_make_market(yes_price=0.30, liquidity=100.0))
+        signal = gen.evaluate(_make_market(yes_price=0.30, liquidity=MIN_MARKET_LIQUIDITY_USD - 1))
         assert signal.quality_gate_passed is False
         assert "low_liquidity" in signal.rejection_reason
 

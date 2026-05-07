@@ -30,9 +30,9 @@ class WeatherMarket:
     location: Location
     metric: str             # "temperature_2m_max", "precipitation_sum", etc.
     threshold: float        # lower bound (or only bound for above/below markets)
-    threshold_high: float | None  # upper bound for range markets ("between X and Y")
     direction: str          # "above", "below", "equal", or "range"
     url: str
+    threshold_high: float | None = None  # upper bound for range markets ("between X and Y")
     raw_title: str = ""     # Original title before parsing
     # For monthly aggregate markets (>7d horizon), forecast is summed over a date window
     forecast_start_date: "date | None" = None  # set for monthly markets
@@ -49,6 +49,9 @@ class EnsembleForecast:
     # Deterministic per-model values for spread calculation
     model_means: dict[str, float] = field(default_factory=dict)
     fetched_at: datetime = field(default_factory=datetime.utcnow)
+    # Historical full_month / first_7_days ratio applied to project monthly aggregates;
+    # None for single-date forecasts.
+    scaling_ratio: float | None = None
 
     @property
     def all_members(self) -> list[float]:
@@ -121,6 +124,13 @@ class PaperTrade:
     ensemble_spread: float
     confidence_score: float
     resolution_date: datetime
+    # Stored at log time so auto-resolve never needs to re-parse the title
+    metric: str = ""
+    threshold: float = 0.0
+    threshold_high: float | None = None
+    weather_direction: str = ""  # "above"/"below"/"equal"/"range"
+    lat: float = 0.0
+    lon: float = 0.0
     actual_outcome: bool | None = None
     resolved_at: datetime | None = None
     pnl_usd: float | None = None

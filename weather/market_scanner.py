@@ -36,11 +36,22 @@ _CITY_CANDIDATES = re.compile(
     re.IGNORECASE,
 )
 _ABOVE_BELOW = re.compile(
-    r"\b(above|exceed|over|high(?:er)? than|greater than|below|under|low(?:er)? than|less than|or (?:above|below|more|less))\b",
+    r"\b(above|exceed|over|high(?:er)? than|greater than|below|under|low(?:er)? than|less than|"
+    r"or (?:above|below|more|less|higher|lower)|"
+    r"(?:and|or) (?:higher|lower))\b",
     re.IGNORECASE,
 )
 # "will it be 28°C?" — exact temperature value market
 _EXACT_TEMP = re.compile(r"\bwill.*?be\s+(\d+(?:\.\d+)?)\s*°?\s*([CF])\b", re.IGNORECASE)
+# "between 72-73°F" — temperature range market (common for F markets)
+_TEMP_RANGE = re.compile(
+    r"between\s+(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*°?\s*([CF])\b",
+    re.IGNORECASE,
+)
+
+
+def _to_celsius(value: float, unit: str) -> float:
+    return value if unit == "C" else (value - 32) * 5 / 9
 _TEMPERATURE_WORDS = re.compile(
     r"\b(temperature|temp|high|low|degrees?|fahrenheit|celsius|°[CF])\b",
     re.IGNORECASE,
@@ -179,19 +190,25 @@ class WeatherMarketScanner:
                 threshold = float(single_match.group(1)) * factor
                 direction = _extract_direction(above_below)
         else:
-            exact_match = _EXACT_TEMP.search(title)
-            degree_match = exact_match or _DEGREE_PATTERN.search(title)
-            if not degree_match:
-                return None
-
-            threshold_raw = float(degree_match.group(1))
-            unit = degree_match.group(2).upper()
-            threshold = threshold_raw if unit == "C" else (threshold_raw - 32) * 5 / 9
-
-            if exact_match and not above_below:
-                direction = "equal"
+            range_match = _TEMP_RANGE.search(title)
+            if range_match:
+                unit = range_match.group(3).upper()
+                threshold = _to_celsius(float(range_match.group(1)), unit)
+                threshold_high = _to_celsius(float(range_match.group(2)), unit)
+                direction = "range"
             else:
-                direction = _extract_direction(above_below)
+                exact_match = _EXACT_TEMP.search(title)
+                degree_match = exact_match or _DEGREE_PATTERN.search(title)
+                if not degree_match:
+                    return None
+
+                unit = degree_match.group(2).upper()
+                threshold = _to_celsius(float(degree_match.group(1)), unit)
+
+                if exact_match and not above_below:
+                    direction = "equal"
+                else:
+                    direction = _extract_direction(above_below)
 
             metric = "temperature_2m_max" if "high" in title.lower() else "temperature_2m_min"
 

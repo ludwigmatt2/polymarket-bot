@@ -20,7 +20,7 @@ from .config import (
     MAX_PAPER_DRAWDOWN_PCT,
     PAPER_TRADE_SIZE_USD,
 )
-from .models import PaperTrade, PaperTradingStats, Signal
+from .models import Location, PaperTrade, PaperTradingStats, Signal
 
 PAPER_TRADES_LOG = Path("logs/paper_trades.csv")
 
@@ -29,6 +29,8 @@ CSV_HEADERS = [
     "signal_time", "entry_price", "model_p", "direction",
     "size_usd", "edge_pp", "ensemble_spread", "confidence_score",
     "resolution_date",
+    # Resolution fields — stored at log time so auto-resolve needs no re-parsing
+    "metric", "threshold", "threshold_high", "weather_direction", "lat", "lon",
     "actual_outcome", "resolved_at", "pnl_usd", "brier_score",
     "cumulative_pnl", "cumulative_brier",
 ]
@@ -40,13 +42,21 @@ _CLIMATOLOGY_BRIER = 0.25
 class PaperTrader:
     def __init__(self, log_path: Path = PAPER_TRADES_LOG):
         self.log_path = log_path
+        self._existing_keys: set[tuple[str, str]] | None = None
 
     def log_trade(self, signal: Signal) -> PaperTrade | None:
         """
         Record a hypothetical trade entry. Returns the PaperTrade object.
-        Returns None if the signal gate did not pass.
+        Returns None if the signal gate did not pass or market already logged.
         """
         if not signal.quality_gate_passed:
+            return None
+
+        if self._existing_keys is None:
+            self._existing_keys = {(r["market_id"], r["direction"]) for r in self._load_all()}
+
+        key = (signal.market.market_id, signal.direction)
+        if key in self._existing_keys:
             return None
 
         trade = PaperTrade(
@@ -62,8 +72,15 @@ class PaperTrader:
             ensemble_spread=signal.ensemble_spread,
             confidence_score=signal.confidence_score,
             resolution_date=signal.market.resolution_date,
+            metric=signal.market.metric,
+            threshold=signal.market.threshold,
+            threshold_high=signal.market.threshold_high,
+            weather_direction=signal.market.direction,
+            lat=signal.market.location.lat,
+            lon=signal.market.location.lon,
         )
         self._append_trade(trade)
+        self._existing_keys.add(key)
         return trade
 
     def resolve_trade(self, trade_id: str, actual_outcome: bool) -> PaperTrade | None:
@@ -118,6 +135,77 @@ class PaperTrader:
             pnl_usd=round(pnl, 4),
             brier_score=round(brier, 4),
         )
+
+    def auto_resolve(self, weather_client) -> tuple[int, int]:
+        """
+        Fetch actual outcomes from the archive API and resolve all eligible trades.
+
+        Eligible: resolution_date has passed AND actual_outcome is blank AND
+        the trade has location/threshold data stored (metric, lat, lon fields non-empty).
+
+        Returns (resolved_count, skipped_count).
+        """
+        now = datetime.now(timezone.utc)
+        trades = self._load_all()
+        resolved = skipped = 0
+
+        for t in trades:
+            if t.get("actual_outcome") not in (None, "", "None"):
+                continue
+
+            res_date_str = t.get("resolution_date", "")
+            if not res_date_str:
+                skipped += 1
+                continue
+            res_dt = datetime.fromisoformat(res_date_str)
+            if not res_dt.tzinfo:
+                res_dt = res_dt.replace(tzinfo=timezone.utc)
+            if res_dt > now:
+                continue  # not yet resolved
+
+            metric = t.get("metric", "")
+            lat_str = t.get("lat", "")
+            lon_str = t.get("lon", "")
+            if not metric or not lat_str or not lon_str:
+                skipped += 1
+                continue
+
+            try:
+                lat, lon = float(lat_str), float(lon_str)
+                threshold = float(t["threshold"])
+                threshold_high = float(t["threshold_high"]) if t.get("threshold_high") else None
+                w_dir = t.get("weather_direction", "above")
+            except (ValueError, KeyError):
+                skipped += 1
+                continue
+
+            loc = Location(city="", lat=lat, lon=lon, timezone="UTC")
+            actual_val = weather_client.get_historical_actual(loc, res_dt.date(), metric)
+            if actual_val is None:
+                skipped += 1
+                continue
+
+            outcome = _evaluate_outcome(actual_val, threshold, w_dir, threshold_high)
+
+            # Compute PnL and Brier in-place to avoid O(n²) load+rewrite per trade
+            entry_price = float(t["entry_price"])
+            size_usd = float(t["size_usd"])
+            model_p = float(t["model_p"])
+            if t["direction"] == "YES":
+                pnl = size_usd * ((1.0 - entry_price) if outcome else -entry_price)
+            else:
+                pnl = size_usd * (entry_price if not outcome else -(1.0 - entry_price))
+
+            t["actual_outcome"] = int(outcome)
+            t["resolved_at"] = now.isoformat()
+            t["pnl_usd"] = round(pnl, 4)
+            t["brier_score"] = round((model_p - float(outcome)) ** 2, 4)
+            resolved += 1
+
+        if resolved:
+            self._rewrite_all(trades)
+
+        return resolved, skipped
 
     def compute_stats(self) -> PaperTradingStats:
         """Compute aggregate metrics over all resolved trades."""
@@ -227,6 +315,12 @@ class PaperTrader:
                 "ensemble_spread": trade.ensemble_spread,
                 "confidence_score": trade.confidence_score,
                 "resolution_date": trade.resolution_date.isoformat(),
+                "metric": trade.metric,
+                "threshold": trade.threshold,
+                "threshold_high": trade.threshold_high if trade.threshold_high is not None else "",
+                "weather_direction": trade.weather_direction,
+                "lat": trade.lat,
+                "lon": trade.lon,
                 "actual_outcome": "",
                 "resolved_at": "",
                 "pnl_usd": "",
@@ -239,10 +333,33 @@ class PaperTrader:
         if not self.log_path.exists():
             return []
         with open(self.log_path) as f:
-            return list(csv.DictReader(f))
+            rows = list(csv.DictReader(f))
+        # Back-fill missing columns added after initial schema (metric/threshold/lat/lon).
+        # Rows written before the schema change simply get empty strings for new fields.
+        new_fields = {"metric", "threshold", "threshold_high", "weather_direction", "lat", "lon"}
+        if rows and not new_fields.issubset(rows[0].keys()):
+            for row in rows:
+                for field in new_fields:
+                    row.setdefault(field, "")
+        return rows
 
     def _rewrite_all(self, trades: list[dict]) -> None:
         with open(self.log_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=CSV_HEADERS, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(trades)
+
+
+def _evaluate_outcome(
+    actual: float,
+    threshold: float,
+    direction: str,
+    threshold_high: float | None = None,
+) -> bool:
+    if direction == "above":
+        return actual > threshold
+    if direction == "below":
+        return actual < threshold
+    if direction == "range" and threshold_high is not None:
+        return threshold <= actual <= threshold_high
+    return abs(actual - threshold) <= 0.5  # "equal" — ±0.5°C

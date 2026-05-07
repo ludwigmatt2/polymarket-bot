@@ -102,11 +102,20 @@ class TestComputeProbability:
         assert result.raw_p == pytest.approx(0.5)
         assert result.n_members == 0
 
-    def test_ensemble_spread_matches_model_means(self, model, forecast_above):
-        result = model.compute_probability(forecast_above, threshold=90.0, direction="above")
-        # Spread = std of model means [93.0, 91.0]
-        expected_spread = float(np.std([93.0, 91.0]))
-        assert result.ensemble_spread == pytest.approx(expected_spread, abs=0.01)
+    def test_ensemble_spread_uses_per_model_probabilities(self, model):
+        # Two models that completely disagree on the threshold:
+        # GFS all above (P=1.0), ICON all below (P=0.0). Spread = std([1.0, 0.0]) = 0.5.
+        forecast = EnsembleForecast(
+            lat=25.77, lon=-80.19,
+            target_date=date(2026, 5, 1),
+            metric="temperature_2m_max",
+            member_arrays={
+                "gfs_seamless": [92.0, 93.0, 94.0, 95.0, 96.0],
+                "icon_seamless": [80.0, 81.0, 82.0, 83.0, 84.0],
+            },
+        )
+        result = model.compute_probability(forecast, threshold=90.0, direction="above")
+        assert result.ensemble_spread == pytest.approx(0.5, abs=0.01)
 
 
 class TestEnsembleSpread:
