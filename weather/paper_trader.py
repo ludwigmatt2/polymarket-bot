@@ -333,7 +333,15 @@ class PaperTrader:
         if not self.log_path.exists():
             return []
         with open(self.log_path) as f:
-            return list(csv.DictReader(f))
+            rows = list(csv.DictReader(f))
+        # Back-fill missing columns added after initial schema (metric/threshold/lat/lon).
+        # Rows written before the schema change simply get empty strings for new fields.
+        new_fields = {"metric", "threshold", "threshold_high", "weather_direction", "lat", "lon"}
+        if rows and not new_fields.issubset(rows[0].keys()):
+            for row in rows:
+                for field in new_fields:
+                    row.setdefault(field, "")
+        return rows
 
     def _rewrite_all(self, trades: list[dict]) -> None:
         with open(self.log_path, "w", newline="") as f:
