@@ -25,8 +25,9 @@ htmlcov/
 logs/
 *.log
 
-# ── Claude Code (local machine settings only) ──────────────────────────────────
-.claude/settings.local.json
+# ── Claude Code — personal config, not for repos ───────────────────────────────
+.claude/
+CLAUDE.md
 
 # ── macOS ──────────────────────────────────────────────────────────────────────
 .DS_Store
