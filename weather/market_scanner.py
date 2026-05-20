@@ -11,7 +11,10 @@ Unparseable markets are logged to logs/unparseable_markets.csv for iteration.
 from __future__ import annotations
 
 import csv
+import json
 import re
+import urllib.parse
+import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -90,16 +93,54 @@ def _extract_direction(above_below_match) -> str:
     return "above"
 
 
+class _YesSide:
+    def __init__(self, price: float):
+        self.price = price
+
+
+class _GammaMarket:
+    """Adapter wrapping a Gamma API market dict to match the pmxt.UnifiedMarket interface."""
+
+    def __init__(self, market: dict, event: dict):
+        self.market_id: str = market.get("conditionId", "")
+        prices_raw = market.get("outcomePrices", "[]")
+        prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+        self.yes = _YesSide(float(prices[0])) if prices else None
+        self.liquidity: float = float(market.get("volumeClob") or market.get("volume") or 0.0)
+        event_title = event.get("title", "")
+        question = market.get("question", "")
+        self.title: str = f"{event_title} - {question}" if event_title and question else (event_title or question)
+        self.description: str = market.get("description") or event.get("description") or ""
+        end_raw = market.get("endDate") or market.get("endDateIso") or ""
+        try:
+            self.resolution_date = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            self.resolution_date = None
+        slug = event.get("slug", "")
+        self.url: str = f"https://polymarket.com/event/{slug}" if slug else ""
+
+
+_GAMMA_SEARCH_URL = "https://gamma-api.polymarket.com/public-search"
+
+
 class WeatherMarketScanner:
     def __init__(self):
         # Weather scanning only needs public market data via the local CLOB sidecar,
         # which supports keyword search. The hosted PMXT API (PMXT_API_KEY) rejects
         # the `query`/`status` params, so we create the client in local mode.
         import os
-        _key = os.environ.pop("PMXT_API_KEY", None)
+        # Strip credentials that aren't needed for public market search and that
+        # newer pmxt versions now validate strictly (rejecting placeholder values).
+        _pmxt_key = os.environ.pop("PMXT_API_KEY", None)
+        _poly_pk = os.environ.pop("POLYMARKET_PRIVATE_KEY", None)
+        _poly_proxy = os.environ.pop("POLYMARKET_PROXY_ADDRESS", None)
         self._poly = pmxt.Polymarket()
-        if _key:
-            os.environ["PMXT_API_KEY"] = _key
+        if _pmxt_key:
+            os.environ["PMXT_API_KEY"] = _pmxt_key
+        if _poly_pk:
+            os.environ["POLYMARKET_PRIVATE_KEY"] = _poly_pk
+        if _poly_proxy:
+            os.environ["POLYMARKET_PROXY_ADDRESS"] = _poly_proxy
 
         self._weather_client = WeatherClient()
         self._geocache: dict[str, Location | None] = {}
@@ -136,26 +177,29 @@ class WeatherMarketScanner:
         print(f"    tradeable after filters: {len(tradeable)} / {len(parsed)}")
         return tradeable
 
-    def _search_keywords(self) -> list[pmxt.UnifiedMarket]:
-        """Query Polymarket for each weather keyword, deduplicate by market_id."""
+    def _search_keywords(self) -> list[_GammaMarket]:
+        """Query Polymarket for each weather keyword via Gamma API, deduplicate by condition_id."""
         seen_ids: set[str] = set()
-        markets: list[pmxt.UnifiedMarket] = []
+        markets: list[_GammaMarket] = []
 
         for term in WEATHER_SEARCH_TERMS:
             try:
-                batch = self._poly.fetch_markets(
-                    params={"query": term, "status": "active", "limit": 50}
-                )
-                for m in batch:
-                    if m.market_id not in seen_ids:
-                        seen_ids.add(m.market_id)
-                        markets.append(m)
+                url = f"{_GAMMA_SEARCH_URL}?q={urllib.parse.quote(term)}&limit=50"
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read())
+                for event in data.get("events", []):
+                    for m in event.get("markets", []):
+                        cid = m.get("conditionId", "")
+                        if cid and cid not in seen_ids:
+                            seen_ids.add(cid)
+                            markets.append(_GammaMarket(m, event))
             except Exception as e:
                 print(f"    warning: search failed for {term!r}: {e}", flush=True)
 
         return markets
 
-    def _parse_market(self, m: pmxt.UnifiedMarket) -> WeatherMarket | None:
+    def _parse_market(self, m: _GammaMarket) -> WeatherMarket | None:
         """
         Attempt to extract weather signal from a market.
         Returns None if the market title cannot be interpreted as a binary weather bet.
