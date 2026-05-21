@@ -1,4 +1,5 @@
 pmxt>=2.35.0
+python-telegram-bot==21.9
 requests>=2.33.0
 python-dotenv>=1.0.0
 numpy>=1.26.0

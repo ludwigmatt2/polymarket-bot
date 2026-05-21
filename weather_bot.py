@@ -62,7 +62,57 @@ def run_scan(scanner: WeatherMarketScanner, generator: SignalGenerator, paper: P
         print(f"{sum(1 for t in logged if t)} logged")
 
     _print_scan_summary(signals, actionable, rejected)
+    _write_signals_file(actionable)
     return signals
+
+
+def _write_signals_file(actionable: list[Signal]) -> None:
+    import json
+    from pathlib import Path
+    out = Path("logs/last_signals.json")
+    out.write_text(json.dumps({
+        "scanned_at": datetime.utcnow().isoformat(),
+        "signals": [
+            {
+                "title": s.market.title,
+                "edge_pp": s.edge_pp,
+                "model_p": s.model_p,
+                "mkt_p": s.market_p,
+                "direction": s.direction,
+                "resolution_date": s.market.resolution_date.isoformat() if s.market.resolution_date else None,
+            }
+            for s in sorted(actionable, key=lambda x: x.edge_pp, reverse=True)
+        ],
+    }))
+
+
+def _write_resolved_file(paper: "PaperTrader", resolved_count: int) -> None:
+    import csv as _csv
+    import json
+    from pathlib import Path
+    trades_path = Path("logs/paper_trades.csv")
+    if not trades_path.exists():
+        return
+    with trades_path.open() as f:
+        rows = list(_csv.DictReader(f))
+    # Most recently resolved trades (by resolved_at timestamp)
+    recently_resolved = sorted(
+        [r for r in rows if r.get("resolved_at")],
+        key=lambda x: x.get("resolved_at", ""), reverse=True
+    )[:resolved_count]
+    Path("logs/last_resolved.json").write_text(json.dumps({
+        "resolved_at": __import__("datetime").datetime.utcnow().isoformat(),
+        "count": resolved_count,
+        "resolved": [
+            {
+                "market_title": r.get("market_title", ""),
+                "direction": r.get("direction", ""),
+                "pnl_usd": float(r.get("pnl_usd", 0)),
+                "resolved_at": r.get("resolved_at", ""),
+            }
+            for r in recently_resolved
+        ],
+    }))
 
 
 def _print_scan_summary(signals: list[Signal], actionable: list[Signal], rejected: list[Signal]) -> None:
@@ -382,10 +432,11 @@ def main() -> None:
     if args.mode == "auto-resolve":
         paper = PaperTrader()
         client = WeatherClient()
-        resolved, skipped = paper.auto_resolve(client)
-        print(f"  Auto-resolved {resolved} trade(s).  {skipped} skipped (no archive data or missing fields).")
-        if resolved:
+        resolved_count, skipped = paper.auto_resolve(client)
+        print(f"  Auto-resolved {resolved_count} trade(s).  {skipped} skipped (no archive data or missing fields).")
+        if resolved_count:
             paper.print_dashboard()
+            _write_resolved_file(paper, resolved_count)
         return
 
     if args.mode == "backtest":
