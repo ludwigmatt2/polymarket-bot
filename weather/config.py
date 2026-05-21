@@ -22,6 +22,9 @@ VELOCITY_WINDOW_HOURS = 6       # Rolling window for velocity measurement
 
 # ── Composite confidence (Gate 8) ─────────────────────────────────────────────
 MIN_COMPOSITE_CONFIDENCE = 0.30  # Weighted score of spread + timing + calibration
+GATE8_SPREAD_WEIGHT = 0.40
+GATE8_TIMING_WEIGHT = 0.35
+GATE8_CALIB_WEIGHT = 0.25
 
 # ── Market filters ─────────────────────────────────────────────────────────────
 MIN_MARKET_LIQUIDITY_USD = 50.0  # Lowered to include monthly precipitation markets

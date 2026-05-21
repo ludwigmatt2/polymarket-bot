@@ -21,6 +21,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from .config import (
+    GATE8_CALIB_WEIGHT,
+    GATE8_SPREAD_WEIGHT,
+    GATE8_TIMING_WEIGHT,
     MAX_ENTRY_DAYS_AHEAD,
     MAX_ENSEMBLE_SPREAD,
     MAX_FORECAST_AGE_HOURS,
@@ -164,12 +167,17 @@ class SignalGenerator:
             if velocity is not None and abs(velocity) > MAX_PRICE_VELOCITY_PP:
                 return False, f"gate6_informed_flow:{velocity:+.3f}", 0.0
 
-        # Gate 8: Composite confidence (spread 40% + timing 35% + calibration 25%)
+        # Gate 8: Composite confidence
         spread_component = 1.0 - min(prob.ensemble_spread / MAX_ENSEMBLE_SPREAD, 1.0)
         timing_component = 1.0 - min(max(days_to_res, 0) / MAX_ENTRY_DAYS_AHEAD, 1.0)
-        calib_component = min(self.model.n_calibration_obs / 50, 1.0)
+        calib_component = min(
+            self.model.n_calibration_obs / self.model.MIN_CALIBRATION_OBS, 1.0
+        )
         composite = round(
-            0.40 * spread_component + 0.35 * timing_component + 0.25 * calib_component, 3
+            GATE8_SPREAD_WEIGHT * spread_component
+            + GATE8_TIMING_WEIGHT * timing_component
+            + GATE8_CALIB_WEIGHT * calib_component,
+            3,
         )
         if composite < MIN_COMPOSITE_CONFIDENCE:
             return False, f"gate8_low_confidence:{composite:.3f}_required:{MIN_COMPOSITE_CONFIDENCE}", composite

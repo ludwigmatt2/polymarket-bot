@@ -1,16 +1,13 @@
 """Tests for signal generator quality gates and direction logic."""
 
 from datetime import date, datetime, timezone, timedelta
-from unittest.mock import MagicMock, patch
-import tempfile
-from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
 from weather.config import MAX_ENSEMBLE_SPREAD, MIN_NET_EV_PP, ROUND_TRIP_FEE
 from weather.models import EnsembleForecast, Location, RawProbabilityResult, WeatherMarket
 from weather.signal_generator import SignalGenerator
-from weather.price_tracker import PriceTracker
 
 
 def _make_market(yes_price=0.30, liquidity=5000.0, days_out=3):
@@ -45,6 +42,7 @@ def _make_generator(model_p=0.80, price_tracker=None):
     client = MagicMock()
     model = MagicMock()
     model.n_calibration_obs = 0
+    model.MIN_CALIBRATION_OBS = 50
     client.get_ensemble_forecast.return_value = _make_forecast()
     model.compute_probability.return_value = RawProbabilityResult(
         raw_p=model_p, calibrated_p=model_p,
@@ -99,6 +97,7 @@ class TestQualityGates:
         client = MagicMock()
         model = MagicMock()
         model.n_calibration_obs = 0
+        model.MIN_CALIBRATION_OBS = 50
         client.get_ensemble_forecast.return_value = _make_forecast(spread=2.0)
         model.compute_probability.return_value = RawProbabilityResult(
             raw_p=0.80, calibrated_p=0.80,
@@ -116,6 +115,7 @@ class TestQualityGates:
         client = MagicMock()
         model = MagicMock()
         model.n_calibration_obs = 0
+        model.MIN_CALIBRATION_OBS = 50
         client.get_ensemble_forecast.return_value = _make_forecast()
         model.compute_probability.return_value = RawProbabilityResult(
             raw_p=0.80, calibrated_p=0.80,
@@ -133,6 +133,7 @@ class TestQualityGates:
         client = MagicMock()
         model = MagicMock()
         model.n_calibration_obs = 0
+        model.MIN_CALIBRATION_OBS = 50
         client.get_ensemble_forecast.return_value = _make_forecast(age_hours=8)  # > 6h limit
         model.compute_probability.return_value = RawProbabilityResult(
             raw_p=0.80, calibrated_p=0.80,
@@ -154,8 +155,6 @@ class TestQualityGates:
 
     def test_rejects_too_late_to_resolution(self):
         gen = _make_generator(model_p=0.80)
-        # 1 hour to resolution < MIN_ENTRY_HOURS_AHEAD=4
-        market = _make_market(yes_price=0.30)
         market = WeatherMarket(
             market_id="test_mkt",
             title="Will the high temperature in Miami exceed 90°F on May 5?",
@@ -175,24 +174,12 @@ class TestQualityGates:
 
     # Gate 6 — odds velocity
     def test_rejects_informed_flow(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tracker = PriceTracker(log_path=Path(tmpdir) / "price_history.csv")
-            # Simulate price having moved 20pp in the window
-            from datetime import timedelta
-            import time
-            tracker.record("test_mkt", 0.10)
-            # Manually backdate the first record by writing directly
-            tracker.record("test_mkt", 0.30)  # 20pp move
-
-            gen = _make_generator(model_p=0.80, price_tracker=tracker)
-            # Patch get_velocity to return a large delta
-            tracker_mock = MagicMock()
-            tracker_mock.get_velocity.return_value = 0.20  # 20pp > MAX_PRICE_VELOCITY_PP=0.15
-            gen.price_tracker = tracker_mock
-
-            signal = gen.evaluate(_make_market(yes_price=0.30))
-            assert signal.quality_gate_passed is False
-            assert "gate6_informed_flow" in signal.rejection_reason
+        tracker_mock = MagicMock()
+        tracker_mock.get_velocity.return_value = 0.20  # 20pp > MAX_PRICE_VELOCITY_PP=0.15
+        gen = _make_generator(model_p=0.80, price_tracker=tracker_mock)
+        signal = gen.evaluate(_make_market(yes_price=0.30))
+        assert signal.quality_gate_passed is False
+        assert "gate6_informed_flow" in signal.rejection_reason
 
     # Gate 8 — composite confidence
     def test_confidence_score_in_signal(self):
@@ -205,6 +192,7 @@ class TestQualityGates:
         client = MagicMock()
         model = MagicMock()
         model.n_calibration_obs = 0
+        model.MIN_CALIBRATION_OBS = 50
         # Very high spread → spread_component near 0
         client.get_ensemble_forecast.return_value = _make_forecast(spread=0.0)
         model.compute_probability.return_value = RawProbabilityResult(
