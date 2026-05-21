@@ -254,7 +254,12 @@ class WeatherMarketScanner:
                 else:
                     direction = _extract_direction(above_below)
 
-            metric = "temperature_2m_max" if "high" in title.lower() else "temperature_2m_min"
+            title_lower = title.lower()
+            metric = (
+                "temperature_2m_min"
+                if "lowest" in title_lower or "low temperature" in title_lower
+                else "temperature_2m_max"
+            )
 
         # City extraction — try pattern match first, fall back to first capitalized sequence
         location = self._extract_location(title)
