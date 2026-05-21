@@ -16,6 +16,7 @@ The active strategy is selected via /strategy (admin only). Currently: weather.
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import json
 import os
@@ -469,7 +470,7 @@ async def check_alerts(ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main() -> None:
+async def _run() -> None:
     _seed_admin()
 
     app = Application.builder().token(BOT_TOKEN).build()
@@ -490,11 +491,17 @@ def main() -> None:
 
     app.add_handler(CallbackQueryHandler(on_button))
 
-    # Check for new signals/resolves every 2 minutes
-    app.job_queue.run_repeating(check_alerts, interval=120, first=10)
+    async with app:
+        await app.start()
+        app.job_queue.run_repeating(check_alerts, interval=120, first=10)
+        await app.updater.start_polling(drop_pending_updates=True)
+        print("Polymarket Bot online.", flush=True)
+        await asyncio.Event().wait()  # run until process is killed
 
-    print("Polymarket Bot online.")
-    app.run_polling(drop_pending_updates=True)
+
+def main() -> None:
+    import asyncio
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":
