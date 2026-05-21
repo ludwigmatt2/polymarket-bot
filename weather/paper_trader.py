@@ -203,6 +203,16 @@ class PaperTrader:
             resolved += 1
 
         if resolved:
+            # Back-fill cumulative columns across all rows in chronological order
+            cum_pnl = 0.0
+            cum_brier = 0.0
+            for t in trades:
+                if t.get("pnl_usd") not in (None, ""):
+                    cum_pnl += float(t["pnl_usd"])
+                    t["cumulative_pnl"] = round(cum_pnl, 4)
+                if t.get("brier_score") not in (None, ""):
+                    cum_brier += float(t["brier_score"])
+                    t["cumulative_brier"] = round(cum_brier, 4)
             self._rewrite_all(trades)
 
         return resolved, skipped

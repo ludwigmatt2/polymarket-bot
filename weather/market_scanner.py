@@ -48,7 +48,7 @@ _ABOVE_BELOW = re.compile(
 _EXACT_TEMP = re.compile(r"\bwill.*?be\s+(\d+(?:\.\d+)?)\s*°?\s*([CF])\b", re.IGNORECASE)
 # "between 72-73°F" — temperature range market (common for F markets)
 _TEMP_RANGE = re.compile(
-    r"between\s+(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*°?\s*([CF])\b",
+    r"between\s+(\d+(?:\.\d+)?)\s*(?:-|and)\s*(\d+(?:\.\d+)?)\s*°?\s*([CF])\b",
     re.IGNORECASE,
 )
 

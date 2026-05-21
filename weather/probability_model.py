@@ -190,6 +190,8 @@ def _apply_kde(
             p = float(density[x_eval <= threshold].sum())
         elif direction == "range" and threshold_high is not None:
             p = float(density[(x_eval >= threshold) & (x_eval <= threshold_high)].sum())
+        elif direction == "equal":
+            p = float(density[(x_eval >= threshold - 0.5) & (x_eval <= threshold + 0.5)].sum())
         else:
             return fallback
         return float(np.clip(p, 0.001, 0.999))
