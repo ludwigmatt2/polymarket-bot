@@ -101,6 +101,10 @@ class ProbabilityModel:
             metric=forecast.metric,
         )
 
+    @property
+    def n_calibration_obs(self) -> int:
+        return len(self._calibration_obs)
+
     def is_confident(self, result: RawProbabilityResult) -> bool:
         """Returns True if forecast quality passes all uncertainty gates."""
         if result.n_members < MIN_ENSEMBLE_MEMBERS:

@@ -35,6 +35,7 @@ from weather.backtest import (
 from weather.market_scanner import WeatherMarketScanner
 from weather.models import Signal
 from weather.paper_trader import PaperTrader
+from weather.price_tracker import PriceTracker
 from weather.probability_model import ProbabilityModel
 from weather.signal_generator import SignalGenerator
 from weather.weather_client import WeatherClient
@@ -455,7 +456,8 @@ def main() -> None:
     client = WeatherClient()
     model = ProbabilityModel()
     scanner = WeatherMarketScanner()
-    generator = SignalGenerator(model=model, client=client)
+    price_tracker = PriceTracker()
+    generator = SignalGenerator(model=model, client=client, price_tracker=price_tracker)
     paper = PaperTrader() if args.mode == "paper" else None
 
     if args.mode == "debug":

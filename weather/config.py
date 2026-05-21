@@ -4,10 +4,24 @@ All thresholds and constants live here — no magic numbers in other modules.
 """
 
 # ── Signal quality thresholds ──────────────────────────────────────────────────
-MIN_EDGE_PP = 0.08              # 8pp minimum model vs market gap (after 4% fees)
+MIN_NET_EV_PP = 0.04            # Gate 4: minimum edge after subtracting round-trip fees
 MAX_DAYS_TO_RESOLUTION = 31     # Include monthly (May) markets
 MAX_ENSEMBLE_SPREAD = 0.20      # Allow slightly more uncertainty for monthly markets
 MIN_ENSEMBLE_MEMBERS = 3        # Minimum model count for a valid ensemble
+
+# ── Entry timing (Gate 1) ──────────────────────────────────────────────────────
+MAX_ENTRY_DAYS_AHEAD = 5        # Reject if resolution is more than 5 days out
+MIN_ENTRY_HOURS_AHEAD = 4       # Reject if resolution is less than 4 hours away
+
+# ── Forecast freshness (Gate 0) ───────────────────────────────────────────────
+MAX_FORECAST_AGE_HOURS = 6      # Reject if Open-Meteo data is older than 6 hours
+
+# ── Odds velocity / informed flow (Gate 6) ────────────────────────────────────
+MAX_PRICE_VELOCITY_PP = 0.15    # Block if price moved >15pp within the velocity window
+VELOCITY_WINDOW_HOURS = 6       # Rolling window for velocity measurement
+
+# ── Composite confidence (Gate 8) ─────────────────────────────────────────────
+MIN_COMPOSITE_CONFIDENCE = 0.30  # Weighted score of spread + timing + calibration
 
 # ── Market filters ─────────────────────────────────────────────────────────────
 MIN_MARKET_LIQUIDITY_USD = 50.0  # Lowered to include monthly precipitation markets
