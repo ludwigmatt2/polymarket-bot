@@ -33,15 +33,17 @@ from weather.backtest import (
     TempBacktester, TempBacktestResult, default_temp_test_suite, summarize_temp,
 )
 from weather.market_scanner import WeatherMarketScanner
+from weather.city_bias import CityBiasCorrector
 from weather.models import Signal
 from weather.paper_trader import PaperTrader
+from weather.position_monitor import PositionMonitor, print_flags
 from weather.price_tracker import PriceTracker
 from weather.probability_model import ProbabilityModel
 from weather.signal_generator import SignalGenerator
 from weather.weather_client import WeatherClient
 
 
-def run_scan(scanner: WeatherMarketScanner, generator: SignalGenerator, paper: PaperTrader | None) -> list[Signal]:
+def run_scan(scanner: WeatherMarketScanner, generator: SignalGenerator, paper: PaperTrader | None, log_dir: Path = Path("logs"), monitor: PositionMonitor | None = None) -> list[Signal]:
     """Single scan cycle: find markets → evaluate signals → optionally log."""
     print("  [1/3] Scanning Polymarket for weather markets...", end=" ", flush=True)
     markets = scanner.scan()
@@ -63,14 +65,23 @@ def run_scan(scanner: WeatherMarketScanner, generator: SignalGenerator, paper: P
         print(f"{sum(1 for t in logged if t)} logged")
 
     _print_scan_summary(signals, actionable, rejected)
-    _write_signals_file(actionable)
+    _write_signals_file(actionable, log_dir)
+
+    if monitor is not None:
+        print("  [4/4] Checking open positions (mark-to-model)...", end=" ", flush=True)
+        flags = monitor.check_open_positions()
+        print(f"{len(flags)} flag(s)")
+        if flags:
+            print()
+            print_flags(flags)
+
     return signals
 
 
-def _write_signals_file(actionable: list[Signal]) -> None:
+def _write_signals_file(actionable: list[Signal], log_dir: Path = Path("logs")) -> None:
     import json
-    from pathlib import Path
-    out = Path("logs/last_signals.json")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    out = log_dir / "last_signals.json"
     out.write_text(json.dumps({
         "scanned_at": datetime.utcnow().isoformat(),
         "signals": [
@@ -87,11 +98,11 @@ def _write_signals_file(actionable: list[Signal]) -> None:
     }))
 
 
-def _write_resolved_file(paper: "PaperTrader", resolved_count: int) -> None:
+def _write_resolved_file(paper: "PaperTrader", resolved_count: int, log_dir: Path = Path("logs")) -> None:
     import csv as _csv
     import json
-    from pathlib import Path
-    trades_path = Path("logs/paper_trades.csv")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    trades_path = log_dir / "paper_trades.csv"
     if not trades_path.exists():
         return
     with trades_path.open() as f:
@@ -101,7 +112,7 @@ def _write_resolved_file(paper: "PaperTrader", resolved_count: int) -> None:
         [r for r in rows if r.get("resolved_at")],
         key=lambda x: x.get("resolved_at", ""), reverse=True
     )[:resolved_count]
-    Path("logs/last_resolved.json").write_text(json.dumps({
+    (log_dir / "last_resolved.json").write_text(json.dumps({
         "resolved_at": __import__("datetime").datetime.utcnow().isoformat(),
         "count": resolved_count,
         "resolved": [
@@ -407,7 +418,7 @@ def mode_resolve(paper: PaperTrader) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Weather model arbitrage bot")
-    parser.add_argument("--mode", choices=["scan", "paper", "stats", "resolve", "auto-resolve", "debug", "backtest", "backtest-temp", "arb"],
+    parser.add_argument("--mode", choices=["scan", "paper", "stats", "resolve", "auto-resolve", "backfill-calibration", "debug", "backtest", "backtest-temp", "arb"],
                         default="paper", help="Operating mode (default: paper)")
     parser.add_argument("--interval", type=int, default=3600,
                         help="Re-scan interval in seconds for paper mode (default: 3600)")
@@ -417,27 +428,59 @@ def main() -> None:
                         help="Minimum cross-venue spread filter for arb mode (e.g. 0.04 for 4%%)")
     parser.add_argument("--limit", type=int, default=20,
                         help="Max results for arb mode (default: 20)")
+    parser.add_argument("--log-dir", type=Path, default=Path("logs"),
+                        help="Directory for trade logs and signal files (default: logs/)")
     args = parser.parse_args()
 
-    print(f"Weather Bot  [mode={args.mode}]")
+    log_dir: Path = args.log_dir
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Weather Bot  [mode={args.mode}  log-dir={log_dir}]")
     print()
 
     if args.mode == "stats":
-        mode_stats(PaperTrader())
+        mode_stats(PaperTrader(log_path=log_dir / "paper_trades.csv"))
         return
 
     if args.mode == "resolve":
-        mode_resolve(PaperTrader())
+        mode_resolve(PaperTrader(log_path=log_dir / "paper_trades.csv"))
         return
 
     if args.mode == "auto-resolve":
-        paper = PaperTrader()
+        paper  = PaperTrader(log_path=log_dir / "paper_trades.csv")
+        model  = ProbabilityModel(calibration_log_path=log_dir / "calibration_log.csv")
         client = WeatherClient()
-        resolved_count, skipped = paper.auto_resolve(client)
+        resolved_count, skipped = paper.auto_resolve(client, model=model)
         print(f"  Auto-resolved {resolved_count} trade(s).  {skipped} skipped (no archive data or missing fields).")
         if resolved_count:
             paper.print_dashboard()
-            _write_resolved_file(paper, resolved_count)
+            _write_resolved_file(paper, resolved_count, log_dir)
+            n_obs = model.n_calibration_obs
+            active = model._calibrator is not None
+            dirs  = list(model._calibrators_by_dir.keys())
+            print(f"  Calibration log: {n_obs} obs  |  active={active}  |  per-direction={dirs or 'none yet'}")
+        return
+
+    if args.mode == "backfill-calibration":
+        paper = PaperTrader(log_path=log_dir / "paper_trades.csv")
+        model = ProbabilityModel(calibration_log_path=log_dir / "calibration_log.csv")
+        resolved = [t for t in paper._load_all() if t.get("actual_outcome") not in (None, "", "None")]
+        count = 0
+        for t in resolved:
+            try:
+                model.log_observation(
+                    float(t["model_p"]),
+                    bool(int(t["actual_outcome"])),
+                    direction=t.get("weather_direction", ""),
+                )
+                count += 1
+            except (ValueError, KeyError):
+                pass
+        n_obs = model.n_calibration_obs
+        active = model._calibrator is not None
+        dirs   = list(model._calibrators_by_dir.keys())
+        print(f"  Backfilled {count} observations into {log_dir / 'calibration_log.csv'}")
+        print(f"  Total obs: {n_obs}  |  global calibrator active: {active}  |  per-direction: {dirs or 'none'}")
         return
 
     if args.mode == "backtest":
@@ -453,24 +496,28 @@ def main() -> None:
         return
 
     # Build components
-    client = WeatherClient()
-    model = ProbabilityModel()
-    scanner = WeatherMarketScanner()
+    client        = WeatherClient()
+    model         = ProbabilityModel(calibration_log_path=log_dir / "calibration_log.csv")
+    bias          = CityBiasCorrector()
+    scanner       = WeatherMarketScanner()
     price_tracker = PriceTracker()
-    generator = SignalGenerator(model=model, client=client, price_tracker=price_tracker)
-    paper = PaperTrader() if args.mode == "paper" else None
+    generator     = SignalGenerator(model=model, client=client, price_tracker=price_tracker, bias_corrector=bias)
+    paper         = PaperTrader(log_path=log_dir / "paper_trades.csv") if args.mode == "paper" else None
+    monitor       = PositionMonitor(client=client, model=model,
+                                    trades_csv=log_dir / "paper_trades.csv",
+                                    bias_corrector=bias)
 
     if args.mode == "debug":
         mode_debug(scanner, generator, city_filter=args.city)
         return
 
     if args.mode == "scan":
-        run_scan(scanner, generator, paper=None)
+        run_scan(scanner, generator, paper=None, log_dir=log_dir, monitor=monitor)
         return
 
     # paper mode — one-shot (interval=0) or continuous
     if args.interval == 0:
-        run_scan(scanner, generator, paper)
+        run_scan(scanner, generator, paper, log_dir, monitor)
         return
 
     print(f"  Scanning every {args.interval}s. Ctrl+C to stop.\n")
@@ -479,7 +526,7 @@ def main() -> None:
         scan_count += 1
         print(f"─── Scan #{scan_count} ────────────────────────────────────────────")
         try:
-            run_scan(scanner, generator, paper)
+            run_scan(scanner, generator, paper, log_dir, monitor)
         except Exception as e:
             print(f"  Scan error: {e}", file=sys.stderr)
         time.sleep(args.interval)

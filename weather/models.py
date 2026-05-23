@@ -97,12 +97,13 @@ class RawProbabilityResult:
 @dataclass
 class Signal:
     market: WeatherMarket
-    model_p: float          # Calibrated model probability
+    model_p: float          # Calibrated model probability (after all shrinkages)
     market_p: float         # Current market price
     edge_pp: float          # abs(model_p - market_p) — always positive
     direction: str          # "YES" or "NO" (which contract to buy)
     ensemble_spread: float
-    confidence_score: float # 1 - (spread / MAX_ENSEMBLE_SPREAD), for sizing
+    confidence_score: float # Gate 8 composite score
+    size_factor: float      # 0.0–1.0: spread × lead-time confidence (for position sizing)
     quality_gate_passed: bool
     rejection_reason: str | None
     signal_time: datetime
@@ -120,6 +121,7 @@ class PaperTrade:
     model_p: float
     direction: str          # "YES" or "NO"
     size_usd: float
+    size_factor: float      # 0.0–1.0 spread×lead-time weight applied to size_usd
     edge_pp: float
     ensemble_spread: float
     confidence_score: float

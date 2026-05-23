@@ -30,6 +30,9 @@ GATE8_CALIB_WEIGHT = 0.25
 MIN_MARKET_LIQUIDITY_USD = 50.0  # Lowered to include monthly precipitation markets
 MIN_MARKET_PRICE = 0.03         # Avoid illiquid extremes
 MAX_MARKET_PRICE = 0.97
+# Gate 9.5: skip "equal" direction markets where crowd is this confident —
+# evidence shows they are pricing on near-real-time station data we don't have
+EXTREME_EQUAL_MARKET_THRESHOLD = 0.85
 
 # ── Fee model ──────────────────────────────────────────────────────────────────
 TAKER_FEE_PER_SIDE = 0.02       # 2% per trade (Polymarket CLOB taker)
@@ -56,9 +59,12 @@ OPEN_METEO_GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 OPEN_METEO_REQUEST_TIMEOUT = 15  # seconds
 
+# ── Lead-time skill decay ──────────────────────────────────────────────────────
+LEAD_TIME_DECAY_PER_DAY = 0.05   # Shrink model_p 5% per day beyond day-1 toward 0.5
+
 # Ensemble model IDs recognized by Open-Meteo /v1/ensemble
-# GFS: 31 members; ICON-EPS: 40 members; ECMWF IFS: 51 members (premium)
-ENSEMBLE_MODELS = ["gfs_seamless", "icon_seamless"]
+# GFS: 31 members; ICON-EPS: 40 members; ECMWF IFS: 50 members
+ENSEMBLE_MODELS = ["gfs_seamless", "icon_seamless", "ecmwf_ifs025"]
 
 # Deterministic models used for cross-model spread (uncertainty proxy)
 FORECAST_MODELS = ["gfs_seamless", "ecmwf_ifs025", "icon_seamless"]

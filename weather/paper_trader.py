@@ -27,7 +27,7 @@ PAPER_TRADES_LOG = Path("logs/paper_trades.csv")
 CSV_HEADERS = [
     "trade_id", "market_id", "market_title",
     "signal_time", "entry_price", "model_p", "direction",
-    "size_usd", "edge_pp", "ensemble_spread", "confidence_score",
+    "size_usd", "size_factor", "edge_pp", "ensemble_spread", "confidence_score",
     "resolution_date",
     # Resolution fields — stored at log time so auto-resolve needs no re-parsing
     "metric", "threshold", "threshold_high", "weather_direction", "lat", "lon",
@@ -59,6 +59,7 @@ class PaperTrader:
         if key in self._existing_keys:
             return None
 
+        size_factor = getattr(signal, "size_factor", 1.0)
         trade = PaperTrade(
             trade_id=str(uuid.uuid4())[:8],
             market_id=signal.market.market_id,
@@ -67,7 +68,8 @@ class PaperTrader:
             entry_price=signal.market_p if signal.direction == "YES" else (1.0 - signal.market_p),
             model_p=signal.model_p,
             direction=signal.direction,
-            size_usd=PAPER_TRADE_SIZE_USD,
+            size_usd=round(PAPER_TRADE_SIZE_USD * size_factor, 2),
+            size_factor=size_factor,
             edge_pp=signal.edge_pp,
             ensemble_spread=signal.ensemble_spread,
             confidence_score=signal.confidence_score,
@@ -136,7 +138,7 @@ class PaperTrader:
             brier_score=round(brier, 4),
         )
 
-    def auto_resolve(self, weather_client) -> tuple[int, int]:
+    def auto_resolve(self, weather_client, model=None) -> tuple[int, int]:
         """
         Fetch actual outcomes from the archive API and resolve all eligible trades.
 
@@ -201,6 +203,9 @@ class PaperTrader:
             t["pnl_usd"] = round(pnl, 4)
             t["brier_score"] = round((model_p - float(outcome)) ** 2, 4)
             resolved += 1
+
+            if model is not None:
+                model.log_observation(model_p, outcome, direction=w_dir)
 
         if resolved:
             # Back-fill cumulative columns across all rows in chronological order
@@ -321,6 +326,7 @@ class PaperTrader:
                 "model_p": trade.model_p,
                 "direction": trade.direction,
                 "size_usd": trade.size_usd,
+                "size_factor": trade.size_factor,
                 "edge_pp": trade.edge_pp,
                 "ensemble_spread": trade.ensemble_spread,
                 "confidence_score": trade.confidence_score,

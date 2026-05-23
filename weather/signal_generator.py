@@ -21,9 +21,11 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from .config import (
+    EXTREME_EQUAL_MARKET_THRESHOLD,
     GATE8_CALIB_WEIGHT,
     GATE8_SPREAD_WEIGHT,
     GATE8_TIMING_WEIGHT,
+    LEAD_TIME_DECAY_PER_DAY,
     MAX_ENTRY_DAYS_AHEAD,
     MAX_ENSEMBLE_SPREAD,
     MAX_FORECAST_AGE_HOURS,
@@ -37,6 +39,7 @@ from .config import (
     ROUND_TRIP_FEE,
     VELOCITY_WINDOW_HOURS,
 )
+from .city_bias import CityBiasCorrector
 from .models import EnsembleForecast, RawProbabilityResult, Signal, WeatherMarket
 from .probability_model import ProbabilityModel
 from .weather_client import WeatherClient
@@ -48,10 +51,12 @@ class SignalGenerator:
         model: ProbabilityModel,
         client: WeatherClient,
         price_tracker=None,
+        bias_corrector: CityBiasCorrector | None = None,
     ):
         self.model = model
         self.client = client
-        self.price_tracker = price_tracker  # Optional PriceTracker for Gate 6
+        self.price_tracker = price_tracker
+        self.bias_corrector = bias_corrector or CityBiasCorrector()
 
     def evaluate(self, market: WeatherMarket) -> Signal:
         """
@@ -75,11 +80,20 @@ class SignalGenerator:
                 metric=market.metric,
             )
 
+        # City bias correction: adjust threshold to compensate for systematic
+        # model warm/cold bias at this location.
+        bias_offset = self.bias_corrector.get_offset(
+            market.location.lat, market.location.lon
+        )
+        adj_threshold      = market.threshold - bias_offset
+        adj_threshold_high = (market.threshold_high - bias_offset
+                               if market.threshold_high is not None else None)
+
         prob_result = self.model.compute_probability(
             forecast=forecast,
-            threshold=market.threshold,
+            threshold=adj_threshold,
             direction=market.direction,
-            threshold_high=market.threshold_high,
+            threshold_high=adj_threshold_high,
         )
 
         gate_passed, rejection_reason, confidence_score = self._quality_gates(
@@ -91,9 +105,29 @@ class SignalGenerator:
             self.price_tracker.record(market.market_id, market.yes_price)
 
         model_p = prob_result.calibrated_p
+
+        # Lead-time + spread shrinkage: shrink model_p toward 0.5.
+        # skill: 5%/day decay beyond day-1; spread_factor: 0 at MAX_ENSEMBLE_SPREAD.
+        now = datetime.now(timezone.utc)
+        days_to_res = (market.resolution_date - now).total_seconds() / 86400
+        skill = max(0.5, 1.0 - LEAD_TIME_DECAY_PER_DAY * max(0.0, days_to_res - 1.0))
+        spread_factor = max(0.0, 1.0 - prob_result.ensemble_spread / MAX_ENSEMBLE_SPREAD)
+        model_p = 0.5 + (model_p - 0.5) * skill * spread_factor
+
+        # Re-check gate 4 after both shrinkages
+        if gate_passed:
+            net_ev_shrunk = abs(model_p - market.yes_price) - ROUND_TRIP_FEE
+            if net_ev_shrunk < MIN_NET_EV_PP:
+                gate_passed = False
+                rejection_reason = f"gate4_after_shrinkage:{net_ev_shrunk:.3f}"
+
         market_p = market.yes_price
         edge_pp = abs(model_p - market_p)
         direction = "YES" if model_p > market_p else "NO"
+
+        # Size factor (0.0–1.0): product of spread and lead-time confidence.
+        # Used by live trader for Kelly position sizing; paper trader logs it for analysis.
+        size_factor = round(spread_factor * skill, 3)
 
         return Signal(
             market=market,
@@ -103,6 +137,7 @@ class SignalGenerator:
             direction=direction,
             ensemble_spread=prob_result.ensemble_spread,
             confidence_score=confidence_score,
+            size_factor=size_factor,
             quality_gate_passed=gate_passed,
             rejection_reason=rejection_reason,
             signal_time=datetime.now(timezone.utc),
@@ -154,6 +189,14 @@ class SignalGenerator:
             return False, f"gate7_invalid_price:{market.yes_price}", 0.0
         if market.yes_price < (1 - MAX_MARKET_PRICE) or market.yes_price > MAX_MARKET_PRICE:
             return False, f"gate7_extreme_price:{market.yes_price:.3f}", 0.0
+
+        # Gate 9.5: Extreme equal-market — crowd is >THRESHOLD confident on exact
+        # temperature. Evidence shows the market has near-real-time station data
+        # in these cases; fading it is systematically losing.
+        if market.direction == "equal":
+            yes_p = market.yes_price
+            if yes_p > EXTREME_EQUAL_MARKET_THRESHOLD or yes_p < (1 - EXTREME_EQUAL_MARKET_THRESHOLD):
+                return False, f"gate9.5_extreme_equal_market:{yes_p:.2f}", 0.0
 
         # Gate 4: Fee-adjusted edge (blocks the majority of candidate trades)
         gross_ev = abs(prob.calibrated_p - market.yes_price)

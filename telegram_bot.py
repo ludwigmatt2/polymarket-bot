@@ -20,7 +20,6 @@ import asyncio
 import csv
 import json
 import os
-import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -38,10 +37,19 @@ load_dotenv()
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 ROOT          = Path(__file__).parent
-TRADES_CSV    = ROOT / "logs" / "paper_trades.csv"
-SIGNALS_FILE  = ROOT / "logs" / "last_signals.json"
-RESOLVED_FILE = ROOT / "logs" / "last_resolved.json"
 USERS_FILE    = ROOT / "config" / "users.json"
+
+def user_log_dir(uid: int) -> Path:
+    return ROOT / "logs" / "users" / str(uid)
+
+def user_trades_csv(uid: int) -> Path:
+    return user_log_dir(uid) / "paper_trades.csv"
+
+def user_signals_file(uid: int) -> Path:
+    return user_log_dir(uid) / "last_signals.json"
+
+def user_resolved_file(uid: int) -> Path:
+    return user_log_dir(uid) / "last_resolved.json"
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ["POLYMARKET_BOT_TOKEN"]
@@ -51,14 +59,22 @@ PYTHON    = str(ROOT / "venv" / "bin" / "python")
 
 # ── User registry ─────────────────────────────────────────────────────────────
 
+_users_cache: dict[int, dict] | None = None
+
 def _load_users() -> dict[int, dict]:
-    if not USERS_FILE.exists():
-        return {}
-    return {int(k): v for k, v in json.loads(USERS_FILE.read_text()).items()}
+    global _users_cache
+    if _users_cache is None:
+        if not USERS_FILE.exists():
+            _users_cache = {}
+        else:
+            _users_cache = {int(k): v for k, v in json.loads(USERS_FILE.read_text()).items()}
+    return _users_cache
 
 def _save_users(users: dict[int, dict]) -> None:
+    global _users_cache
     USERS_FILE.parent.mkdir(exist_ok=True)
     USERS_FILE.write_text(json.dumps({str(k): v for k, v in users.items()}, indent=2))
+    _users_cache = users
 
 def _seed_admin() -> None:
     users = _load_users()
@@ -67,8 +83,17 @@ def _seed_admin() -> None:
             "role": "admin",
             "username": "owner",
             "added_at": datetime.utcnow().isoformat(),
+            "private_key": None,
+            "proxy_address": None,
+            "mode": "paper",
         }
         _save_users(users)
+
+def get_user_mode(uid: int) -> str:
+    return _load_users().get(uid, {}).get("mode", "paper")
+
+def get_user_private_key(uid: int) -> Optional[str]:
+    return _load_users().get(uid, {}).get("private_key")
 
 def get_role(user_id: int) -> Optional[str]:
     return _load_users().get(user_id, {}).get("role")
@@ -104,10 +129,11 @@ def require_auth(admin_only: bool = False):
 
 # ── Stats ─────────────────────────────────────────────────────────────────────
 
-def read_stats() -> dict:
-    if not TRADES_CSV.exists():
+def read_stats(uid: int) -> dict:
+    trades_csv = user_trades_csv(uid)
+    if not trades_csv.exists():
         return {}
-    with TRADES_CSV.open() as f:
+    with trades_csv.open() as f:
         rows = list(csv.DictReader(f))
 
     resolved = [r for r in rows if r.get("resolved_at")]
@@ -144,18 +170,44 @@ def read_stats() -> dict:
         "gates_passed": len(resolved) >= 20 and pf is not None and pf >= 1.5,
     }
 
-def read_last_signals() -> list[dict]:
-    if not SIGNALS_FILE.exists():
+def read_last_signals(uid: int) -> list[dict]:
+    f = user_signals_file(uid)
+    if not f.exists():
         return []
-    return json.loads(SIGNALS_FILE.read_text()).get("signals", [])
+    return json.loads(f.read_text()).get("signals", [])
+
+def read_last_scan_meta(uid: int) -> dict:
+    f = user_signals_file(uid)
+    if not f.exists():
+        return {}
+    try:
+        data = json.loads(f.read_text())
+        signals = data.get("signals", [])
+        return {
+            "scanned_at": data.get("scanned_at", "")[:16].replace("T", " "),
+            "total": len(signals),
+            "high_conf": sum(1 for s in signals if s.get("edge_pp", 0) >= 0.30),
+        }
+    except Exception:
+        return {}
+
+def get_mode(uid: int) -> str:
+    mode = get_user_mode(uid)
+    return "🟢 LIVE" if mode == "live" else "🟡 PAPER"
 
 
 # ── Formatters ────────────────────────────────────────────────────────────────
 
-def fmt_status(s: dict) -> str:
+def fmt_status(uid: int) -> str:
+    s = read_stats(uid)
+    mode = get_mode(uid)
+    scan = read_last_scan_meta(uid)
     if not s:
-        return "No trade data yet."
-    lines = ["*📊 Paper Trading Status*\n"]
+        header = f"*📊 Trading Status* — {mode}\n"
+        if scan:
+            return header + f"Last scan: {scan['scanned_at']} UTC\nNo trades yet — run a scan first."
+        return header + "No data yet. Run /scan to start."
+    lines = [f"*📊 Trading Status* — {mode}\n"]
     lines.append(f"Trades:       {s['resolved']} resolved / {s['pending']} pending")
     if s["win_rate"] is not None:
         lines.append(f"Win rate:     {s['win_rate']:.1f}%  ({s['wins']}W / {s['losses']}L)")
@@ -165,6 +217,9 @@ def fmt_status(s: dict) -> str:
     if s["bss"] is not None:
         lines.append(f"Brier skill:  {s['bss']:+.3f}  (need ≥ 0.0)")
     lines.append(f"Total PnL:    *€{s['total_pnl']:.2f}*")
+    if scan:
+        lines.append(f"\nLast scan:    {scan['scanned_at']} UTC")
+        lines.append(f"Signals:      {scan['high_conf']} high-conf (≥30%) / {scan['total']} total")
     if s["pending_by_date"]:
         lines.append("\n_Pending resolves:_")
         for d, n in s["pending_by_date"].items():
@@ -173,12 +228,13 @@ def fmt_status(s: dict) -> str:
     lines.append(f"\n{gate}")
     return "\n".join(lines)
 
-def fmt_signals(signals: list[dict]) -> str:
+def fmt_signals(signals: list[dict], uid: int) -> str:
     if not signals:
         return "No signals from last scan."
     scanned_at = ""
-    if SIGNALS_FILE.exists():
-        scanned_at = json.loads(SIGNALS_FILE.read_text()).get("scanned_at", "")[:16].replace("T", " ")
+    f = user_signals_file(uid)
+    if f.exists():
+        scanned_at = json.loads(f.read_text()).get("scanned_at", "")[:16].replace("T", " ")
     lines = [f"*🎯 Last Scan Signals* — {len(signals)} total"]
     if scanned_at:
         lines.append(f"_Scanned: {scanned_at} UTC_\n")
@@ -194,10 +250,11 @@ def fmt_signals(signals: list[dict]) -> str:
         lines.append(f"\n_...and {len(signals) - 10} more_")
     return "\n".join(lines)
 
-def fmt_trades(n: int = 10) -> str:
-    if not TRADES_CSV.exists():
+def fmt_trades(uid: int, n: int = 10) -> str:
+    trades_csv = user_trades_csv(uid)
+    if not trades_csv.exists():
         return "No trades yet."
-    with TRADES_CSV.open() as f:
+    with trades_csv.open() as f:
         rows = list(csv.DictReader(f))
     resolved = sorted(
         [r for r in rows if r.get("resolved_at")],
@@ -238,16 +295,42 @@ def main_kb(uid: int) -> InlineKeyboardMarkup:
 def back_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="status")]])
 
+def confirm_kb(action: str, label: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"✅ {label}", callback_data=f"{action}_confirm"),
+        InlineKeyboardButton("❌ Cancel", callback_data="status"),
+    ]])
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def run_bot(mode: str) -> str:
-    """Run weather_bot.py in a given mode, return stdout."""
-    args = [PYTHON, "weather_bot.py", "--mode", mode]
+async def run_bot_async(mode: str, uid: int) -> tuple[str, str, int]:
+    """Run weather_bot.py async for a specific user. Returns (stdout, stderr, returncode)."""
+    log_dir = user_log_dir(uid)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    args = [PYTHON, "weather_bot.py", "--mode", mode, "--log-dir", str(log_dir)]
     if mode == "paper":
         args += ["--interval", "0"]
-    r = subprocess.run(args, capture_output=True, text=True, cwd=ROOT, timeout=180)
-    return r.stdout
+    env = os.environ.copy()
+    private_key = get_user_private_key(uid)
+    if private_key:
+        env["POLYMARKET_PRIVATE_KEY"] = private_key
+        proxy = _load_users().get(uid, {}).get("proxy_address")
+        if proxy:
+            env["POLYMARKET_PROXY_ADDRESS"] = proxy
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=ROOT,
+        env=env,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return "", "Timed out after 180s.", -1
+    return stdout.decode(), stderr.decode(), proc.returncode or 0
 
 
 # ── Command handlers ───────────────────────────────────────────────────────────
@@ -267,15 +350,17 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     lines = [
         "*Available commands:*\n",
-        "/status — trading stats",
+        "/status — your trading stats",
         "/signals — last scan signals",
         "/trades [n] — last N resolved trades",
+        "/scan — trigger a scan (your account)",
+        "/resolve — auto-resolve your pending trades",
+        "/mymode [paper|live] — view or change your mode",
+        "/setup <key> [proxy] — save your Polymarket credentials",
     ]
     if is_admin(uid):
         lines += [
             "\n*Admin:*",
-            "/scan — trigger a scan now",
-            "/resolve — run auto-resolve",
             "/adduser <id> [admin|viewer] — add user",
             "/removeuser <id> — remove user",
             "/users — list users",
@@ -284,22 +369,23 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @require_auth()
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
     await update.effective_message.reply_text(
-        fmt_status(read_stats()),
-        reply_markup=main_kb(update.effective_user.id),
-        parse_mode="Markdown",
+        fmt_status(uid), reply_markup=main_kb(uid), parse_mode="Markdown",
     )
 
 @require_auth()
 async def cmd_signals(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
     await update.effective_message.reply_text(
-        fmt_signals(read_last_signals()),
-        reply_markup=main_kb(update.effective_user.id),
+        fmt_signals(read_last_signals(uid), uid),
+        reply_markup=main_kb(uid),
         parse_mode="Markdown",
     )
 
 @require_auth()
 async def cmd_trades(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
     n = 10
     if ctx.args:
         try:
@@ -307,24 +393,78 @@ async def cmd_trades(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             pass
     await update.effective_message.reply_text(
-        fmt_trades(n),
-        reply_markup=main_kb(update.effective_user.id),
+        fmt_trades(uid, n), reply_markup=main_kb(uid), parse_mode="Markdown",
+    )
+
+@require_auth()
+async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    msg = await update.effective_message.reply_text("🔍 Scanning Polymarket...")
+    stdout, stderr, rc = await run_bot_async("paper", uid)
+    if rc != 0:
+        err = (stderr or stdout or "Unknown error")[-300:].strip()
+        await msg.edit_text(f"❌ Scan failed\n```\n{err}\n```", reply_markup=main_kb(uid), parse_mode="Markdown")
+    else:
+        summary = next((l for l in stdout.splitlines() if "evaluated" in l), "Scan complete.")
+        await msg.edit_text(f"✅ {summary.strip()}", reply_markup=main_kb(uid))
+
+@require_auth()
+async def cmd_resolve(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    msg = await update.effective_message.reply_text("⏳ Running auto-resolve...")
+    stdout, stderr, rc = await run_bot_async("auto-resolve", uid)
+    if rc != 0:
+        err = (stderr or stdout or "Unknown error")[-300:].strip()
+        await msg.edit_text(f"❌ Resolve failed\n```\n{err}\n```", reply_markup=main_kb(uid), parse_mode="Markdown")
+    else:
+        summary = next((l for l in stdout.splitlines() if "Auto-resolved" in l), "Done.")
+        await msg.edit_text(f"✅ {summary.strip()}", reply_markup=main_kb(uid))
+
+@require_auth()
+async def cmd_setup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Store user's Polymarket credentials. Usage: /setup <private_key> [proxy_address]"""
+    uid = update.effective_user.id
+    if not ctx.args:
+        await update.message.reply_text(
+            "*Setup your Polymarket account*\n\n"
+            "Usage: `/setup <private_key> [proxy_address]`\n\n"
+            "Your private key is stored locally in `config/users.json`. "
+            "Send this command in a private chat with the bot.",
+            parse_mode="Markdown",
+        )
+        return
+    users = _load_users()
+    users[uid]["private_key"] = ctx.args[0]
+    if len(ctx.args) > 1:
+        users[uid]["proxy_address"] = ctx.args[1]
+    _save_users(users)
+    await update.message.reply_text(
+        "✅ Credentials saved. Use `/mymode live` to switch to live trading.",
         parse_mode="Markdown",
     )
 
-@require_auth(admin_only=True)
-async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = await update.effective_message.reply_text("🔍 Scanning Polymarket...")
-    out = run_bot("paper")
-    summary = next((l for l in out.splitlines() if "evaluated" in l), "Scan complete.")
-    await msg.edit_text(f"✅ {summary.strip()}", reply_markup=main_kb(update.effective_user.id))
-
-@require_auth(admin_only=True)
-async def cmd_resolve(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = await update.effective_message.reply_text("⏳ Running auto-resolve...")
-    out = run_bot("auto-resolve")
-    summary = next((l for l in out.splitlines() if "Auto-resolved" in l), "Done.")
-    await msg.edit_text(f"✅ {summary.strip()}", reply_markup=main_kb(update.effective_user.id))
+@require_auth()
+async def cmd_mymode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Set or view your trading mode. Usage: /mymode [paper|live]"""
+    uid = update.effective_user.id
+    if not ctx.args:
+        mode = get_user_mode(uid)
+        await update.message.reply_text(f"Your current mode: `{mode}`", parse_mode="Markdown")
+        return
+    new_mode = ctx.args[0].lower()
+    if new_mode not in ("paper", "live"):
+        await update.message.reply_text("Usage: `/mymode paper` or `/mymode live`", parse_mode="Markdown")
+        return
+    if new_mode == "live" and not get_user_private_key(uid):
+        await update.message.reply_text(
+            "❌ Set your credentials first with `/setup <private_key>`.", parse_mode="Markdown"
+        )
+        return
+    users = _load_users()
+    users[uid]["mode"] = new_mode
+    _save_users(users)
+    badge = "🟢 LIVE" if new_mode == "live" else "🟡 PAPER"
+    await update.message.reply_text(f"✅ Mode set to {badge}", parse_mode="Markdown")
 
 @require_auth(admin_only=True)
 async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -348,7 +488,10 @@ async def cmd_adduser(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(ctx.args) > 1 and ctx.args[1] in ("admin", "viewer"):
         role = ctx.args[1]
     users = _load_users()
-    users[new_id] = {"role": role, "username": "", "added_at": datetime.utcnow().isoformat()}
+    users[new_id] = {
+        "role": role, "username": "", "added_at": datetime.utcnow().isoformat(),
+        "private_key": None, "proxy_address": None, "mode": "paper",
+    }
     _save_users(users)
     await update.message.reply_text(
         f"✅ Added `{new_id}` as `{role}`.", parse_mode="Markdown"
@@ -387,26 +530,50 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data == "status":
         await q.edit_message_text(
-            fmt_status(read_stats()), reply_markup=main_kb(uid), parse_mode="Markdown"
+            fmt_status(uid), reply_markup=main_kb(uid), parse_mode="Markdown"
         )
     elif data == "signals":
         await q.edit_message_text(
-            fmt_signals(read_last_signals()), reply_markup=main_kb(uid), parse_mode="Markdown"
+            fmt_signals(read_last_signals(uid), uid), reply_markup=main_kb(uid), parse_mode="Markdown"
         )
     elif data == "trades":
         await q.edit_message_text(
-            fmt_trades(), reply_markup=main_kb(uid), parse_mode="Markdown"
+            fmt_trades(uid), reply_markup=main_kb(uid), parse_mode="Markdown"
         )
     elif data == "scan" and is_admin(uid):
+        await q.edit_message_text(
+            "🔍 *Trigger scan?*\nThis fetches live forecasts and evaluates all markets (~2–3 min).",
+            reply_markup=confirm_kb("scan", "Run scan"),
+            parse_mode="Markdown",
+        )
+    elif data == "scan_confirm":
         await q.edit_message_text("🔍 Scanning Polymarket...")
-        out = run_bot("paper")
-        summary = next((l for l in out.splitlines() if "evaluated" in l), "Scan complete.")
-        await q.edit_message_text(f"✅ {summary.strip()}", reply_markup=main_kb(uid))
+        stdout, stderr, rc = await run_bot_async("paper", uid)
+        if rc != 0:
+            err = (stderr or stdout or "Unknown error")[-300:].strip()
+            await q.edit_message_text(
+                f"❌ Scan failed\n```\n{err}\n```", reply_markup=main_kb(uid), parse_mode="Markdown"
+            )
+        else:
+            summary = next((l for l in stdout.splitlines() if "evaluated" in l), "Scan complete.")
+            await q.edit_message_text(f"✅ {summary.strip()}", reply_markup=main_kb(uid))
     elif data == "resolve" and is_admin(uid):
+        await q.edit_message_text(
+            "✅ *Trigger auto-resolve?*\nThis resolves all pending paper trades that are due.",
+            reply_markup=confirm_kb("resolve", "Run resolve"),
+            parse_mode="Markdown",
+        )
+    elif data == "resolve_confirm":
         await q.edit_message_text("⏳ Running auto-resolve...")
-        out = run_bot("auto-resolve")
-        summary = next((l for l in out.splitlines() if "Auto-resolved" in l), "Done.")
-        await q.edit_message_text(f"✅ {summary.strip()}", reply_markup=main_kb(uid))
+        stdout, stderr, rc = await run_bot_async("auto-resolve", uid)
+        if rc != 0:
+            err = (stderr or stdout or "Unknown error")[-300:].strip()
+            await q.edit_message_text(
+                f"❌ Resolve failed\n```\n{err}\n```", reply_markup=main_kb(uid), parse_mode="Markdown"
+            )
+        else:
+            summary = next((l for l in stdout.splitlines() if "Auto-resolved" in l), "Done.")
+            await q.edit_message_text(f"✅ {summary.strip()}", reply_markup=main_kb(uid))
     elif data == "users" and is_admin(uid):
         users = _load_users()
         lines = ["*👥 Registered Users*\n"]
@@ -417,51 +584,49 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Push alerts ────────────────────────────────────────────────────────────────
 
-_seen_signals_mtime:  float = 0.0
-_seen_resolved_mtime: float = 0.0
+_seen_signals_mtimes:  dict[int, float] = {}
+_seen_resolved_mtimes: dict[int, float] = {}
 
 async def check_alerts(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    global _seen_signals_mtime, _seen_resolved_mtime
     bot = ctx.bot
-    recipients = all_user_ids()
+    for uid in all_user_ids():
+        signals_file  = user_signals_file(uid)
+        resolved_file = user_resolved_file(uid)
 
-    if SIGNALS_FILE.exists():
-        mtime = SIGNALS_FILE.stat().st_mtime
-        if mtime > _seen_signals_mtime:
-            _seen_signals_mtime = mtime
-            data = json.loads(SIGNALS_FILE.read_text())
-            signals = [s for s in data.get("signals", []) if s.get("edge_pp", 0) >= 0.30]
-            if signals:
-                text = f"🔔 *Scheduled scan — {len(signals)} signal(s)*\n\n{fmt_signals(signals)}"
-                for uid in recipients:
+        if signals_file.exists():
+            mtime = signals_file.stat().st_mtime
+            if mtime > _seen_signals_mtimes.get(uid, 0.0):
+                _seen_signals_mtimes[uid] = mtime
+                data = json.loads(signals_file.read_text())
+                signals = [s for s in data.get("signals", []) if s.get("edge_pp", 0) >= 0.30]
+                if signals:
+                    text = f"🔔 *Scheduled scan — {len(signals)} signal(s)*\n\n{fmt_signals(signals, uid)}"
                     try:
                         await bot.send_message(uid, text, parse_mode="Markdown")
                     except Exception:
                         pass
 
-    if RESOLVED_FILE.exists():
-        mtime = RESOLVED_FILE.stat().st_mtime
-        if mtime > _seen_resolved_mtime:
-            _seen_resolved_mtime = mtime
-            data = json.loads(RESOLVED_FILE.read_text())
-            resolved = data.get("resolved", [])
-            if resolved:
-                total = sum(t.get("pnl_usd", 0) for t in resolved)
-                e = "✅" if total >= 0 else "❌"
-                lines = [f"{e} *{len(resolved)} trade(s) resolved* — *€{total:+.2f}*\n"]
-                for t in resolved[:5]:
-                    pnl = t.get("pnl_usd", 0)
-                    em = "✅" if pnl > 0 else "❌"
-                    title = t.get("market_title", "?")[:44]
-                    lines.append(f"{em} €{pnl:+.2f} — _{title}_")
-                if len(resolved) > 5:
-                    lines.append(f"_...and {len(resolved) - 5} more_")
-                # Append fresh stats
-                s = read_stats()
-                if s:
-                    lines.append(f"\n📊 PnL: *€{s['total_pnl']:.2f}* | PF: {s['profit_factor']:.2f}" if s.get("profit_factor") else "")
-                text = "\n".join(l for l in lines if l)
-                for uid in recipients:
+        if resolved_file.exists():
+            mtime = resolved_file.stat().st_mtime
+            if mtime > _seen_resolved_mtimes.get(uid, 0.0):
+                _seen_resolved_mtimes[uid] = mtime
+                data = json.loads(resolved_file.read_text())
+                resolved = data.get("resolved", [])
+                if resolved:
+                    total = sum(t.get("pnl_usd", 0) for t in resolved)
+                    e = "✅" if total >= 0 else "❌"
+                    lines = [f"{e} *{len(resolved)} trade(s) resolved* — *€{total:+.2f}*\n"]
+                    for t in resolved[:5]:
+                        pnl = t.get("pnl_usd", 0)
+                        em = "✅" if pnl > 0 else "❌"
+                        title = t.get("market_title", "?")[:44]
+                        lines.append(f"{em} €{pnl:+.2f} — _{title}_")
+                    if len(resolved) > 5:
+                        lines.append(f"_...and {len(resolved) - 5} more_")
+                    s = read_stats(uid)
+                    if s and s.get("profit_factor"):
+                        lines.append(f"\n📊 PnL: *€{s['total_pnl']:.2f}* | PF: {s['profit_factor']:.2f}")
+                    text = "\n".join(line for line in lines if line)
                     try:
                         await bot.send_message(uid, text, parse_mode="Markdown")
                     except Exception:
@@ -483,6 +648,8 @@ async def _run() -> None:
         ("trades",      cmd_trades),
         ("scan",        cmd_scan),
         ("resolve",     cmd_resolve),
+        ("setup",       cmd_setup),
+        ("mymode",      cmd_mymode),
         ("users",       cmd_users),
         ("adduser",     cmd_adduser),
         ("removeuser",  cmd_removeuser),
