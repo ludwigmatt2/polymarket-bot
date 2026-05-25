@@ -5,6 +5,7 @@ Weather Bot — Ensemble forecast vs. Polymarket weather market arbitrage.
 Modes:
   scan     One-shot: scan markets, evaluate signals, print summary (no logging)
   paper    Continuous paper trading — scan + log signals (default)
+  live     Live trading — Kelly-sized orders via pmxt (requires .env credentials)
   stats    Print paper trading dashboard and go-live gate status
   resolve  Interactively resolve outstanding paper trades with actual outcomes
   debug    Print full model internals: 7-day ensemble, scaling ratio, projected totals
@@ -12,6 +13,7 @@ Modes:
 Run:
   python weather_bot.py --mode scan
   python weather_bot.py --mode paper --interval 3600
+  python weather_bot.py --mode live --bankroll 500 --interval 3600
   python weather_bot.py --mode stats
   python weather_bot.py --mode debug
   python weather_bot.py --mode debug --city Seoul
@@ -35,6 +37,7 @@ from weather.backtest import (
 from weather.market_scanner import WeatherMarketScanner
 from weather.city_bias import CityBiasCorrector
 from weather.models import Signal
+from weather.live_trader import LiveTrader
 from weather.paper_trader import PaperTrader
 from weather.position_monitor import PositionMonitor, print_flags
 from weather.price_tracker import PriceTracker
@@ -43,8 +46,15 @@ from weather.signal_generator import SignalGenerator
 from weather.weather_client import WeatherClient
 
 
-def run_scan(scanner: WeatherMarketScanner, generator: SignalGenerator, paper: PaperTrader | None, log_dir: Path = Path("logs"), monitor: PositionMonitor | None = None) -> list[Signal]:
-    """Single scan cycle: find markets → evaluate signals → optionally log."""
+def run_scan(
+    scanner: WeatherMarketScanner,
+    generator: SignalGenerator,
+    paper: PaperTrader | None,
+    log_dir: Path = Path("logs"),
+    monitor: PositionMonitor | None = None,
+    live_trader: "LiveTrader | None" = None,
+) -> list[Signal]:
+    """Single scan cycle: find markets → evaluate signals → optionally log or execute."""
     print("  [1/3] Scanning Polymarket for weather markets...", end=" ", flush=True)
     markets = scanner.scan()
     print(f"{len(markets)} tradeable found")
@@ -59,7 +69,21 @@ def run_scan(scanner: WeatherMarketScanner, generator: SignalGenerator, paper: P
     rejected = [s for s in signals if not s.quality_gate_passed]
     print(f"{len(actionable)} signals pass quality gates")
 
-    if paper and actionable:
+    if live_trader and actionable:
+        print(f"  [3/3] Executing {len(actionable)} live order(s)...")
+        for s in actionable:
+            try:
+                result = live_trader.execute_signal(s)
+                if result:
+                    print(f"    ✓ {s.market.title[:55]} | {s.direction} ${result['size_usd']:.2f} @ {result['price']:.3f}  order={result['order_id'][:10]}")
+                else:
+                    print(f"    – {s.market.title[:55]} | skipped (size too small)")
+            except RuntimeError as e:
+                print(f"  LIVE HALT: {e}", file=sys.stderr)
+                raise
+            except Exception as e:
+                print(f"    ✗ {s.market.title[:55]} | order failed: {e}", file=sys.stderr)
+    elif paper and actionable:
         print(f"  [3/3] Logging {len(actionable)} paper trades...", end=" ", flush=True)
         logged = [paper.log_trade(s) for s in actionable]
         print(f"{sum(1 for t in logged if t)} logged")
@@ -418,10 +442,12 @@ def mode_resolve(paper: PaperTrader) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Weather model arbitrage bot")
-    parser.add_argument("--mode", choices=["scan", "paper", "stats", "resolve", "auto-resolve", "backfill-calibration", "debug", "backtest", "backtest-temp", "arb"],
+    parser.add_argument("--mode", choices=["scan", "paper", "live", "stats", "resolve", "auto-resolve", "backfill-calibration", "debug", "backtest", "backtest-temp", "arb"],
                         default="paper", help="Operating mode (default: paper)")
     parser.add_argument("--interval", type=int, default=3600,
-                        help="Re-scan interval in seconds for paper mode (default: 3600)")
+                        help="Re-scan interval in seconds for paper/live mode (default: 3600)")
+    parser.add_argument("--bankroll", type=float, default=500.0,
+                        help="Live trading bankroll in USD for Kelly sizing (default: 500)")
     parser.add_argument("--city", type=str, default=None,
                         help="Filter markets by city name (debug mode only)")
     parser.add_argument("--min-spread", type=float, default=None,
@@ -502,7 +528,7 @@ def main() -> None:
     scanner       = WeatherMarketScanner()
     price_tracker = PriceTracker()
     generator     = SignalGenerator(model=model, client=client, price_tracker=price_tracker, bias_corrector=bias)
-    paper         = PaperTrader(log_path=log_dir / "paper_trades.csv") if args.mode == "paper" else None
+    paper         = PaperTrader(log_path=log_dir / "paper_trades.csv") if args.mode in ("paper", "live") else None
     monitor       = PositionMonitor(client=client, model=model,
                                     trades_csv=log_dir / "paper_trades.csv",
                                     bias_corrector=bias)
@@ -515,18 +541,33 @@ def main() -> None:
         run_scan(scanner, generator, paper=None, log_dir=log_dir, monitor=monitor)
         return
 
-    # paper mode — one-shot (interval=0) or continuous
+    live_trader = None
+    if args.mode == "live":
+        live_trader = LiveTrader(paper_trader=paper, bankroll_usd=args.bankroll)
+        if not live_trader.is_unlocked():
+            print("  Go-live gates not passed. Run: python weather_bot.py --mode stats", file=sys.stderr)
+            sys.exit(1)
+        balance = live_trader.fetch_balance()
+        from weather.config import MAX_LIVE_TRADE_USD, KELLY_FRACTION
+        print(f"  Live mode — bankroll=${args.bankroll:.0f}  USDC balance=${balance:.2f}  Kelly={KELLY_FRACTION:.2f}x  max_order=${MAX_LIVE_TRADE_USD:.0f}")
+        print()
+
+    # paper / live mode — one-shot (interval=0) or continuous
     if args.interval == 0:
-        run_scan(scanner, generator, paper, log_dir, monitor)
+        run_scan(scanner, generator, paper, log_dir, monitor, live_trader=live_trader)
         return
 
-    print(f"  Scanning every {args.interval}s. Ctrl+C to stop.\n")
+    mode_label = "live" if args.mode == "live" else "paper"
+    print(f"  [{mode_label}] Scanning every {args.interval}s. Ctrl+C to stop.\n")
     scan_count = 0
     while True:
         scan_count += 1
         print(f"─── Scan #{scan_count} ────────────────────────────────────────────")
         try:
-            run_scan(scanner, generator, paper, log_dir, monitor)
+            run_scan(scanner, generator, paper, log_dir, monitor, live_trader=live_trader)
+        except RuntimeError:
+            # Hard halt from live_trader (kill switch or gate failure) — exit cleanly
+            sys.exit(1)
         except Exception as e:
             print(f"  Scan error: {e}", file=sys.stderr)
         time.sleep(args.interval)
