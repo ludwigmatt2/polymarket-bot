@@ -61,7 +61,8 @@ class LiveTrader:
         if not (0.0 < entry_price < 1.0):
             return 0.0
         b = (1.0 / entry_price) - 1.0
-        p = signal.model_p
+        # p_win = P(our side wins): for YES bets = P(YES), for NO bets = P(NO) = 1 - model_p
+        p = signal.model_p if signal.direction == "YES" else (1.0 - signal.model_p)
         full_kelly = (b * p - (1.0 - p)) / b
         if full_kelly <= 0:
             return 0.0

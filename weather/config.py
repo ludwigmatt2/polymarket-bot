@@ -34,6 +34,15 @@ MAX_MARKET_PRICE = 0.97
 # evidence shows they are pricing on near-real-time station data we don't have
 EXTREME_EQUAL_MARKET_THRESHOLD = 0.85
 
+# ── Equal-market direction filter ─────────────────────────────────────────────
+# Data (160 resolved trades): equal NO bets → 85% WR; equal YES bets → 20% WR.
+# Root cause: predicting "temperature EXACTLY = X°" (YES) requires sub-0.5°C
+# ensemble precision the model doesn't achieve — systematic overestimation of P(hit).
+# Predicting "temperature WON'T be exactly X" (NO) is structurally easier and
+# consistently profitable. Block equal YES bets until model can demonstrate
+# calibrated P(exact hit) that beats market pricing.
+BLOCK_EQUAL_YES = True
+
 # ── Fee model ──────────────────────────────────────────────────────────────────
 TAKER_FEE_PER_SIDE = 0.02       # 2% per trade (Polymarket CLOB taker)
 ROUND_TRIP_FEE = 0.04           # 4% total

@@ -11,6 +11,8 @@ Gate structure (evaluated in order):
   Gate 4:   Fee-adjusted edge    — positive EV after round-trip fees? (blocks most trades)
   Gate 6:   Odds velocity        — fast price movement = informed flow present?
   Gate 8:   Composite confidence — weighted spread + timing + calibration score?
+  Gate 9.5: Equal extreme-price   — crowd >85% confident = market has station data.
+  Gate 9.6: Equal YES blocked     — model overestimates P(exact hit); 20% WR vs 85% for NO.
 
 A Signal is produced for every evaluation. quality_gate_passed=False signals carry
 a rejection_reason string naming the gate that blocked them.
@@ -21,6 +23,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from .config import (
+    BLOCK_EQUAL_YES,
     EXTREME_EQUAL_MARKET_THRESHOLD,
     GATE8_CALIB_WEIGHT,
     GATE8_SPREAD_WEIGHT,
@@ -198,6 +201,12 @@ class SignalGenerator:
             yes_p = market.yes_price
             if yes_p > EXTREME_EQUAL_MARKET_THRESHOLD or yes_p < (1 - EXTREME_EQUAL_MARKET_THRESHOLD):
                 return False, f"gate9.5_extreme_equal_market:{yes_p:.2f}", 0.0
+
+        # Gate 9.6: Equal YES blocked — model overestimates P(exact hit).
+        # 160-trade backtest: equal YES = 20% WR; equal NO = 85% WR.
+        # Shrinkage never flips direction, so calibrated_p vs yes_price is reliable here.
+        if BLOCK_EQUAL_YES and market.direction == "equal" and prob.calibrated_p > market.yes_price:
+            return False, "gate9.6_equal_yes_blocked", 0.0
 
         # Gate 4: Fee-adjusted edge (blocks the majority of candidate trades)
         gross_ev = abs(prob.calibrated_p - market.yes_price)
