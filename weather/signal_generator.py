@@ -96,8 +96,11 @@ class SignalGenerator:
             threshold_high=adj_threshold_high,
         )
 
+        now = datetime.now(timezone.utc)
+        days_to_res = (market.resolution_date - now).total_seconds() / 86400
+
         gate_passed, rejection_reason, confidence_score = self._quality_gates(
-            market, forecast, prob_result
+            market, forecast, prob_result, now, days_to_res
         )
 
         # Record price AFTER gate check so Gate 6 velocity uses previous prices
@@ -108,8 +111,6 @@ class SignalGenerator:
 
         # Lead-time + spread shrinkage: shrink model_p toward 0.5.
         # skill: 5%/day decay beyond day-1; spread_factor: 0 at MAX_ENSEMBLE_SPREAD.
-        now = datetime.now(timezone.utc)
-        days_to_res = (market.resolution_date - now).total_seconds() / 86400
         skill = max(0.5, 1.0 - LEAD_TIME_DECAY_PER_DAY * max(0.0, days_to_res - 1.0))
         spread_factor = max(0.0, 1.0 - prob_result.ensemble_spread / MAX_ENSEMBLE_SPREAD)
         model_p = 0.5 + (model_p - 0.5) * skill * spread_factor
@@ -140,7 +141,7 @@ class SignalGenerator:
             size_factor=size_factor,
             quality_gate_passed=gate_passed,
             rejection_reason=rejection_reason,
-            signal_time=datetime.now(timezone.utc),
+            signal_time=now,
             forecast=forecast,
             prob_result=prob_result,
         )
@@ -150,13 +151,13 @@ class SignalGenerator:
         market: WeatherMarket,
         forecast: EnsembleForecast,
         prob: RawProbabilityResult,
+        now: datetime,
+        days_to_res: float,
     ) -> tuple[bool, str | None, float]:
         """
         Returns (passes, rejection_reason, composite_confidence).
         Composite confidence is 0.0 for any early-rejection gate.
         """
-        now = datetime.now(timezone.utc)
-        days_to_res = (market.resolution_date - now).total_seconds() / 86400
 
         # Gate 0: Forecast freshness
         fetched_at = forecast.fetched_at

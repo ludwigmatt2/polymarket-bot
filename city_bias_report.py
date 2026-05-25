@@ -41,6 +41,9 @@ def parse_city(title: str) -> str:
     return m.group(1).strip() if m else "Unknown"
 
 
+def market_correct(r: dict) -> bool:
+    return (r["stored_outcome"] == 1 and r["mkt_yes"] > 0.5) or (r["stored_outcome"] == 0 and r["mkt_yes"] <= 0.5)
+
 def bar(v: float, scale: float = 1.0, width: int = 20) -> str:
     filled = min(round(abs(v) / scale * width), width)
     char = "▶" if v >= 0 else "◀"
@@ -52,7 +55,7 @@ def main() -> None:
         sys.exit("No paper_trades.csv found.")
 
     rows = list(csv.DictReader(open(TRADES_CSV)))
-    resolved = [r for r in rows if r.get("actual_outcome") not in (None, "", "None")]
+    resolved = [r for r in rows if r.get("actual_outcome") in ("0", "1")]
     print(f"Resolved trades to analyse: {len(resolved)}")
     print(f"Fetching {len(resolved)} archive temperatures...\n")
 
@@ -112,7 +115,7 @@ def main() -> None:
         if i % 20 == 0:
             print(f"  {i}/{len(resolved)} done...", flush=True)
 
-    print(f"\n  Done. {len(results)} temperatures fetched, {len(results) - len(resolved) + len(results)- len(results)} skipped.\n")
+    print(f"\n  Done. {len(results)} temperatures fetched, {len(resolved) - len(results)} skipped.\n")
 
     # ── Section 1: Integrity check ────────────────────────────────────────────
     print("═" * 60)
@@ -138,7 +141,6 @@ def main() -> None:
     for r in results:
         by_city[r["city"]].append(r["residual"])
 
-    bias_rows = []
     print(f"  {'City':<15}  {'n':>4}  {'Mean bias':>10}  {'Stdev':>7}  {'Bar':>22}  {'Action'}")
     for city, residuals in sorted(by_city.items(), key=lambda x: abs(mean(x[1])), reverse=True):
         n       = len(residuals)
@@ -149,9 +151,6 @@ def main() -> None:
         action  = f"apply {damped:+.2f}°C" if reliable else "too few trades"
         flag    = "✅" if reliable and abs(m) >= 0.5 else ("⚠️" if reliable else "  ")
         print(f"  {city:<15}  {n:>4}  {m:>+9.2f}°C  {sd:>6.2f}  {bar(m, 3.0):>22}  {flag} {action}")
-        bias_rows.append({"city": city, "n": n, "mean_bias": round(m, 3),
-                          "damped_bias": round(damped, 3), "lat": results[0]["lat"],
-                          "lon": results[0]["lon"]})
     print()
 
     # ── Section 3: Extreme market price analysis ──────────────────────────────
@@ -162,9 +161,7 @@ def main() -> None:
 
     extreme = [r for r in results if r["mkt_yes"] > 0.80 or r["mkt_yes"] < 0.20]
     model_right  = sum(1 for r in extreme if r["stored_outcome"] == int(r["model_p"] > 0.5))
-    market_right = sum(1 for r in extreme if
-                       (r["stored_outcome"] == 1 and r["mkt_yes"] > 0.5) or
-                       (r["stored_outcome"] == 0 and r["mkt_yes"] <= 0.5))
+    market_right = sum(1 for r in extreme if market_correct(r))
 
     print(f"  Extreme-priced trades: {len(extreme)}")
     print(f"  Market was correct:    {market_right}/{len(extreme)} ({market_right/max(len(extreme),1):.0%})")
@@ -177,9 +174,7 @@ def main() -> None:
 
     print(f"  {'City':<15}  {'n':>4}  {'Mkt correct':>12}  {'Model correct':>14}  Note")
     for city, trades in sorted(by_city_ext.items(), key=lambda x: -len(x[1])):
-        mkt_ok   = sum(1 for r in trades if
-                       (r["stored_outcome"] == 1 and r["mkt_yes"] > 0.5) or
-                       (r["stored_outcome"] == 0 and r["mkt_yes"] <= 0.5))
+        mkt_ok   = sum(1 for r in trades if market_correct(r))
         model_ok = sum(1 for r in trades if r["stored_outcome"] == int(r["model_p"] > 0.5))
         note = "⚠️ market knows more" if mkt_ok > model_ok else ""
         print(f"  {city:<15}  {len(trades):>4}  {mkt_ok:>5}/{len(trades):<5}  {model_ok:>6}/{len(trades):<5}  {note}")
@@ -199,7 +194,6 @@ def main() -> None:
         print()
 
     # ── Write city_bias.csv ───────────────────────────────────────────────────
-    # Write per-lat/lon bias (more precise than city name matching)
     latlon_bias: dict[tuple, list] = defaultdict(list)
     for r in results:
         key = (round(r["lat"], 2), round(r["lon"], 2))

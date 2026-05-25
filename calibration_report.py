@@ -24,6 +24,7 @@ from pathlib import Path
 # ── Load project modules ──────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent))
 from weather.models import Location
+from weather.paper_trader import _evaluate_outcome
 from weather.weather_client import WeatherClient
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -39,7 +40,7 @@ def load_resolved() -> list[dict]:
     if not TRADES_CSV.exists():
         sys.exit("No paper_trades.csv found.")
     rows = list(csv.DictReader(open(TRADES_CSV)))
-    return [r for r in rows if r.get("actual_outcome") not in (None, "", "None")]
+    return [r for r in rows if r.get("actual_outcome") in ("0", "1")]
 
 
 # ── Climatological probability ────────────────────────────────────────────────
@@ -78,15 +79,7 @@ def clim_p(
         return None
 
     n = len(train_vals)
-    if direction == "above":
-        return sum(1 for v in train_vals if v > threshold) / n
-    if direction == "below":
-        return sum(1 for v in train_vals if v < threshold) / n
-    if direction == "equal":
-        return sum(1 for v in train_vals if threshold - 0.5 <= v <= threshold + 0.5) / n
-    if direction == "range" and threshold_high is not None:
-        return sum(1 for v in train_vals if threshold <= v <= threshold_high) / n
-    return None
+    return sum(_evaluate_outcome(v, threshold, direction, threshold_high) for v in train_vals) / n
 
 
 # ── Scoring helpers ───────────────────────────────────────────────────────────
@@ -144,7 +137,8 @@ def main() -> None:
             direction  = t["weather_direction"]
             metric     = t["metric"]
             res_date   = datetime.fromisoformat(t["resolution_date"]).date()
-            edge       = float(t["edge_pp"])
+            edge           = float(t["edge_pp"])
+            trade_direction = t["direction"]
         except (ValueError, KeyError):
             skipped += 1
             continue
@@ -158,21 +152,21 @@ def main() -> None:
         b_clim  = brier(p_clim,  actual)
 
         enriched.append({
-            "trade_id":       t["trade_id"],
-            "market_title":   t["market_title"][:60],
+            "trade_id":        t["trade_id"],
+            "market_title":    t["market_title"][:60],
             "resolution_date": res_date.isoformat(),
-            "direction":      direction,
-            "metric":         metric,
-            "model_p":        model_p,
-            "p_clim":         p_clim,
-            "actual":         actual,
-            "edge":           edge,
-            "brier_model":    b_model,
-            "brier_clim":     b_clim,
-            "model_wins":     int(b_model < b_clim),
+            "direction":       direction,
+            "trade_direction": trade_direction,
+            "metric":          metric,
+            "model_p":         model_p,
+            "p_clim":          p_clim,
+            "actual":          actual,
+            "edge":            edge,
+            "brier_model":     b_model,
+            "brier_clim":      b_clim,
+            "model_wins":      int(b_model < b_clim),
         })
 
-        # Progress dot every 10
         if i % 10 == 0:
             print(f"  {i}/{len(trades)} done...", flush=True)
 
@@ -234,8 +228,6 @@ def main() -> None:
         if not vals:
             continue
         actual_frac = sum(vals) / len(vals)
-        midpoint    = (cal_edges[i-1] if i > 0 else 0.0 + cal_edges[i]) / 2
-        diff        = actual_frac - (cal_edges[i-1] if i > 0 else 0)
         icon = "✅" if abs(actual_frac - (sum(cal_edges[i-1:i+1])/2 if i > 0 else cal_edges[0]/2)) < 0.10 else "⚠️"
         print(f"  {label:>10}  {len(vals):>4}  {actual_frac:>7.1%}  {bar(actual_frac)} {icon}")
     print()
@@ -249,13 +241,9 @@ def main() -> None:
     edge_edges  = [0.15, 0.25, 0.35, 0.50, 1.01]
     edge_labels = ["<15%", "15–25%", "25–35%", "35–50%", "50%+"]
 
-    # Re-load directions from original trades for edge analysis
-    orig = {t["trade_id"]: t["direction"] for t in trades}
     for e in enriched:
-        td = orig.get(e["trade_id"], "")
-        actual = e["actual"]
-        e["win"] = int((td == "YES" and actual == 1) or (td == "NO" and actual == 0))
-        e["trade_direction"] = td
+        td = e["trade_direction"]
+        e["win"] = int((td == "YES" and e["actual"] == 1) or (td == "NO" and e["actual"] == 0))
 
     edge_buckets: dict[int, list] = defaultdict(list)
     for e in enriched:
