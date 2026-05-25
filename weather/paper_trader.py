@@ -152,7 +152,7 @@ class PaperTrader:
         resolved = skipped = 0
 
         for t in trades:
-            if t.get("actual_outcome") not in (None, "", "None"):
+            if t.get("actual_outcome") in ("0", "1", 0, 1):
                 continue
 
             res_date_str = t.get("resolution_date", "")
@@ -225,7 +225,7 @@ class PaperTrader:
     def compute_stats(self) -> PaperTradingStats:
         """Compute aggregate metrics over all resolved trades."""
         trades = self._load_all()
-        resolved = [t for t in trades if t.get("actual_outcome") not in (None, "", "None")]
+        resolved = [t for t in trades if t.get("actual_outcome") in ("0", "1", 0, 1)]
 
         total = len(trades)
         n_resolved = len(resolved)
@@ -251,11 +251,12 @@ class PaperTrader:
         mean_brier = sum(briers) / len(briers) if briers else _CLIMATOLOGY_BRIER
         bss = 1.0 - (mean_brier / _CLIMATOLOGY_BRIER)
 
-        # Max drawdown
+        # Max drawdown — denominator is total capital deployed across all resolved trades
+        sizes = [float(t["size_usd"]) for t in resolved if t.get("size_usd")]
+        hypothetical_capital = max(sum(sizes), 1.0)
         cumulative = 0.0
         peak = 0.0
         max_dd = 0.0
-        hypothetical_capital = PAPER_TRADE_SIZE_USD * MIN_RESOLVED_TRADES  # proxy
         for p in pnls:
             cumulative += p
             if cumulative > peak:
