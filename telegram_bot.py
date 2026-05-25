@@ -20,7 +20,8 @@ import asyncio
 import csv
 import json
 import os
-from datetime import datetime
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -38,6 +39,7 @@ load_dotenv()
 # ── Paths ─────────────────────────────────────────────────────────────────────
 ROOT          = Path(__file__).parent
 USERS_FILE    = ROOT / "config" / "users.json"
+WALLET_FILE   = ROOT / "logs" / "wallet.json"
 
 def user_log_dir(uid: int) -> Path:
     return ROOT / "logs" / "users" / str(uid)
@@ -50,6 +52,20 @@ def user_signals_file(uid: int) -> Path:
 
 def user_resolved_file(uid: int) -> Path:
     return user_log_dir(uid) / "last_resolved.json"
+
+# Fallback to root logs/ when per-user files don't exist (launchd writes there)
+def _trades_csv_path(uid: int) -> Path:
+    p = user_trades_csv(uid)
+    return p if p.exists() else ROOT / "logs" / "paper_trades.csv"
+
+def _signals_path(uid: int) -> Path:
+    p = user_signals_file(uid)
+    return p if p.exists() else ROOT / "logs" / "last_signals.json"
+
+def _resolved_path(uid: int) -> Path:
+    p = user_resolved_file(uid)
+    return p if p.exists() else ROOT / "logs" / "last_resolved.json"
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ["POLYMARKET_BOT_TOKEN"]
@@ -127,10 +143,76 @@ def require_auth(admin_only: bool = False):
     return decorator
 
 
+# ── Wallet ────────────────────────────────────────────────────────────────────
+
+def read_wallet() -> dict:
+    if not WALLET_FILE.exists():
+        return {"transactions": []}
+    return json.loads(WALLET_FILE.read_text())
+
+def append_wallet_transaction(tx_type: str, amount: float, note: str = "") -> None:
+    data = read_wallet()
+    data["transactions"].append({
+        "type": tx_type,
+        "amount": amount,
+        "timestamp": datetime.utcnow().isoformat(),
+        "note": note,
+    })
+    WALLET_FILE.parent.mkdir(exist_ok=True)
+    WALLET_FILE.write_text(json.dumps(data, indent=2))
+
+def wallet_stats(uid: int) -> dict:
+    txns = read_wallet().get("transactions", [])
+    deposited = sum(t["amount"] for t in txns if t["type"] == "deposit")
+    withdrawn = sum(t["amount"] for t in txns if t["type"] == "withdraw")
+
+    csv_path = _trades_csv_path(uid)
+    rows: list[dict] = []
+    if csv_path.exists():
+        with csv_path.open() as f:
+            rows = list(csv.DictReader(f))
+
+    resolved = [r for r in rows if r.get("resolved_at")]
+    pending  = [r for r in rows if not r.get("resolved_at")]
+
+    realized_pnl = sum(float(r["pnl_usd"]) for r in resolved if r.get("pnl_usd"))
+    deployed     = sum(float(r["size_usd"]) for r in pending  if r.get("size_usd"))
+
+    wallet_balance = deposited - withdrawn + realized_pnl
+    available      = wallet_balance - deployed
+    return_pct     = (realized_pnl / deposited * 100) if deposited > 0 else None
+
+    today_str  = datetime.utcnow().strftime("%Y-%m-%d")
+    week_start = (datetime.utcnow() - timedelta(days=7)).isoformat()
+
+    pnl_today = sum(
+        float(r["pnl_usd"]) for r in resolved
+        if r.get("pnl_usd") and r.get("resolved_at", "")[:10] == today_str
+    )
+    pnl_week = sum(
+        float(r["pnl_usd"]) for r in resolved
+        if r.get("pnl_usd") and r.get("resolved_at", "") >= week_start
+    )
+
+    return {
+        "deposited":     deposited,
+        "withdrawn":     withdrawn,
+        "deployed":      deployed,
+        "realized_pnl":  realized_pnl,
+        "wallet_balance": wallet_balance,
+        "available":     available,
+        "return_pct":    return_pct,
+        "pnl_today":     pnl_today,
+        "pnl_week":      pnl_week,
+        "resolved_count": len(resolved),
+        "pending_count":  len(pending),
+    }
+
+
 # ── Stats ─────────────────────────────────────────────────────────────────────
 
 def read_stats(uid: int) -> dict:
-    trades_csv = user_trades_csv(uid)
+    trades_csv = _trades_csv_path(uid)
     if not trades_csv.exists():
         return {}
     with trades_csv.open() as f:
@@ -145,7 +227,7 @@ def read_stats(uid: int) -> dict:
     pf         = gross_win / gross_loss if gross_loss > 0 else None
     total_pnl  = sum(float(r["pnl_usd"]) for r in resolved if r.get("pnl_usd"))
 
-    brier     = [float(r["brier_score"]) for r in resolved if r.get("brier_score")]
+    brier      = [float(r["brier_score"]) for r in resolved if r.get("brier_score")]
     mean_brier = sum(brier) / len(brier) if brier else None
     bss        = 1 - (mean_brier / 0.25) if mean_brier else None
 
@@ -171,22 +253,22 @@ def read_stats(uid: int) -> dict:
     }
 
 def read_last_signals(uid: int) -> list[dict]:
-    f = user_signals_file(uid)
+    f = _signals_path(uid)
     if not f.exists():
         return []
     return json.loads(f.read_text()).get("signals", [])
 
 def read_last_scan_meta(uid: int) -> dict:
-    f = user_signals_file(uid)
+    f = _signals_path(uid)
     if not f.exists():
         return {}
     try:
-        data = json.loads(f.read_text())
+        data    = json.loads(f.read_text())
         signals = data.get("signals", [])
         return {
             "scanned_at": data.get("scanned_at", "")[:16].replace("T", " "),
-            "total": len(signals),
-            "high_conf": sum(1 for s in signals if s.get("edge_pp", 0) >= 0.30),
+            "total":      len(signals),
+            "high_conf":  sum(1 for s in signals if s.get("edge_pp", 0) >= 0.30),
         }
     except Exception:
         return {}
@@ -196,62 +278,243 @@ def get_mode(uid: int) -> str:
     return "🟢 LIVE" if mode == "live" else "🟡 PAPER"
 
 
+# ── City extractor ────────────────────────────────────────────────────────────
+
+_CITY_MAP = [
+    ("HK",    ["Hong Kong"]),
+    ("SZ",    ["Shenzhen"]),
+    ("NYC",   ["NYC", "New York City", "New York"]),
+    ("LON",   ["London"]),
+    ("SEA",   ["Seattle"]),
+    ("SEO",   ["Seoul"]),
+    ("TA",    ["Tel Aviv"]),
+    ("HNL",   ["Honolulu"]),
+    ("SYD",   ["Sydney"]),
+    ("TYO",   ["Tokyo"]),
+    ("MIA",   ["Miami"]),
+    ("DAL",   ["Dallas"]),
+    ("ATL",   ["Atlanta"]),
+    ("MAD",   ["Madrid"]),
+    ("CHI",   ["Chicago"]),
+    ("LAX",   ["Los Angeles"]),
+    ("SFO",   ["San Francisco"]),
+    ("BER",   ["Berlin"]),
+    ("PAR",   ["Paris"]),
+    ("SGP",   ["Singapore"]),
+]
+
+def _extract_city(title: str) -> str:
+    t = title.lower()
+    for abbr, patterns in _CITY_MAP:
+        if any(p.lower() in t for p in patterns):
+            return abbr
+    return "?"
+
+
 # ── Formatters ────────────────────────────────────────────────────────────────
 
 def fmt_status(uid: int) -> str:
-    s = read_stats(uid)
+    s    = read_stats(uid)
+    ws   = wallet_stats(uid)
     mode = get_mode(uid)
     scan = read_last_scan_meta(uid)
+
     if not s:
-        header = f"*📊 Trading Status* — {mode}\n"
+        header = f"*📊 Status* — {mode}\n"
         if scan:
-            return header + f"Last scan: {scan['scanned_at']} UTC\nNo trades yet — run a scan first."
+            return header + f"Last scan: {scan['scanned_at']} UTC\nNo trades yet."
         return header + "No data yet. Run /scan to start."
-    lines = [f"*📊 Trading Status* — {mode}\n"]
-    lines.append(f"Trades:       {s['resolved']} resolved / {s['pending']} pending")
+
+    lines = [f"*📊 Status* — {mode}\n"]
+
+    # Lead with return
+    if ws["return_pct"] is not None:
+        sign = "+" if ws["return_pct"] >= 0 else ""
+        lines.append(
+            f"📈 *{sign}{ws['return_pct']:.1f}% return*"
+            f"   (${ws['realized_pnl']:+,.2f} on ${ws['deposited']:,.0f})"
+        )
+    else:
+        lines.append(
+            f"📈 PnL: *${s['total_pnl']:+,.2f}*"
+            f"   _(use /deposit to track ROI %)_"
+        )
+
+    lines.append(f"\n{s['resolved']} resolved · {s['pending']} pending · {s['total']} total")
+
     if s["win_rate"] is not None:
-        lines.append(f"Win rate:     {s['win_rate']:.1f}%  ({s['wins']}W / {s['losses']}L)")
+        lines.append(f"Win rate:      {s['win_rate']:.1f}%  ({s['wins']}W / {s['losses']}L)")
     if s["profit_factor"] is not None:
         e = "✅" if s["profit_factor"] >= 1.5 else "⚠️"
-        lines.append(f"Prof. factor: {e} {s['profit_factor']:.2f}  (need ≥ 1.5)")
+        lines.append(f"Prof. factor:  {e} {s['profit_factor']:.2f}  (need ≥ 1.5)")
     if s["bss"] is not None:
-        lines.append(f"Brier skill:  {s['bss']:+.3f}  (need ≥ 0.0)")
-    lines.append(f"Total PnL:    *€{s['total_pnl']:.2f}*")
+        e = "✅" if s["bss"] >= 0 else "⚠️"
+        lines.append(f"Brier skill:   {e} {s['bss']:+.3f}  (need ≥ 0.0)")
+
     if scan:
-        lines.append(f"\nLast scan:    {scan['scanned_at']} UTC")
-        lines.append(f"Signals:      {scan['high_conf']} high-conf (≥30%) / {scan['total']} total")
-    if s["pending_by_date"]:
-        lines.append("\n_Pending resolves:_")
-        for d, n in s["pending_by_date"].items():
-            lines.append(f"  {d}: {n} trade(s)")
-    gate = "🟢 ALL GATES PASSED — ready for live" if s["gates_passed"] else "🔴 Gates not yet passed"
-    lines.append(f"\n{gate}")
+        lines.append(
+            f"\nLast scan: {scan['scanned_at']} UTC"
+            f" · {scan['high_conf']} high-conf / {scan['total']} signals"
+        )
+
+    # Go-live gate
+    all_pass = (
+        s["resolved"] >= 20
+        and s["profit_factor"] is not None and s["profit_factor"] >= 1.5
+        and s["bss"] is not None and s["bss"] >= 0.0
+    )
+    if all_pass:
+        lines.append("\n🟢 *All gates passed — ready for live*")
+    else:
+        missing = []
+        if s["resolved"] < 20:
+            missing.append(f"{s['resolved']}/20 trades")
+        if s["profit_factor"] is None or s["profit_factor"] < 1.5:
+            pf_str = f"{s['profit_factor']:.2f}" if s["profit_factor"] else "N/A"
+            missing.append(f"PF {pf_str}")
+        if s["bss"] is None or s["bss"] < 0.0:
+            bss_str = f"{s['bss']:+.3f}" if s["bss"] is not None else "N/A"
+            missing.append(f"BSS {bss_str}")
+        lines.append(f"\n🔴 Gates pending: {', '.join(missing)}")
+
     return "\n".join(lines)
+
+
+def fmt_wallet(uid: int) -> str:
+    ws   = wallet_stats(uid)
+    mode = get_mode(uid)
+    txns = read_wallet().get("transactions", [])
+
+    lines = [f"*💼 Wallet* — {mode}\n"]
+
+    if ws["deposited"] == 0:
+        lines.append("No deposits recorded yet.")
+        lines.append("Use /deposit <amount> to start tracking your wallet.\n")
+        lines.append(f"Realized PnL (paper):  *${ws['realized_pnl']:+,.2f}*")
+        lines.append(f"Deployed right now:    ${ws['deployed']:,.2f}")
+        return "\n".join(lines)
+
+    # Balance block
+    ret_str = ""
+    if ws["return_pct"] is not None:
+        sign = "+" if ws["return_pct"] >= 0 else ""
+        ret_str = f"  ({sign}{ws['return_pct']:.1f}%)"
+    lines.append(f"💰 Balance:   *${ws['wallet_balance']:,.2f}*{ret_str}")
+    lines.append(f"├─ Deposited  ${ws['deposited']:,.2f}")
+    if ws["withdrawn"] > 0:
+        lines.append(f"├─ Withdrawn  -${ws['withdrawn']:,.2f}")
+    lines.append(f"├─ Deployed   ${ws['deployed']:,.2f}  ({ws['pending_count']} open positions)")
+    avail_sign = "+" if ws["available"] >= 0 else ""
+    lines.append(f"└─ Available  {avail_sign}${ws['available']:,.2f}")
+
+    # PnL breakdown
+    lines.append(f"\n📊 *Realized PnL*")
+    lines.append(f"All-time:  *${ws['realized_pnl']:+,.2f}*")
+    if abs(ws["pnl_week"]) > 0:
+        lines.append(f"This week: ${ws['pnl_week']:+,.2f}")
+    if abs(ws["pnl_today"]) > 0:
+        lines.append(f"Today:     ${ws['pnl_today']:+,.2f}")
+
+    # Transaction history (last 5)
+    if txns:
+        lines.append(f"\n_Last transactions:_")
+        for t in txns[-5:][::-1]:
+            ts   = t["timestamp"][:10]
+            sign = "+" if t["type"] == "deposit" else "-"
+            note = f" · {t['note']}" if t.get("note") else ""
+            lines.append(f"  {ts}  {sign}${t['amount']:,.2f}  ({t['type']}{note})")
+
+    return "\n".join(lines)
+
+
+def fmt_positions(uid: int) -> str:
+    csv_path = _trades_csv_path(uid)
+    if not csv_path.exists():
+        return "No open positions."
+
+    with csv_path.open() as f:
+        rows = list(csv.DictReader(f))
+
+    pending = [r for r in rows if not r.get("resolved_at")]
+    if not pending:
+        return "✅ No open positions — all trades resolved."
+
+    total_deployed = sum(float(r["size_usd"]) for r in pending if r.get("size_usd"))
+
+    # Group by resolution date
+    by_date: dict[str, list] = defaultdict(list)
+    for r in pending:
+        d = (r.get("resolution_date") or "?")[:10]
+        by_date[d].append(r)
+
+    lines = [
+        f"*📍 Open Positions* — {len(pending)} trades · ${total_deployed:,.0f} deployed\n"
+    ]
+
+    for date in sorted(by_date.keys()):
+        trades   = by_date[date]
+        at_risk  = sum(float(t["size_usd"]) for t in trades if t.get("size_usd"))
+        avg_edge = sum(float(t.get("edge_pp", 0)) for t in trades) / len(trades)
+
+        # Group by city within this date
+        city_groups: dict[str, list] = defaultdict(list)
+        for t in trades:
+            city_groups[_extract_city(t.get("market_title", ""))].append(t)
+
+        city_str = "  ".join(
+            f"{city}×{len(ts)}" for city, ts in sorted(city_groups.items())
+        )
+
+        lines.append(f"📅 *{date}*  —  {len(trades)} trades · ${at_risk:,.0f} at risk · avg {avg_edge:.0%} edge")
+        lines.append(f"   {city_str}")
+
+        # Show individual trades (up to 6 per date to stay readable)
+        shown = trades[:6]
+        for t in shown:
+            d_icon  = "📈" if t.get("direction") == "YES" else "📉"
+            size    = float(t.get("size_usd", 0))
+            edge    = float(t.get("edge_pp", 0))
+            city    = _extract_city(t.get("market_title", ""))
+            # Strip city prefix from title to save space
+            title   = t.get("market_title", "?")
+            # Take the part after " - " (the specific question)
+            if " - " in title:
+                title = title.split(" - ", 1)[1]
+            title = title[:52]
+            lines.append(f"   {d_icon} ${size:.0f} · {edge:.0%} · _{title}_")
+        if len(trades) > 6:
+            lines.append(f"   _...and {len(trades) - 6} more_")
+
+        lines.append("")  # spacer between dates
+
+    return "\n".join(lines).rstrip()
+
 
 def fmt_signals(signals: list[dict], uid: int) -> str:
     if not signals:
         return "No signals from last scan."
     scanned_at = ""
-    f = user_signals_file(uid)
+    f = _signals_path(uid)
     if f.exists():
         scanned_at = json.loads(f.read_text()).get("scanned_at", "")[:16].replace("T", " ")
     lines = [f"*🎯 Last Scan Signals* — {len(signals)} total"]
     if scanned_at:
         lines.append(f"_Scanned: {scanned_at} UTC_\n")
     for s in signals[:10]:
-        d = "📈 YES" if s["direction"] == "YES" else "📉 NO"
-        edge = s.get("edge_pp", 0)
+        d       = "📈 YES" if s["direction"] == "YES" else "📉 NO"
+        edge    = s.get("edge_pp", 0)
         model_p = s.get("model_p", 0)
-        mkt_p = s.get("mkt_p", 0)
-        title = s.get("title", "?")[:50]
+        mkt_p   = s.get("mkt_p", 0)
+        title   = s.get("title", "?")[:50]
         lines.append(f"{d} *{edge:.0%}* edge — _{title}_")
         lines.append(f"   Model {model_p:.1%} vs Mkt {mkt_p:.1%}")
     if len(signals) > 10:
         lines.append(f"\n_...and {len(signals) - 10} more_")
     return "\n".join(lines)
 
+
 def fmt_trades(uid: int, n: int = 10) -> str:
-    trades_csv = user_trades_csv(uid)
+    trades_csv = _trades_csv_path(uid)
     if not trades_csv.exists():
         return "No trades yet."
     with trades_csv.open() as f:
@@ -264,12 +527,15 @@ def fmt_trades(uid: int, n: int = 10) -> str:
         return "No resolved trades yet."
     lines = [f"*📋 Last {len(resolved)} Resolved Trades*\n"]
     for r in resolved:
-        pnl = float(r.get("pnl_usd", 0))
-        e = "✅" if pnl > 0 else "❌"
-        title = r.get("market_title", "?")[:44]
+        pnl       = float(r.get("pnl_usd", 0))
+        e         = "✅" if pnl > 0 else "❌"
+        title     = r.get("market_title", "?")
+        if " - " in title:
+            title = title.split(" - ", 1)[1]
+        title     = title[:48]
         direction = r.get("direction", "?")
-        edge = float(r.get("edge_pp", 0))
-        lines.append(f"{e} *€{pnl:+.2f}* | {direction} | {edge:.0%} edge")
+        edge      = float(r.get("edge_pp", 0))
+        lines.append(f"{e} *${pnl:+.2f}* · {direction} · {edge:.0%} edge")
         lines.append(f"   _{title}_")
     return "\n".join(lines)
 
@@ -279,10 +545,14 @@ def fmt_trades(uid: int, n: int = 10) -> str:
 def main_kb(uid: int) -> InlineKeyboardMarkup:
     rows = [
         [
-            InlineKeyboardButton("📊 Status",  callback_data="status"),
-            InlineKeyboardButton("🎯 Signals", callback_data="signals"),
+            InlineKeyboardButton("📊 Status",    callback_data="status"),
+            InlineKeyboardButton("💼 Wallet",    callback_data="wallet"),
         ],
-        [InlineKeyboardButton("📋 Trades", callback_data="trades")],
+        [
+            InlineKeyboardButton("📍 Positions", callback_data="positions"),
+            InlineKeyboardButton("🎯 Signals",   callback_data="signals"),
+        ],
+        [InlineKeyboardButton("📋 Trades",       callback_data="trades")],
     ]
     if is_admin(uid):
         rows.append([
@@ -298,14 +568,14 @@ def back_kb() -> InlineKeyboardMarkup:
 def confirm_kb(action: str, label: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton(f"✅ {label}", callback_data=f"{action}_confirm"),
-        InlineKeyboardButton("❌ Cancel", callback_data="status"),
+        InlineKeyboardButton("❌ Cancel",   callback_data="status"),
     ]])
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 async def run_bot_async(mode: str, uid: int) -> tuple[str, str, int]:
-    """Run weather_bot.py async for a specific user. Returns (stdout, stderr, returncode)."""
+    """Run weather_bot.py async for a specific user."""
     log_dir = user_log_dir(uid)
     log_dir.mkdir(parents=True, exist_ok=True)
     args = [PYTHON, "weather_bot.py", "--mode", mode, "--log-dir", str(log_dir)]
@@ -337,7 +607,7 @@ async def run_bot_async(mode: str, uid: int) -> tuple[str, str, int]:
 
 @require_auth()
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+    uid  = update.effective_user.id
     role = get_role(uid)
     await update.message.reply_text(
         f"👋 *Polymarket Bot*\nRole: `{role}`\n\nUse the buttons or type /help.",
@@ -349,18 +619,24 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     lines = [
-        "*Available commands:*\n",
-        "/status — your trading stats",
-        "/signals — last scan signals",
-        "/trades [n] — last N resolved trades",
-        "/scan — trigger a scan (your account)",
-        "/resolve — auto-resolve your pending trades",
-        "/mymode [paper|live] — view or change your mode",
-        "/setup <key> [proxy] — save your Polymarket credentials",
+        "*Portfolio*",
+        "/status — overview: return %, win rate, gates",
+        "/wallet — balance, deployed, PnL breakdown",
+        "/positions — open trades grouped by date & city",
+        "/trades [n] — last N resolved trades (default 10)",
+        "/signals — signals from the last scan\n",
+        "*Wallet tracking*",
+        "/deposit <amount> [note] — record a deposit",
+        "/withdraw <amount> [note] — record a withdrawal\n",
+        "*Bot control*",
+        "/scan — trigger a market scan",
+        "/resolve — auto-resolve pending paper trades",
+        "/mymode [paper|live] — view or change mode",
+        "/setup <key> [proxy] — save Polymarket credentials",
     ]
     if is_admin(uid):
         lines += [
-            "\n*Admin:*",
+            "\n*Admin*",
             "/adduser <id> [admin|viewer] — add user",
             "/removeuser <id> — remove user",
             "/users — list users",
@@ -375,6 +651,20 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 @require_auth()
+async def cmd_wallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    await update.effective_message.reply_text(
+        fmt_wallet(uid), reply_markup=main_kb(uid), parse_mode="Markdown",
+    )
+
+@require_auth()
+async def cmd_positions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    await update.effective_message.reply_text(
+        fmt_positions(uid), reply_markup=main_kb(uid), parse_mode="Markdown",
+    )
+
+@require_auth()
 async def cmd_signals(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     await update.effective_message.reply_text(
@@ -386,7 +676,7 @@ async def cmd_signals(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 @require_auth()
 async def cmd_trades(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    n = 10
+    n   = 10
     if ctx.args:
         try:
             n = min(int(ctx.args[0]), 30)
@@ -396,6 +686,54 @@ async def cmd_trades(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         fmt_trades(uid, n), reply_markup=main_kb(uid), parse_mode="Markdown",
     )
 
+@require_auth(admin_only=True)
+async def cmd_deposit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Record a deposit. Usage: /deposit <amount> [note]"""
+    if not ctx.args:
+        await update.message.reply_text(
+            "Usage: `/deposit <amount> [note]`\nExample: `/deposit 500 initial load`",
+            parse_mode="Markdown",
+        )
+        return
+    try:
+        amount = float(ctx.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount.")
+        return
+    note = " ".join(ctx.args[1:]) if len(ctx.args) > 1 else ""
+    append_wallet_transaction("deposit", amount, note)
+    ws = wallet_stats(update.effective_user.id)
+    await update.message.reply_text(
+        f"✅ *Deposit recorded:* +${amount:,.2f}\n"
+        f"Total deposited: ${ws['deposited']:,.2f}\n"
+        f"Wallet balance:  ${ws['wallet_balance']:,.2f}",
+        parse_mode="Markdown",
+    )
+
+@require_auth(admin_only=True)
+async def cmd_withdraw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Record a withdrawal. Usage: /withdraw <amount> [note]"""
+    if not ctx.args:
+        await update.message.reply_text(
+            "Usage: `/withdraw <amount> [note]`\nExample: `/withdraw 200 partial exit`",
+            parse_mode="Markdown",
+        )
+        return
+    try:
+        amount = float(ctx.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount.")
+        return
+    note = " ".join(ctx.args[1:]) if len(ctx.args) > 1 else ""
+    append_wallet_transaction("withdraw", amount, note)
+    ws = wallet_stats(update.effective_user.id)
+    await update.message.reply_text(
+        f"✅ *Withdrawal recorded:* -${amount:,.2f}\n"
+        f"Total withdrawn: ${ws['withdrawn']:,.2f}\n"
+        f"Wallet balance:  ${ws['wallet_balance']:,.2f}",
+        parse_mode="Markdown",
+    )
+
 @require_auth()
 async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -403,7 +741,9 @@ async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     stdout, stderr, rc = await run_bot_async("paper", uid)
     if rc != 0:
         err = (stderr or stdout or "Unknown error")[-300:].strip()
-        await msg.edit_text(f"❌ Scan failed\n```\n{err}\n```", reply_markup=main_kb(uid), parse_mode="Markdown")
+        await msg.edit_text(
+            f"❌ Scan failed\n```\n{err}\n```", reply_markup=main_kb(uid), parse_mode="Markdown"
+        )
     else:
         summary = next((l for l in stdout.splitlines() if "evaluated" in l), "Scan complete.")
         await msg.edit_text(f"✅ {summary.strip()}", reply_markup=main_kb(uid))
@@ -415,14 +755,15 @@ async def cmd_resolve(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     stdout, stderr, rc = await run_bot_async("auto-resolve", uid)
     if rc != 0:
         err = (stderr or stdout or "Unknown error")[-300:].strip()
-        await msg.edit_text(f"❌ Resolve failed\n```\n{err}\n```", reply_markup=main_kb(uid), parse_mode="Markdown")
+        await msg.edit_text(
+            f"❌ Resolve failed\n```\n{err}\n```", reply_markup=main_kb(uid), parse_mode="Markdown"
+        )
     else:
         summary = next((l for l in stdout.splitlines() if "Auto-resolved" in l), "Done.")
         await msg.edit_text(f"✅ {summary.strip()}", reply_markup=main_kb(uid))
 
 @require_auth()
 async def cmd_setup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Store user's Polymarket credentials. Usage: /setup <private_key> [proxy_address]"""
     uid = update.effective_user.id
     if not ctx.args:
         await update.message.reply_text(
@@ -445,7 +786,6 @@ async def cmd_setup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @require_auth()
 async def cmd_mymode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Set or view your trading mode. Usage: /mymode [paper|live]"""
     uid = update.effective_user.id
     if not ctx.args:
         mode = get_user_mode(uid)
@@ -523,14 +863,22 @@ async def cmd_removeuser(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @require_auth()
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
+    q    = update.callback_query
     await q.answer()
-    uid = update.effective_user.id
+    uid  = update.effective_user.id
     data = q.data
 
     if data == "status":
         await q.edit_message_text(
             fmt_status(uid), reply_markup=main_kb(uid), parse_mode="Markdown"
+        )
+    elif data == "wallet":
+        await q.edit_message_text(
+            fmt_wallet(uid), reply_markup=main_kb(uid), parse_mode="Markdown"
+        )
+    elif data == "positions":
+        await q.edit_message_text(
+            fmt_positions(uid), reply_markup=main_kb(uid), parse_mode="Markdown"
         )
     elif data == "signals":
         await q.edit_message_text(
@@ -542,7 +890,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     elif data == "scan" and is_admin(uid):
         await q.edit_message_text(
-            "🔍 *Trigger scan?*\nThis fetches live forecasts and evaluates all markets (~2–3 min).",
+            "🔍 *Trigger scan?*\nFetches live forecasts and evaluates all markets (~2–3 min).",
             reply_markup=confirm_kb("scan", "Run scan"),
             parse_mode="Markdown",
         )
@@ -559,7 +907,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(f"✅ {summary.strip()}", reply_markup=main_kb(uid))
     elif data == "resolve" and is_admin(uid):
         await q.edit_message_text(
-            "✅ *Trigger auto-resolve?*\nThis resolves all pending paper trades that are due.",
+            "✅ *Trigger auto-resolve?*\nResolves all pending paper trades that are due.",
             reply_markup=confirm_kb("resolve", "Run resolve"),
             parse_mode="Markdown",
         )
@@ -590,42 +938,59 @@ _seen_resolved_mtimes: dict[int, float] = {}
 async def check_alerts(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     bot = ctx.bot
     for uid in all_user_ids():
-        signals_file  = user_signals_file(uid)
-        resolved_file = user_resolved_file(uid)
+        signals_file  = _signals_path(uid)
+        resolved_file = _resolved_path(uid)
 
+        # New signals alert
         if signals_file.exists():
             mtime = signals_file.stat().st_mtime
             if mtime > _seen_signals_mtimes.get(uid, 0.0):
                 _seen_signals_mtimes[uid] = mtime
-                data = json.loads(signals_file.read_text())
+                data    = json.loads(signals_file.read_text())
                 signals = [s for s in data.get("signals", []) if s.get("edge_pp", 0) >= 0.30]
                 if signals:
-                    text = f"🔔 *Scheduled scan — {len(signals)} signal(s)*\n\n{fmt_signals(signals, uid)}"
+                    text = (
+                        f"🔔 *Scheduled scan — {len(signals)} signal(s)*\n\n"
+                        f"{fmt_signals(signals, uid)}"
+                    )
                     try:
                         await bot.send_message(uid, text, parse_mode="Markdown")
                     except Exception:
                         pass
 
+        # Resolved trades alert — enhanced with wallet context
         if resolved_file.exists():
             mtime = resolved_file.stat().st_mtime
             if mtime > _seen_resolved_mtimes.get(uid, 0.0):
                 _seen_resolved_mtimes[uid] = mtime
-                data = json.loads(resolved_file.read_text())
+                data     = json.loads(resolved_file.read_text())
                 resolved = data.get("resolved", [])
                 if resolved:
-                    total = sum(t.get("pnl_usd", 0) for t in resolved)
-                    e = "✅" if total >= 0 else "❌"
-                    lines = [f"{e} *{len(resolved)} trade(s) resolved* — *€{total:+.2f}*\n"]
+                    batch_pnl = sum(t.get("pnl_usd", 0) for t in resolved)
+                    e         = "✅" if batch_pnl >= 0 else "❌"
+                    lines     = [f"{e} *{len(resolved)} trade(s) resolved* — *${batch_pnl:+.2f}*\n"]
+
                     for t in resolved[:5]:
-                        pnl = t.get("pnl_usd", 0)
-                        em = "✅" if pnl > 0 else "❌"
-                        title = t.get("market_title", "?")[:44]
-                        lines.append(f"{em} €{pnl:+.2f} — _{title}_")
+                        pnl   = t.get("pnl_usd", 0)
+                        em    = "✅" if pnl > 0 else "❌"
+                        title = t.get("market_title", "?")
+                        if " - " in title:
+                            title = title.split(" - ", 1)[1]
+                        lines.append(f"{em} ${pnl:+.2f} — _{title[:44]}_")
                     if len(resolved) > 5:
                         lines.append(f"_...and {len(resolved) - 5} more_")
-                    s = read_stats(uid)
-                    if s and s.get("profit_factor"):
-                        lines.append(f"\n📊 PnL: *€{s['total_pnl']:.2f}* | PF: {s['profit_factor']:.2f}")
+
+                    # Running wallet summary
+                    ws = wallet_stats(uid)
+                    lines.append(f"\n📊 *All-time: ${ws['realized_pnl']:+,.2f}*")
+                    if ws["return_pct"] is not None:
+                        sign = "+" if ws["return_pct"] >= 0 else ""
+                        lines.append(f"   Return:  {sign}{ws['return_pct']:.1f}%")
+                    if abs(ws["pnl_today"]) > 0:
+                        lines.append(f"   Today:   ${ws['pnl_today']:+.2f}")
+                    if ws["pending_count"] > 0:
+                        lines.append(f"   Open:    {ws['pending_count']} positions · ${ws['deployed']:,.0f} deployed")
+
                     text = "\n".join(line for line in lines if line)
                     try:
                         await bot.send_message(uid, text, parse_mode="Markdown")
@@ -644,12 +1009,16 @@ async def _run() -> None:
         ("start",       cmd_start),
         ("help",        cmd_help),
         ("status",      cmd_status),
+        ("wallet",      cmd_wallet),
+        ("positions",   cmd_positions),
         ("signals",     cmd_signals),
         ("trades",      cmd_trades),
         ("scan",        cmd_scan),
         ("resolve",     cmd_resolve),
         ("setup",       cmd_setup),
         ("mymode",      cmd_mymode),
+        ("deposit",     cmd_deposit),
+        ("withdraw",    cmd_withdraw),
         ("users",       cmd_users),
         ("adduser",     cmd_adduser),
         ("removeuser",  cmd_removeuser),
@@ -663,11 +1032,10 @@ async def _run() -> None:
         app.job_queue.run_repeating(check_alerts, interval=120, first=10)
         await app.updater.start_polling(drop_pending_updates=True)
         print("Polymarket Bot online.", flush=True)
-        await asyncio.Event().wait()  # run until process is killed
+        await asyncio.Event().wait()
 
 
 def main() -> None:
-    import asyncio
     asyncio.run(_run())
 
 
