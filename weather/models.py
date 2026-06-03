@@ -36,6 +36,8 @@ class WeatherMarket:
     raw_title: str = ""     # Original title before parsing
     # For monthly aggregate markets (>7d horizon), forecast is summed over a date window
     forecast_start_date: "date | None" = None  # set for monthly markets
+    # Current CLOB order-book depth; 0.0 = not fetched (sidecar unavailable)
+    book_depth_usd: float = 0.0
 
 
 @dataclass
@@ -92,6 +94,7 @@ class RawProbabilityResult:
     threshold: float
     direction: str
     metric: str
+    n_models: int = 0                   # Distinct models that contributed to model_breakdown
 
 
 @dataclass
@@ -109,6 +112,11 @@ class Signal:
     signal_time: datetime
     forecast: EnsembleForecast
     prob_result: RawProbabilityResult
+
+    @property
+    def entry_price(self) -> float:
+        """Market-implied cost per contract for the signalled direction."""
+        return self.market_p if self.direction == "YES" else (1.0 - self.market_p)
 
 
 @dataclass
@@ -133,6 +141,7 @@ class PaperTrade:
     weather_direction: str = ""  # "above"/"below"/"equal"/"range"
     lat: float = 0.0
     lon: float = 0.0
+    location_tz: str = "UTC"     # timezone used when this trade was forecast; E1 fix
     actual_outcome: bool | None = None
     resolved_at: datetime | None = None
     pnl_usd: float | None = None

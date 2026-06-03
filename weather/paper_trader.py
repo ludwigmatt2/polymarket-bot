@@ -12,6 +12,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from ._io import atomic_write_csv
 from .config import (
     DAILY_LOSS_LIMIT_PCT,
     MIN_BRIER_SKILL_SCORE,
@@ -30,13 +31,22 @@ CSV_HEADERS = [
     "size_usd", "size_factor", "edge_pp", "ensemble_spread", "confidence_score",
     "resolution_date",
     # Resolution fields — stored at log time so auto-resolve needs no re-parsing
-    "metric", "threshold", "threshold_high", "weather_direction", "lat", "lon",
+    "metric", "threshold", "threshold_high", "weather_direction", "lat", "lon", "location_tz",
     "actual_outcome", "resolved_at", "pnl_usd", "brier_score",
     "cumulative_pnl", "cumulative_brier",
 ]
 
 # Brier score for an uninformed 50/50 forecast (climatology baseline)
 _CLIMATOLOGY_BRIER = 0.25
+
+
+def _trade_pnl(size_usd: float, entry_price: float, bet_wins: bool) -> float:
+    """option-b semantics: size_usd is the USD stake; win returns stake*(1/price-1)."""
+    return size_usd * (1.0 / entry_price - 1.0) if bet_wins else -size_usd
+
+
+def _brier(model_p: float, outcome: bool) -> float:
+    return (model_p - float(outcome)) ** 2
 
 
 class PaperTrader:
@@ -80,6 +90,7 @@ class PaperTrader:
             weather_direction=signal.market.direction,
             lat=signal.market.location.lat,
             lon=signal.market.location.lon,
+            location_tz=signal.market.location.timezone or "UTC",
         )
         self._append_trade(trade)
         self._existing_keys.add(key)
@@ -101,15 +112,10 @@ class PaperTrader:
         size_usd = float(target["size_usd"])
         model_p = float(target["model_p"])
 
-        # PnL: if direction=YES and outcome=True → win (1-entry_price) per unit
-        # if direction=YES and outcome=False → lose entry_price per unit
-        if direction == "YES":
-            pnl = size_usd * ((1.0 - entry_price) if actual_outcome else -entry_price)
-        else:
-            # Bought NO at (1-yes_price)
-            pnl = size_usd * ((entry_price) if not actual_outcome else -(1.0 - entry_price))
+        bet_wins = actual_outcome if direction == "YES" else not actual_outcome
+        pnl = _trade_pnl(size_usd, entry_price, bet_wins)
 
-        brier = (model_p - float(actual_outcome)) ** 2
+        brier = _brier(model_p, actual_outcome)
         now = datetime.now(timezone.utc).isoformat()
 
         target["actual_outcome"] = int(actual_outcome)
@@ -181,7 +187,8 @@ class PaperTrader:
                 skipped += 1
                 continue
 
-            loc = Location(city="", lat=lat, lon=lon, timezone="UTC")
+            loc_tz = t.get("location_tz") or "UTC"
+            loc = Location(city="", lat=lat, lon=lon, timezone=loc_tz)
             actual_val = weather_client.get_historical_actual(loc, res_dt.date(), metric)
             if actual_val is None:
                 skipped += 1
@@ -193,15 +200,13 @@ class PaperTrader:
             entry_price = float(t["entry_price"])
             size_usd = float(t["size_usd"])
             model_p = float(t["model_p"])
-            if t["direction"] == "YES":
-                pnl = size_usd * ((1.0 - entry_price) if outcome else -entry_price)
-            else:
-                pnl = size_usd * (entry_price if not outcome else -(1.0 - entry_price))
+            bet_wins = outcome if t["direction"] == "YES" else not outcome
+            pnl = _trade_pnl(size_usd, entry_price, bet_wins)
 
             t["actual_outcome"] = int(outcome)
             t["resolved_at"] = now.isoformat()
             t["pnl_usd"] = round(pnl, 4)
-            t["brier_score"] = round((model_p - float(outcome)) ** 2, 4)
+            t["brier_score"] = round(_brier(model_p, outcome), 4)
             resolved += 1
 
             if model is not None:
@@ -251,17 +256,17 @@ class PaperTrader:
         mean_brier = sum(briers) / len(briers) if briers else _CLIMATOLOGY_BRIER
         bss = 1.0 - (mean_brier / _CLIMATOLOGY_BRIER)
 
-        # Max drawdown — denominator is total capital deployed across all resolved trades
-        sizes = [float(t["size_usd"]) for t in resolved if t.get("size_usd")]
-        hypothetical_capital = max(sum(sizes), 1.0)
-        cumulative = 0.0
+        # Max drawdown — equity-curve (peak−trough)/total_capital_staked.
+        # total_capital = sum of USD stakes (size_usd, option-b semantics).
+        sizes = [float(t["size_usd"]) for t in resolved if t.get("size_usd") not in (None, "")]
+        total_capital = max(sum(sizes), 1.0)
+        equity = 0.0
         peak = 0.0
         max_dd = 0.0
         for p in pnls:
-            cumulative += p
-            if cumulative > peak:
-                peak = cumulative
-            dd = (peak - cumulative) / max(hypothetical_capital, 1)
+            equity += p
+            peak = max(peak, equity)
+            dd = (peak - equity) / total_capital
             if dd > max_dd:
                 max_dd = dd
 
@@ -338,6 +343,7 @@ class PaperTrader:
                 "weather_direction": trade.weather_direction,
                 "lat": trade.lat,
                 "lon": trade.lon,
+                "location_tz": trade.location_tz,
                 "actual_outcome": "",
                 "resolved_at": "",
                 "pnl_usd": "",
@@ -351,20 +357,15 @@ class PaperTrader:
             return []
         with open(self.log_path) as f:
             rows = list(csv.DictReader(f))
-        # Back-fill missing columns added after initial schema (metric/threshold/lat/lon).
-        # Rows written before the schema change simply get empty strings for new fields.
-        new_fields = {"metric", "threshold", "threshold_high", "weather_direction", "lat", "lon"}
-        if rows and not new_fields.issubset(rows[0].keys()):
+        if rows:
+            expected = set(CSV_HEADERS)
             for row in rows:
-                for field in new_fields:
-                    row.setdefault(field, "")
+                for field in expected - row.keys():
+                    row[field] = ""
         return rows
 
     def _rewrite_all(self, trades: list[dict]) -> None:
-        with open(self.log_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=CSV_HEADERS, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(trades)
+        atomic_write_csv(self.log_path, CSV_HEADERS, trades)
 
 
 def _evaluate_outcome(

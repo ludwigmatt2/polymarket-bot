@@ -2,6 +2,8 @@
 .env
 *.key
 *.pem
+# Per-user Polymarket credentials (plaintext private keys) live in config/users.json
+config/
 
 # ── Python ─────────────────────────────────────────────────────────────────────
 venv/

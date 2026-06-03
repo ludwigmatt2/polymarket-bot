@@ -118,6 +118,37 @@ class TestComputeProbability:
         assert result.ensemble_spread == pytest.approx(0.5, abs=0.01)
 
 
+class TestSingleModelDegradation:
+    """E2: single-model forecast should set n_models=1 and spread=0."""
+
+    def test_compute_probability_single_model_flags_degraded(self, model):
+        """When only one model has members, n_models=1 and spread=0.0."""
+        single_model_forecast = EnsembleForecast(
+            lat=25.77, lon=-80.19,
+            target_date=date(2026, 5, 1),
+            metric="temperature_2m_max",
+            member_arrays={"gfs_seamless": [92.0, 93.0, 94.0, 95.0, 96.0]},
+        )
+        result = model.compute_probability(single_model_forecast, threshold=90.0, direction="above")
+        assert result.n_models == 1
+        assert result.ensemble_spread == pytest.approx(0.0)
+
+    def test_compute_probability_two_models_sets_n_models_2(self, model):
+        """With two models, n_models=2 and spread is non-zero when models disagree."""
+        two_model_forecast = EnsembleForecast(
+            lat=25.77, lon=-80.19,
+            target_date=date(2026, 5, 1),
+            metric="temperature_2m_max",
+            member_arrays={
+                "gfs_seamless": [92.0, 93.0, 94.0, 95.0],
+                "icon_seamless": [80.0, 81.0, 82.0, 83.0],
+            },
+        )
+        result = model.compute_probability(two_model_forecast, threshold=90.0, direction="above")
+        assert result.n_models == 2
+        assert result.ensemble_spread > 0.0
+
+
 class TestEnsembleSpread:
     def test_single_model_spread_is_zero(self):
         f = EnsembleForecast(

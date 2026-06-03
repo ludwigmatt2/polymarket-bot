@@ -14,9 +14,12 @@ Core logic:
 from __future__ import annotations
 
 import csv
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+_log = logging.getLogger(__name__)
 
 import numpy as np
 from scipy.stats import gaussian_kde
@@ -36,6 +39,7 @@ class ProbabilityModel:
         self._calibrators_by_dir: dict[str, Any] = {}             # per-direction
         self._calibration_obs: list[tuple[float, float]] = []     # (model_p, actual) global
         self._calibration_obs_by_dir: dict[str, list[tuple[float, float]]] = {}
+        self.calibration_load_error: str | None = None
         self._load_calibration_data()
 
     def compute_probability(
@@ -87,6 +91,7 @@ class ProbabilityModel:
             threshold=threshold,
             direction=direction,
             metric=forecast.metric,
+            n_models=len(model_breakdown),
         )
 
     @property
@@ -144,8 +149,9 @@ class ProbabilityModel:
                     if d:
                         self._calibration_obs_by_dir.setdefault(d, []).append((p, a))
             self._fit_calibrator()
-        except Exception:
-            pass
+        except Exception as exc:
+            self.calibration_load_error = str(exc)
+            _log.warning("Calibration load failed — running uncalibrated: %s", exc)
 
     def _append_calibration_csv(self, model_p: float, actual_outcome: bool, direction: str) -> None:
         path = self.calibration_log_path
@@ -181,7 +187,8 @@ def _fit_single(obs: list[tuple[float, float]], min_obs: int, platt_threshold: i
             ir = IsotonicRegression(out_of_bounds="clip")
             ir.fit(X, y)
             return ir
-    except Exception:
+    except Exception as exc:
+        _log.warning("Calibrator fit failed: %s", exc)
         return None
 
 
@@ -190,7 +197,8 @@ def _predict(calibrator: Any, raw_p: float) -> float:
         if hasattr(calibrator, "predict_proba"):
             return float(np.clip(calibrator.predict_proba([[raw_p]])[0][1], 0.001, 0.999))
         return float(np.clip(calibrator.predict([raw_p])[0], 0.001, 0.999))
-    except Exception:
+    except Exception as exc:
+        _log.warning("Calibrator predict failed, returning raw_p: %s", exc)
         return raw_p
 
 

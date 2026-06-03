@@ -34,6 +34,7 @@ from weather.backtest import (
     Backtester, BacktestResult, default_test_suite, summarize,
     TempBacktester, TempBacktestResult, default_temp_test_suite, summarize_temp,
 )
+from weather.live_backtest import LiveSignalBacktester
 from weather.market_scanner import WeatherMarketScanner
 from weather.city_bias import CityBiasCorrector
 from weather.models import Signal
@@ -413,6 +414,49 @@ def _save_results_csv(results: list[BacktestResult], path: Path) -> None:
     print(f"\n  Full results saved → {path}")
 
 
+def mode_backtest_live(client: WeatherClient, model: ProbabilityModel, log_dir: Path) -> None:
+    """
+    Replay all resolved paper trades through the live signal path.
+
+    For each resolved trade in logs/paper_trades.csv, reconstructs the market,
+    builds a synthetic ensemble from archive historical data, then runs the full
+    SignalGenerator (gates, calibration, shrinkage). Reports:
+      - Parity %: fraction of replays whose direction matches the original signal.
+      - Brier delta: mean(replayed Brier) − mean(original Brier).
+    """
+    trades_csv = log_dir / "paper_trades.csv"
+    backtester = LiveSignalBacktester(model=model, client=client)
+    print(f"  Replaying resolved trades from {trades_csv} ...")
+    report = backtester.replay_trades(trades_csv)
+
+    print()
+    print("  ══════════════ Live Signal Backtest ══════════════")
+    print(f"  Resolved trades loaded : {report.n_total}")
+    print(f"  Successfully replayed  : {report.n_replayed}  "
+          f"({'archive fetch failed' if report.n_replayed < report.n_total else 'all'})")
+    if report.n_replayed == 0:
+        print("  No trades replayed — archive data unavailable for these dates.")
+        return
+    print(f"  Direction parity       : {report.n_direction_match}/{report.n_replayed}  "
+          f"({report.parity_pct:.1%})")
+    print(f"  Mean Brier (original)  : {report.mean_brier_original:.4f}")
+    print(f"  Mean Brier (replayed)  : {report.mean_brier_replayed:.4f}")
+    delta_sign = "+" if report.mean_brier_delta > 0 else ""
+    print(f"  Brier delta            : {delta_sign}{report.mean_brier_delta:.4f}  "
+          f"({'replayed worse' if report.mean_brier_delta > 0 else 'replayed better or equal'})")
+    print()
+
+    mismatches = [r for r in report.results if not r.direction_match]
+    if mismatches:
+        print(f"  Direction mismatches ({len(mismatches)}):")
+        print(f"  {'ID':>8}  {'Orig':>4}  {'Replay':>6}  {'Brier-O':>7}  {'Brier-R':>7}  Title")
+        print(f"  {'-'*8}  {'-'*4}  {'-'*6}  {'-'*7}  {'-'*7}  {'-'*45}")
+        for r in sorted(mismatches, key=lambda x: abs(x.brier_replayed - x.brier_original), reverse=True)[:10]:
+            print(f"  {r.trade_id[:8]:>8}  {r.original_direction:>4}  {r.replayed_direction:>6}  "
+                  f"{r.brier_original:>7.4f}  {r.brier_replayed:>7.4f}  {r.market_title[:45]}")
+    print("  ══════════════════════════════════════════════════")
+
+
 def mode_stats(paper: PaperTrader) -> None:
     paper.print_dashboard()
 
@@ -442,7 +486,7 @@ def mode_resolve(paper: PaperTrader) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Weather model arbitrage bot")
-    parser.add_argument("--mode", choices=["scan", "paper", "live", "stats", "resolve", "auto-resolve", "backfill-calibration", "debug", "backtest", "backtest-temp", "arb"],
+    parser.add_argument("--mode", choices=["scan", "paper", "live", "stats", "resolve", "auto-resolve", "backfill-calibration", "debug", "backtest", "backtest-temp", "backtest-live", "arb"],
                         default="paper", help="Operating mode (default: paper)")
     parser.add_argument("--interval", type=int, default=3600,
                         help="Re-scan interval in seconds for paper/live mode (default: 3600)")
@@ -454,6 +498,8 @@ def main() -> None:
                         help="Minimum cross-venue spread filter for arb mode (e.g. 0.04 for 4%%)")
     parser.add_argument("--limit", type=int, default=20,
                         help="Max results for arb mode (default: 20)")
+    parser.add_argument("--source", choices=["gamma", "clob"], default="gamma",
+                        help="Market search source: gamma (REST) or clob (pmxt sidecar) (default: gamma)")
     parser.add_argument("--log-dir", type=Path, default=Path("logs"),
                         help="Directory for trade logs and signal files (default: logs/)")
     args = parser.parse_args()
@@ -476,8 +522,9 @@ def main() -> None:
         paper  = PaperTrader(log_path=log_dir / "paper_trades.csv")
         model  = ProbabilityModel(calibration_log_path=log_dir / "calibration_log.csv")
         client = WeatherClient()
+
         resolved_count, skipped = paper.auto_resolve(client, model=model)
-        print(f"  Auto-resolved {resolved_count} trade(s).  {skipped} skipped (no archive data or missing fields).")
+        print(f"  Paper: auto-resolved {resolved_count} trade(s).  {skipped} skipped.")
         if resolved_count:
             paper.print_dashboard()
             _write_resolved_file(paper, resolved_count, log_dir)
@@ -485,6 +532,13 @@ def main() -> None:
             active = model._calibrator is not None
             dirs  = list(model._calibrators_by_dir.keys())
             print(f"  Calibration log: {n_obs} obs  |  active={active}  |  per-direction={dirs or 'none yet'}")
+
+        live_log = log_dir / "live_trades.csv"
+        if live_log.exists():
+            live_trader = LiveTrader(paper_trader=paper, bankroll_usd=0, log_path=live_log)
+            live_resolved, live_skipped = live_trader.auto_resolve(client, model=model)
+            print(f"  Live:  auto-resolved {live_resolved} trade(s).  {live_skipped} skipped.")
+
         return
 
     if args.mode == "backfill-calibration":
@@ -517,6 +571,12 @@ def main() -> None:
         mode_backtest_temp(WeatherClient())
         return
 
+    if args.mode == "backtest-live":
+        _client = WeatherClient()
+        _model = ProbabilityModel(calibration_log_path=log_dir / "calibration_log.csv")
+        mode_backtest_live(_client, _model, log_dir)
+        return
+
     if args.mode == "arb":
         mode_arb(min_spread=args.min_spread, limit=args.limit)
         return
@@ -525,7 +585,7 @@ def main() -> None:
     client        = WeatherClient()
     model         = ProbabilityModel(calibration_log_path=log_dir / "calibration_log.csv")
     bias          = CityBiasCorrector()
-    scanner       = WeatherMarketScanner()
+    scanner       = WeatherMarketScanner(source=args.source)
     price_tracker = PriceTracker()
     generator     = SignalGenerator(model=model, client=client, price_tracker=price_tracker, bias_corrector=bias)
     paper         = PaperTrader(log_path=log_dir / "paper_trades.csv") if args.mode in ("paper", "live") else None
@@ -543,7 +603,12 @@ def main() -> None:
 
     live_trader = None
     if args.mode == "live":
-        live_trader = LiveTrader(paper_trader=paper, bankroll_usd=args.bankroll)
+        live_trader = LiveTrader(
+            paper_trader=paper,
+            bankroll_usd=args.bankroll,
+            log_path=log_dir / "live_trades.csv",
+            idempotency_path=log_dir / "live_idempotency.json",
+        )
         if not live_trader.is_unlocked():
             print("  Go-live gates not passed. Run: python weather_bot.py --mode stats", file=sys.stderr)
             sys.exit(1)

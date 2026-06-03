@@ -28,6 +28,7 @@ GATE8_CALIB_WEIGHT = 0.25
 
 # ── Market filters ─────────────────────────────────────────────────────────────
 MIN_MARKET_LIQUIDITY_USD = 50.0  # Lowered to include monthly precipitation markets
+BOOK_DEPTH_MIN_MULTIPLIER = 3   # Gate 5: require N× min liquidity in live CLOB book depth
 MIN_MARKET_PRICE = 0.03         # Avoid illiquid extremes
 MAX_MARKET_PRICE = 0.97
 # Gate 9.5: skip "equal" direction markets where crowd is this confident —

@@ -47,8 +47,10 @@ def _make_generator(model_p=0.80, price_tracker=None):
     model.compute_probability.return_value = RawProbabilityResult(
         raw_p=model_p, calibrated_p=model_p,
         ensemble_spread=0.05, n_members=5,
-        is_calibrated=False, model_breakdown={},
+        is_calibrated=False,
+        model_breakdown={"gfs_seamless": model_p, "ecmwf_ifs025": model_p},
         threshold=90.0, direction="above", metric="temperature_2m_max",
+        n_models=2,
     )
     return SignalGenerator(model=model, client=client, price_tracker=price_tracker)
 
@@ -87,6 +89,37 @@ class TestQualityGates:
         assert signal.quality_gate_passed is False
         assert "gate5_low_liquidity" in signal.rejection_reason
 
+    def test_gate5_uses_book_depth_not_volume_when_depth_available(self):
+        """Gate 5 rejects on low book_depth_usd even when volumeClob is high."""
+        from weather.config import MIN_MARKET_LIQUIDITY_USD, BOOK_DEPTH_MIN_MULTIPLIER
+        gen = _make_generator(model_p=0.80)
+        # volume is fine (10k) but book depth is below the 3x threshold
+        market = _make_market(yes_price=0.30, liquidity=10_000.0)
+        # Inject a low book depth directly
+        market.book_depth_usd = MIN_MARKET_LIQUIDITY_USD * BOOK_DEPTH_MIN_MULTIPLIER - 1.0
+        signal = gen.evaluate(market)
+        assert signal.quality_gate_passed is False
+        assert "gate5_low_book_depth" in signal.rejection_reason
+
+    def test_gate5_passes_on_sufficient_book_depth(self):
+        """Gate 5 passes when book_depth_usd meets the 3x threshold."""
+        from weather.config import MIN_MARKET_LIQUIDITY_USD, BOOK_DEPTH_MIN_MULTIPLIER
+        gen = _make_generator(model_p=0.80)
+        market = _make_market(yes_price=0.30, liquidity=10_000.0)
+        market.book_depth_usd = MIN_MARKET_LIQUIDITY_USD * BOOK_DEPTH_MIN_MULTIPLIER + 1.0
+        signal = gen.evaluate(market)
+        assert signal.quality_gate_passed is True
+
+    def test_gate5_falls_back_to_volume_when_depth_zero(self):
+        """When book_depth_usd == 0 (sidecar unavailable), fall back to volume check."""
+        from weather.config import MIN_MARKET_LIQUIDITY_USD
+        gen = _make_generator(model_p=0.80)
+        # volume is good, depth is 0 (not fetched) → should fall back and pass
+        market = _make_market(yes_price=0.30, liquidity=MIN_MARKET_LIQUIDITY_USD + 100.0)
+        market.book_depth_usd = 0.0
+        signal = gen.evaluate(market)
+        assert signal.quality_gate_passed is True
+
     def test_rejects_extreme_price(self):
         gen = _make_generator(model_p=0.80)
         signal = gen.evaluate(_make_market(yes_price=0.98))
@@ -103,8 +136,9 @@ class TestQualityGates:
             raw_p=0.80, calibrated_p=0.80,
             ensemble_spread=MAX_ENSEMBLE_SPREAD + 0.1,
             n_members=5, is_calibrated=False,
-            model_breakdown={}, threshold=90.0,
-            direction="above", metric="temperature_2m_max",
+            model_breakdown={"gfs_seamless": 0.80, "ecmwf_ifs025": 0.70},
+            threshold=90.0, direction="above", metric="temperature_2m_max",
+            n_models=2,
         )
         gen = SignalGenerator(model=model, client=client)
         signal = gen.evaluate(_make_market(yes_price=0.30))
@@ -120,8 +154,10 @@ class TestQualityGates:
         model.compute_probability.return_value = RawProbabilityResult(
             raw_p=0.80, calibrated_p=0.80,
             ensemble_spread=0.05, n_members=1,
-            is_calibrated=False, model_breakdown={},
+            is_calibrated=False,
+            model_breakdown={"gfs_seamless": 0.80, "ecmwf_ifs025": 0.80},
             threshold=90.0, direction="above", metric="temperature_2m_max",
+            n_models=2,
         )
         gen = SignalGenerator(model=model, client=client)
         signal = gen.evaluate(_make_market(yes_price=0.30))
@@ -138,8 +174,10 @@ class TestQualityGates:
         model.compute_probability.return_value = RawProbabilityResult(
             raw_p=0.80, calibrated_p=0.80,
             ensemble_spread=0.05, n_members=5,
-            is_calibrated=False, model_breakdown={},
+            is_calibrated=False,
+            model_breakdown={"gfs_seamless": 0.80, "ecmwf_ifs025": 0.80},
             threshold=90.0, direction="above", metric="temperature_2m_max",
+            n_models=2,
         )
         gen = SignalGenerator(model=model, client=client)
         signal = gen.evaluate(_make_market(yes_price=0.30))
@@ -199,8 +237,9 @@ class TestQualityGates:
             raw_p=0.80, calibrated_p=0.80,
             ensemble_spread=0.19,  # just under MAX so gate 2.7 passes
             n_members=5, is_calibrated=False,
-            model_breakdown={}, threshold=90.0,
-            direction="above", metric="temperature_2m_max",
+            model_breakdown={"gfs_seamless": 0.80, "ecmwf_ifs025": 0.70},
+            threshold=90.0, direction="above", metric="temperature_2m_max",
+            n_models=2,
         )
         gen = SignalGenerator(model=model, client=client)
         # 5 days out = timing_component near 0; high spread; 0 calibration obs
@@ -210,11 +249,66 @@ class TestQualityGates:
         assert "gate8_low_confidence" in signal.rejection_reason
 
 
+class TestModelDiversity:
+    """Gate 2.6 — at least 2 distinct models required (E2)."""
+
+    def test_gate2_6_rejects_single_model(self):
+        """Single-model forecast (n_models=1) must be rejected by gate 2.6."""
+        client = MagicMock()
+        model = MagicMock()
+        model.n_calibration_obs = 0
+        model.MIN_CALIBRATION_OBS = 50
+        client.get_ensemble_forecast.return_value = _make_forecast()
+        model.compute_probability.return_value = RawProbabilityResult(
+            raw_p=0.80, calibrated_p=0.80,
+            ensemble_spread=0.0, n_members=5,
+            is_calibrated=False,
+            model_breakdown={"gfs_seamless": 0.80},
+            threshold=90.0, direction="above", metric="temperature_2m_max",
+            n_models=1,
+        )
+        gen = SignalGenerator(model=model, client=client)
+        signal = gen.evaluate(_make_market(yes_price=0.30))
+        assert signal.quality_gate_passed is False
+        assert "gate2.6_single_model" in signal.rejection_reason
+        assert "n_models=1" in signal.rejection_reason
+
+    def test_gate2_6_passes_two_models(self):
+        """Two-model forecast must pass gate 2.6."""
+        gen = _make_generator(model_p=0.80)  # _make_generator sets n_models=2
+        signal = gen.evaluate(_make_market(yes_price=0.30))
+        assert signal.rejection_reason is None or "gate2.6" not in signal.rejection_reason
+
+    def test_gate8_spread_component_zero_when_single_model(self):
+        """When n_models=0 (no model breakdown), spread_component must be 0 and signal rejected."""
+        client = MagicMock()
+        model = MagicMock()
+        model.n_calibration_obs = 100
+        model.MIN_CALIBRATION_OBS = 50
+        client.get_ensemble_forecast.return_value = _make_forecast()
+        model.compute_probability.return_value = RawProbabilityResult(
+            raw_p=0.80, calibrated_p=0.80,
+            # spread=0.0 would give spread_component=1.0 without the n_models guard
+            ensemble_spread=0.0, n_members=5,
+            is_calibrated=True, model_breakdown={},
+            threshold=90.0, direction="above", metric="temperature_2m_max",
+            n_models=0,
+        )
+        gen = SignalGenerator(model=model, client=client)
+        # Gate 2.6 must reject first; rejection score is 0.0
+        signal = gen.evaluate(_make_market(yes_price=0.30, days_out=1))
+        assert signal.quality_gate_passed is False
+        assert "gate2.6_single_model" in signal.rejection_reason
+        assert signal.confidence_score == 0.0
+
+
 class TestEdgeCalculation:
     def test_edge_is_absolute_difference(self):
         gen = _make_generator(model_p=0.80)
         signal = gen.evaluate(_make_market(yes_price=0.30))
-        assert signal.edge_pp == pytest.approx(0.50, abs=0.001)
+        # model_p=0.80 → after lead-time+spread shrinkage (skill≈1, spread_factor≈1 at 1d out)
+        # signal is evaluated at days_to_res≈1, so edge reflects post-shrinkage model_p
+        assert signal.edge_pp == pytest.approx(0.4025, abs=0.01)
 
     def test_net_ev_gate_threshold(self):
         # Minimum passing gross edge = ROUND_TRIP_FEE + MIN_NET_EV_PP

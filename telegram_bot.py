@@ -19,13 +19,18 @@ from __future__ import annotations
 import asyncio
 import csv
 import json
+import math
 import os
+import threading
+from contextlib import contextmanager
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
+from weather._io import atomic_write_text
+from weather.secrets import get_user_key, set_user_key
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -76,6 +81,7 @@ PYTHON    = str(ROOT / "venv" / "bin" / "python")
 # ── User registry ─────────────────────────────────────────────────────────────
 
 _users_cache: dict[int, dict] | None = None
+_users_lock = threading.Lock()
 
 def _load_users() -> dict[int, dict]:
     global _users_cache
@@ -89,21 +95,30 @@ def _load_users() -> dict[int, dict]:
 def _save_users(users: dict[int, dict]) -> None:
     global _users_cache
     USERS_FILE.parent.mkdir(exist_ok=True)
-    USERS_FILE.write_text(json.dumps({str(k): v for k, v in users.items()}, indent=2))
+    atomic_write_text(USERS_FILE, json.dumps({str(k): v for k, v in users.items()}, indent=2))
     _users_cache = users
 
-def _seed_admin() -> None:
-    users = _load_users()
-    if ADMIN_ID not in users:
-        users[ADMIN_ID] = {
-            "role": "admin",
-            "username": "owner",
-            "added_at": datetime.utcnow().isoformat(),
-            "private_key": None,
-            "proxy_address": None,
-            "mode": "paper",
-        }
+@contextmanager
+def _users_transaction():
+    """Load, yield the mutable users dict, then save — all under the lock."""
+    with _users_lock:
+        users = _load_users()
+        yield users
         _save_users(users)
+
+def _seed_admin() -> None:
+    with _users_lock:
+        users = _load_users()
+        if ADMIN_ID not in users:
+            users[ADMIN_ID] = {
+                "role": "admin",
+                "username": "owner",
+                "added_at": datetime.utcnow().isoformat(),
+                "private_key": None,
+                "proxy_address": None,
+                "mode": "paper",
+            }
+            _save_users(users)
 
 def get_user_mode(uid: int) -> str:
     return _load_users().get(uid, {}).get("mode", "paper")
@@ -159,7 +174,7 @@ def append_wallet_transaction(tx_type: str, amount: float, note: str = "") -> No
         "note": note,
     })
     WALLET_FILE.parent.mkdir(exist_ok=True)
-    WALLET_FILE.write_text(json.dumps(data, indent=2))
+    atomic_write_text(WALLET_FILE, json.dumps(data, indent=2))
 
 def wallet_stats(uid: int) -> dict:
     txns = read_wallet().get("transactions", [])
@@ -582,7 +597,8 @@ async def run_bot_async(mode: str, uid: int) -> tuple[str, str, int]:
     if mode == "paper":
         args += ["--interval", "0"]
     env = os.environ.copy()
-    private_key = get_user_private_key(uid)
+    # Prefer encrypted secrets backend; fall back to legacy plaintext in users.json
+    private_key = get_user_key(uid) or get_user_private_key(uid)
     if private_key:
         env["POLYMARKET_PRIVATE_KEY"] = private_key
         proxy = _load_users().get(uid, {}).get("proxy_address")
@@ -596,10 +612,10 @@ async def run_bot_async(mode: str, uid: int) -> tuple[str, str, int]:
         env=env,
     )
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
     except asyncio.TimeoutError:
         proc.kill()
-        return "", "Timed out after 180s.", -1
+        return "", "Timed out after 300s.", -1
     return stdout.decode(), stderr.decode(), proc.returncode or 0
 
 
@@ -700,6 +716,9 @@ async def cmd_deposit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("❌ Invalid amount.")
         return
+    if amount <= 0 or not math.isfinite(amount):
+        await update.message.reply_text("❌ Amount must be a positive finite number.")
+        return
     note = " ".join(ctx.args[1:]) if len(ctx.args) > 1 else ""
     append_wallet_transaction("deposit", amount, note)
     ws = wallet_stats(update.effective_user.id)
@@ -723,6 +742,9 @@ async def cmd_withdraw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         amount = float(ctx.args[0])
     except ValueError:
         await update.message.reply_text("❌ Invalid amount.")
+        return
+    if amount <= 0 or not math.isfinite(amount):
+        await update.message.reply_text("❌ Amount must be a positive finite number.")
         return
     note = " ".join(ctx.args[1:]) if len(ctx.args) > 1 else ""
     append_wallet_transaction("withdraw", amount, note)
@@ -762,7 +784,7 @@ async def cmd_resolve(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         summary = next((l for l in stdout.splitlines() if "Auto-resolved" in l), "Done.")
         await msg.edit_text(f"✅ {summary.strip()}", reply_markup=main_kb(uid))
 
-@require_auth()
+@require_auth(admin_only=True)
 async def cmd_setup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not ctx.args:
@@ -774,17 +796,41 @@ async def cmd_setup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
         return
-    users = _load_users()
-    users[uid]["private_key"] = ctx.args[0]
-    if len(ctx.args) > 1:
-        users[uid]["proxy_address"] = ctx.args[1]
-    _save_users(users)
-    await update.message.reply_text(
-        "✅ Credentials saved. Use `/mymode live` to switch to live trading.",
-        parse_mode="Markdown",
-    )
+    # Store key encrypted; scrub the plaintext arg from memory immediately
+    raw_key = ctx.args[0]
+    ctx.args[0] = "***"
+    try:
+        set_user_key(uid, raw_key)
+    except RuntimeError as exc:
+        await update.message.reply_text(
+            f"❌ Key storage unavailable: {exc}\n"
+            "Set `POLYMARKET_SECRETS_KEY` in `.env` or install `keyring`.",
+            parse_mode="Markdown",
+        )
+        return
 
-@require_auth()
+    if len(ctx.args) > 1:
+        with _users_transaction() as users:
+            users[uid]["proxy_address"] = ctx.args[1]
+
+    # Best-effort: delete the user's message to remove the key from chat history
+    try:
+        await update.message.delete()
+        key_deleted = True
+    except Exception:
+        key_deleted = False
+
+    reply = (
+        "✅ Credentials saved (encrypted). Use `/mymode live` to switch to live trading.\n\n"
+    )
+    if not key_deleted:
+        reply += (
+            "⚠️ *Please delete your message containing the private key* — "
+            "it remains visible in this chat and may be stored by Telegram."
+        )
+    await update.message.reply_text(reply, parse_mode="Markdown")
+
+@require_auth(admin_only=True)
 async def cmd_mymode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not ctx.args:
@@ -795,14 +841,13 @@ async def cmd_mymode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if new_mode not in ("paper", "live"):
         await update.message.reply_text("Usage: `/mymode paper` or `/mymode live`", parse_mode="Markdown")
         return
-    if new_mode == "live" and not get_user_private_key(uid):
+    if new_mode == "live" and not (get_user_key(uid) or get_user_private_key(uid)):
         await update.message.reply_text(
             "❌ Set your credentials first with `/setup <private_key>`.", parse_mode="Markdown"
         )
         return
-    users = _load_users()
-    users[uid]["mode"] = new_mode
-    _save_users(users)
+    with _users_transaction() as users:
+        users[uid]["mode"] = new_mode
     badge = "🟢 LIVE" if new_mode == "live" else "🟡 PAPER"
     await update.message.reply_text(f"✅ Mode set to {badge}", parse_mode="Markdown")
 
@@ -827,12 +872,11 @@ async def cmd_adduser(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     role = "viewer"
     if len(ctx.args) > 1 and ctx.args[1] in ("admin", "viewer"):
         role = ctx.args[1]
-    users = _load_users()
-    users[new_id] = {
-        "role": role, "username": "", "added_at": datetime.utcnow().isoformat(),
-        "private_key": None, "proxy_address": None, "mode": "paper",
-    }
-    _save_users(users)
+    with _users_transaction() as users:
+        users[new_id] = {
+            "role": role, "username": "", "added_at": datetime.utcnow().isoformat(),
+            "private_key": None, "proxy_address": None, "mode": "paper",
+        }
     await update.message.reply_text(
         f"✅ Added `{new_id}` as `{role}`.", parse_mode="Markdown"
     )
@@ -850,12 +894,15 @@ async def cmd_removeuser(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if rm_id == ADMIN_ID:
         await update.message.reply_text("❌ Cannot remove the primary admin.")
         return
-    users = _load_users()
-    if rm_id not in users:
+    with _users_lock:
+        users = _load_users()
+        found = rm_id in users
+        if found:
+            del users[rm_id]
+            _save_users(users)
+    if not found:
         await update.message.reply_text("User not found.")
         return
-    del users[rm_id]
-    _save_users(users)
     await update.message.reply_text(f"✅ Removed `{rm_id}`.", parse_mode="Markdown")
 
 

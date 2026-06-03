@@ -41,6 +41,9 @@ class PriceTracker:
         self._cache[market_id] = [r for r in bucket if r["ts"] >= cutoff]
 
         self.log_path.parent.mkdir(exist_ok=True)
+        # Append-only: each write is a single fwrite() call, which POSIX guarantees
+        # is atomic for pipes and regular files when the data fits in PIPE_BUF. A CSV
+        # row is well under that limit. No tmp+replace needed here.
         with open(self.log_path, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=_CSV_HEADERS)
             if f.tell() == 0:

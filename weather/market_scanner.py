@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import re
 import urllib.parse
 import urllib.request
@@ -19,6 +20,8 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pmxt
+
+_log = logging.getLogger(__name__)
 
 from .config import (
     MAX_DAYS_TO_RESOLUTION,
@@ -82,6 +85,29 @@ _MONTH_NAME = re.compile(
 _BELOW_WORDS = {"below", "under", "lower", "less"}
 
 UNPARSEABLE_LOG = Path("logs/unparseable_markets.csv")
+MISMATCH_LOG = Path("logs/parser_mismatch.csv")
+SCANNER_ALARM_LOG = Path("logs/scanner_alarm.csv")
+_ALARM_FIELDS = ["timestamp", "source", "search_terms", "reason"]
+_UNPARSEABLE_FIELDS = ["scanned_at", "market_id", "title", "yes_price", "liquidity"]
+_MISMATCH_FIELDS = [
+    "market_id", "title", "description",
+    "parsed_metric", "parsed_threshold", "parsed_threshold_high",
+    "parsed_direction", "scanned_at",
+]
+# Sentinel returned by _parse_market when description disagrees with title.
+# Distinct from None (truly unparseable) so scan() doesn't double-log it.
+_MISMATCH_DROP = object()
+
+
+def _append_csv_log(path: Path, rows: list[dict], fieldnames: list[str]) -> None:
+    """Append rows to a CSV log, writing headers only on first use."""
+    is_new = not path.exists()
+    path.parent.mkdir(exist_ok=True)
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if is_new:
+            writer.writeheader()
+        writer.writerows(rows)
 
 
 def _extract_direction(above_below_match) -> str:
@@ -124,26 +150,39 @@ _GAMMA_SEARCH_URL = "https://gamma-api.polymarket.com/public-search"
 
 
 class WeatherMarketScanner:
-    def __init__(self):
+    def __init__(
+        self,
+        source: str = "gamma",
+        poly: object | None = None,
+        weather_client: WeatherClient | None = None,
+    ):
+        """
+        source: "gamma" (default) uses the Gamma REST API;
+                "clob" uses the pmxt CLOB sidecar fetch_events.
+        poly / weather_client: optional injectable dependencies for testing.
+        """
+        self._source = source
+        self._poly = poly if poly is not None else self._make_default_poly()
+        self._weather_client = weather_client or WeatherClient()
+        self._geocache: dict[str, Location | None] = {}
+
+    @staticmethod
+    def _make_default_poly():
         # Weather scanning only needs public market data via the local CLOB sidecar,
         # which supports keyword search. The hosted PMXT API (PMXT_API_KEY) rejects
         # the `query`/`status` params, so we create the client in local mode.
-        import os
         # Strip credentials that aren't needed for public market search and that
         # newer pmxt versions now validate strictly (rejecting placeholder values).
-        _pmxt_key = os.environ.pop("PMXT_API_KEY", None)
-        _poly_pk = os.environ.pop("POLYMARKET_PRIVATE_KEY", None)
+        import os
+        _pmxt_key   = os.environ.pop("PMXT_API_KEY", None)
+        _poly_pk    = os.environ.pop("POLYMARKET_PRIVATE_KEY", None)
         _poly_proxy = os.environ.pop("POLYMARKET_PROXY_ADDRESS", None)
-        self._poly = pmxt.Polymarket()
-        if _pmxt_key:
-            os.environ["PMXT_API_KEY"] = _pmxt_key
-        if _poly_pk:
-            os.environ["POLYMARKET_PRIVATE_KEY"] = _poly_pk
-        if _poly_proxy:
-            os.environ["POLYMARKET_PROXY_ADDRESS"] = _poly_proxy
-
-        self._weather_client = WeatherClient()
-        self._geocache: dict[str, Location | None] = {}
+        try:
+            return pmxt.Polymarket()
+        finally:
+            if _pmxt_key:   os.environ["PMXT_API_KEY"] = _pmxt_key
+            if _poly_pk:    os.environ["POLYMARKET_PRIVATE_KEY"] = _poly_pk
+            if _poly_proxy: os.environ["POLYMARKET_PROXY_ADDRESS"] = _poly_proxy
 
     def scan(self) -> list[WeatherMarket]:
         """
@@ -158,27 +197,61 @@ class WeatherMarketScanner:
 
         for m in raw_markets:
             result = self._parse_market(m)
-            if result is not None:
+            if isinstance(result, WeatherMarket):
                 parsed.append(result)
+            elif result is _MISMATCH_DROP:
+                pass  # already logged to parser_mismatch.csv; not an unparseable market
             else:
                 unparseable.append({
+                    "scanned_at": datetime.utcnow().isoformat(),
                     "market_id": m.market_id,
                     "title": m.title,
                     "yes_price": m.yes.price if m.yes else None,
                     "liquidity": m.liquidity,
-                    "scanned_at": datetime.utcnow().isoformat(),
                 })
 
         if unparseable:
-            self._log_unparseable(unparseable)
+            _append_csv_log(UNPARSEABLE_LOG, unparseable, _UNPARSEABLE_FIELDS)
 
         print(f"    parsed {len(parsed)} / {len(raw_markets)}  ({len(unparseable)} unparseable → logs/unparseable_markets.csv)")
         tradeable = self._filter_tradeable(parsed)
+        # Fetch live CLOB order-book depth only for markets that survived all other filters.
+        # This avoids 2 sidecar API calls per scanned market on every scan cycle.
+        for wm in tradeable:
+            wm.book_depth_usd = self._fetch_book_depth_usd(wm.market_id, wm.yes_price)
         print(f"    tradeable after filters: {len(tradeable)} / {len(parsed)}")
         return tradeable
 
     def _search_keywords(self) -> list[_GammaMarket]:
-        """Query Polymarket for each weather keyword via Gamma API, deduplicate by condition_id."""
+        """Query Polymarket for each weather keyword, deduplicate by condition_id.
+
+        Uses the configured source (gamma or clob). On zero results logs a
+        WARNING and writes a row to logs/scanner_alarm.csv so the Telegram
+        bot can surface it.
+        """
+        if self._source == "clob":
+            markets = self._clob_search_keywords()
+        else:
+            markets = self._gamma_search_keywords()
+
+        if len(markets) == 0:
+            _log.warning(
+                "Zero markets returned from %s search (terms: %s). "
+                "Check logs/scanner_alarm.csv.",
+                self._source,
+                WEATHER_SEARCH_TERMS[:3],
+            )
+            _append_csv_log(SCANNER_ALARM_LOG, [{
+                "timestamp": datetime.utcnow().isoformat(),
+                "source": self._source,
+                "search_terms": ",".join(WEATHER_SEARCH_TERMS[:5]),
+                "reason": "zero_markets_returned",
+            }], _ALARM_FIELDS)
+
+        return markets
+
+    def _gamma_search_keywords(self) -> list[_GammaMarket]:
+        """Gamma REST API keyword search."""
         seen_ids: set[str] = set()
         markets: list[_GammaMarket] = []
 
@@ -196,6 +269,43 @@ class WeatherMarketScanner:
                             markets.append(_GammaMarket(m, event))
             except Exception as e:
                 print(f"    warning: search failed for {term!r}: {e}", flush=True)
+
+        return markets
+
+    def _clob_search_keywords(self) -> list[_GammaMarket]:
+        """CLOB sidecar keyword search via pmxt fetch_events."""
+        seen_ids: set[str] = set()
+        markets: list[_GammaMarket] = []
+
+        for term in WEATHER_SEARCH_TERMS:
+            try:
+                events = self._poly.fetch_events({"query": term, "active": True, "limit": 50})
+                for event in events:
+                    event_dict = {
+                        "title": getattr(event, "title", ""),
+                        "description": getattr(event, "description", ""),
+                        "slug": getattr(event, "slug", ""),
+                    }
+                    for mkt in getattr(event, "markets", []):
+                        cid = getattr(mkt, "condition_id", "") or getattr(mkt, "id", "")
+                        if not cid or cid in seen_ids:
+                            continue
+                        seen_ids.add(cid)
+                        yes_price = 0.5
+                        if hasattr(mkt, "yes") and mkt.yes is not None:
+                            yes_price = float(getattr(mkt.yes, "price", 0.5))
+                        mkt_dict = {
+                            "conditionId": cid,
+                            "outcomePrices": json.dumps([yes_price, 1 - yes_price]),
+                            "volumeClob": str(getattr(mkt, "volume", 0)),
+                            "question": getattr(mkt, "question", ""),
+                            "description": getattr(mkt, "description", event_dict.get("description", "")),
+                            "endDate": (getattr(mkt, "end_date_iso", "") or
+                                        getattr(mkt, "end_date", "") or ""),
+                        }
+                        markets.append(_GammaMarket(mkt_dict, event_dict))
+            except Exception as e:
+                print(f"    warning: CLOB search failed for {term!r}: {e}", flush=True)
 
         return markets
 
@@ -289,6 +399,20 @@ class WeatherMarketScanner:
                 mo = datetime.strptime(month_m.group(1), "%B").month
                 forecast_start_date = date(res_date.year, mo, 1)
 
+        # E4: cross-check parsed values against description to catch mis-parses
+        if not self._description_agrees(m.description, metric, threshold, threshold_high, direction):
+            _append_csv_log(MISMATCH_LOG, [{
+                "market_id": m.market_id,
+                "title": title,
+                "description": (m.description or "")[:200],
+                "parsed_metric": metric,
+                "parsed_threshold": threshold,
+                "parsed_threshold_high": threshold_high or "",
+                "parsed_direction": direction,
+                "scanned_at": datetime.utcnow().isoformat(),
+            }], _MISMATCH_FIELDS)
+            return _MISMATCH_DROP
+
         return WeatherMarket(
             market_id=m.market_id,
             title=title,
@@ -305,6 +429,90 @@ class WeatherMarketScanner:
             raw_title=title,
             forecast_start_date=forecast_start_date,
         )
+
+    def _description_agrees(
+        self,
+        description: str,
+        metric: str,
+        threshold: float,
+        threshold_high: float | None,
+        direction: str,
+    ) -> bool:
+        """
+        E4: Lightly parse the description and verify it agrees with title-derived values.
+        Returns True if description is absent/unparseable (no evidence of conflict) or agrees.
+        Returns False only on a clear conflict between description and title.
+        """
+        if not description:
+            return True
+
+        desc = description.lower()
+
+        # Check direction agreement when description has explicit above/below language
+        above_kw = any(w in desc for w in ("above", "exceed", "greater than", "more than", "higher than", "at least"))
+        below_kw = any(w in desc for w in ("below", "less than", "under", "lower than", "fewer than"))
+        if above_kw and not below_kw and direction == "below":
+            return False
+        if below_kw and not above_kw and direction == "above":
+            return False
+
+        # Check threshold agreement for temperature (allow ±3°C tolerance for F→C conversion rounding)
+        if metric.startswith("temperature"):
+            deg_matches = _DEGREE_PATTERN.findall(description)
+            if deg_matches:
+                desc_values_c = [_to_celsius(float(v), u) for v, u in deg_matches]
+                # Check if any description value is close to the title threshold
+                close_to_threshold = any(abs(v - threshold) <= 3.0 for v in desc_values_c)
+                # If ALL description values are far from the threshold, it's a conflict
+                if not close_to_threshold:
+                    # Also check against threshold_high for range markets
+                    if threshold_high is not None:
+                        close_to_high = any(abs(v - threshold_high) <= 3.0 for v in desc_values_c)
+                        if not close_to_high:
+                            return False
+                    else:
+                        return False
+
+        # Check threshold agreement for precipitation (allow ±5mm tolerance)
+        if metric == "precipitation_sum":
+            precip_matches = _PRECIP_THRESHOLD.findall(description)
+            if precip_matches:
+                desc_values_mm = [
+                    float(v) * (25.4 if u.lower().startswith("in") else 1.0)
+                    for v, u in precip_matches
+                ]
+                close_to_threshold = any(abs(v - threshold) <= 5.0 for v in desc_values_mm)
+                if not close_to_threshold:
+                    if threshold_high is not None:
+                        close_to_high = any(abs(v - threshold_high) <= 5.0 for v in desc_values_mm)
+                        if not close_to_high:
+                            return False
+                    else:
+                        return False
+
+        return True
+
+    def _fetch_book_depth_usd(self, market_id: str, yes_price: float) -> float:
+        """
+        B4: Fetch live CLOB order-book depth for the YES side.
+        Returns 0.0 when the pmxt sidecar is unavailable (paper mode).
+        """
+        try:
+            market = self._poly.fetch_market(id=market_id)
+            yes_outcome = market.yes
+            if yes_outcome is None:
+                # fall back to first outcome labelled Yes/YES
+                for o in market.outcomes:
+                    if o.label.upper() == "YES":
+                        yes_outcome = o
+                        break
+            if yes_outcome is None:
+                return 0.0
+            ob = self._poly.fetch_order_book(yes_outcome.outcome_id)
+            # Depth = USD value of asks on the YES side (what we can buy)
+            return sum(ask.price * ask.size for ask in ob.asks) if ob.asks else 0.0
+        except Exception:
+            return 0.0
 
     def _extract_location(self, title: str) -> Location | None:
         """Try to find a city name in the title and geocode it."""
@@ -355,11 +563,3 @@ class WeatherMarketScanner:
             print(f"    filter breakdown: {dict(sorted(reasons.items(), key=lambda x: -x[1]))}")
         return result
 
-    def _log_unparseable(self, markets: list[dict]) -> None:
-        is_new = not UNPARSEABLE_LOG.exists()
-        UNPARSEABLE_LOG.parent.mkdir(exist_ok=True)
-        with open(UNPARSEABLE_LOG, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["scanned_at", "market_id", "title", "yes_price", "liquidity"])
-            if is_new:
-                writer.writeheader()
-            writer.writerows(markets)

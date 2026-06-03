@@ -5,6 +5,7 @@ Gate structure (evaluated in order):
   Gate 0:   Forecast freshness   — is Open-Meteo data recent enough?
   Gate 1:   Entry timing window  — not too early (>5d) or too late (<4h)?
   Gate 2.5: Min ensemble members — enough model runs for statistical validity?
+  Gate 2.6: Model diversity      — at least 2 distinct models required?
   Gate 2.7: Volatility regime    — is cross-model spread acceptably low?
   Gate 5:   Liquidity            — enough USD in the book to enter/exit?
   Gate 7:   Valid price range    — not at degenerate extremes?
@@ -24,6 +25,7 @@ from datetime import datetime, timezone
 
 from .config import (
     BLOCK_EQUAL_YES,
+    BOOK_DEPTH_MIN_MULTIPLIER,
     EXTREME_EQUAL_MARKET_THRESHOLD,
     GATE8_CALIB_WEIGHT,
     GATE8_SPREAD_WEIGHT,
@@ -180,12 +182,26 @@ class SignalGenerator:
         if prob.n_members < MIN_ENSEMBLE_MEMBERS:
             return False, f"gate2.5_insufficient_members:{prob.n_members}", 0.0
 
+        # Gate 2.6: Model diversity — single-model forecasts have no cross-model
+        # spread signal; spread=0.0 would masquerade as maximum agreement.
+        if prob.n_models < 2:
+            return False, f"gate2.6_single_model:n_models={prob.n_models}", 0.0
+
         # Gate 2.7: Volatility regime (ensemble spread)
         if prob.ensemble_spread > MAX_ENSEMBLE_SPREAD:
             return False, f"gate2.7_high_spread:{prob.ensemble_spread:.3f}", 0.0
 
-        # Gate 5: Liquidity
-        if market.liquidity_usd < MIN_MARKET_LIQUIDITY_USD:
+        # Gate 5: Liquidity.
+        # Two separate checks, not a fallback for the same metric:
+        #   book_depth_usd = live ask-side CLOB depth (fetched when sidecar is running)
+        #     → must be ≥ BOOK_DEPTH_MIN_MULTIPLIER × MIN_MARKET_LIQUIDITY_USD (3×)
+        #   liquidity_usd = volumeClob (cumulative, always available)
+        #     → used only when depth is unavailable (paper mode / sidecar down)
+        if market.book_depth_usd > 0.0:
+            min_depth = MIN_MARKET_LIQUIDITY_USD * BOOK_DEPTH_MIN_MULTIPLIER
+            if market.book_depth_usd < min_depth:
+                return False, f"gate5_low_book_depth:{market.book_depth_usd:.0f}_required:{min_depth:.0f}", 0.0
+        elif market.liquidity_usd < MIN_MARKET_LIQUIDITY_USD:
             return False, f"gate5_low_liquidity:{market.liquidity_usd:.0f}", 0.0
 
         # Gate 7: Valid price range
@@ -204,7 +220,8 @@ class SignalGenerator:
 
         # Gate 9.6: Equal YES blocked — model overestimates P(exact hit).
         # 160-trade backtest: equal YES = 20% WR; equal NO = 85% WR.
-        # Shrinkage never flips direction, so calibrated_p vs yes_price is reliable here.
+        # Uses pre-shrinkage calibrated_p; shrinkage can flip direction near 0.5, so this
+        # gate may occasionally block a post-shrinkage NO trade (conservative, acceptable).
         if BLOCK_EQUAL_YES and market.direction == "equal" and prob.calibrated_p > market.yes_price:
             return False, "gate9.6_equal_yes_blocked", 0.0
 
@@ -221,7 +238,11 @@ class SignalGenerator:
                 return False, f"gate6_informed_flow:{velocity:+.3f}", 0.0
 
         # Gate 8: Composite confidence
-        spread_component = 1.0 - min(prob.ensemble_spread / MAX_ENSEMBLE_SPREAD, 1.0)
+        # spread_component is 0 when n_models < 2 (single model = no real spread signal)
+        if prob.n_models < 2:
+            spread_component = 0.0
+        else:
+            spread_component = 1.0 - min(prob.ensemble_spread / MAX_ENSEMBLE_SPREAD, 1.0)
         timing_component = 1.0 - min(max(days_to_res, 0) / MAX_ENTRY_DAYS_AHEAD, 1.0)
         calib_component = min(
             self.model.n_calibration_obs / self.model.MIN_CALIBRATION_OBS, 1.0
