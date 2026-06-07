@@ -101,8 +101,9 @@ class SignalGenerator:
         mos_covers = corrector is not None and corrector.covers(market.metric)
         is_temp = market.metric in ("temperature_2m_max", "temperature_2m_min")
         if is_temp and not mos_covers:
+            # Phase 3: seasonal offset (falls back to all-season within get_offset).
             bias_offset = self.bias_corrector.get_offset(
-                market.location.lat, market.location.lon
+                market.location.lat, market.location.lon, month
             )
         else:
             bias_offset = 0.0

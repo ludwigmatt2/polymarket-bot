@@ -39,17 +39,21 @@ class CityBiasCorrector:
                 # mean_bias_c plus n; confidence scaling happens at read time in
                 # get_offset. Do NOT use damped_bias_c — scaling here as well would
                 # damp twice (Atlanta would become 0.656×0.33 instead of 2.622×0.33).
+                # Phase 3: a `month` column (1–12) keys seasonal cells; month 0 is the
+                # all-season fallback. Old CSVs without the column load as month 0,
+                # so behaviour is identical to Phase 2.
                 self._entries.append({
                     "city":      row["city"],
                     "lat":       float(row["lat"]),
                     "lon":       float(row["lon"]),
+                    "month":     int(row.get("month", 0) or 0),
                     "mean_bias": float(row["mean_bias_c"]),
                     "n":         int(row["n"]),
                 })
         except Exception:
             pass
 
-    def get_offset(self, lat: float, lon: float) -> float:
+    def get_offset(self, lat: float, lon: float, month: int = 0) -> float:
         """
         Return a confidence-scaled temperature offset in °C for the nearest city.
         Returns 0.0 if none is within 100 km or the nearest has too few samples.
@@ -57,29 +61,34 @@ class CityBiasCorrector:
         offset > 0 means model runs cold → we lower the threshold to compensate.
         offset < 0 means model runs warm → we raise the threshold.
 
-        The raw per-city bias is scaled by min(n/FULL_CONFIDENCE_N, 1.0), so a
-        well-sampled city applies its full bias while a thin one applies a fraction.
+        Phase 3 fallback chain at the nearest location: exact month → all-season
+        (month 0) → 0.0. The raw bias is scaled by min(n/FULL_CONFIDENCE_N, 1.0),
+        so a well-sampled cell applies its full bias and a thin one a fraction.
+        Calling with month=0 (the default) reproduces the Phase-2 flat behaviour.
         """
         if not self._entries:
             return 0.0
-        best, best_dist = None, float("inf")
+        # Nearest known location (any month), then resolve the month within it.
+        best_loc, best_dist = None, float("inf")
         for e in self._entries:
             d = _haversine(lat, lon, e["lat"], e["lon"])
             if d < best_dist:
-                best_dist, best = d, e
-        if not best or best_dist >= 100:
+                best_dist, best_loc = d, (e["lat"], e["lon"])
+        if best_loc is None or best_dist >= 100:
             return 0.0
-        if best["n"] < MIN_BIAS_N:
-            return 0.0
-        confidence = min(best["n"] / FULL_CONFIDENCE_N, 1.0)
-        return best["mean_bias"] * confidence
+        at_loc = [e for e in self._entries if (e["lat"], e["lon"]) == best_loc]
+        for target in (month, 0):
+            for e in at_loc:
+                if e["month"] == target and e["n"] >= MIN_BIAS_N:
+                    return e["mean_bias"] * min(e["n"] / FULL_CONFIDENCE_N, 1.0)
+        return 0.0
 
     def summary(self) -> str:
         if not self._entries:
             return "No city bias corrections loaded."
         parts = []
         for e in self._entries:
-            if e["n"] < MIN_BIAS_N:
+            if e["month"] != 0 or e["n"] < MIN_BIAS_N:   # all-season rows only
                 continue
             conf = min(e["n"] / FULL_CONFIDENCE_N, 1.0)
             parts.append(f"{e['city']} {e['mean_bias'] * conf:+.2f}°C(n={e['n']})")

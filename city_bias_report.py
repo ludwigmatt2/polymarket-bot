@@ -81,6 +81,13 @@ def main() -> None:
         except (ValueError, KeyError):
             continue
 
+        # This is a TEMPERATURE bias report (residual is in °C and the offset is
+        # subtracted from temperature thresholds). Precipitation trades have mm
+        # thresholds, so pooling their residuals (e.g. 5mm − 150mm = −145) poisons
+        # the per-city mean. Restrict to temperature metrics.
+        if metric not in ("temperature_2m_max", "temperature_2m_min"):
+            continue
+
         loc = Location(city=city, lat=lat, lon=lon, timezone="UTC")
         actual_temp = client.get_historical_actual(loc, res_dt, metric)
         if actual_temp is None:
@@ -193,31 +200,40 @@ def main() -> None:
                   f"outcome={r['stored_outcome']} integrity={'✅' if r['integrity_ok'] else '❌'}")
         print()
 
-    # ── Write city_bias.csv ───────────────────────────────────────────────────
-    latlon_bias: dict[tuple, list] = defaultdict(list)
+    # ── Write city_bias.csv (Phase 3: seasonal cells + month=0 all-season) ────
+    # Every observation lands in two cells: its own month (1–12) and month 0 (the
+    # all-season fallback that CityBiasCorrector uses when a month cell is sparse).
+    cells: dict[tuple, list] = defaultdict(list)   # (lat, lon, month) -> residuals
+    city_of: dict[tuple, str] = {}
     for r in results:
         key = (round(r["lat"], 2), round(r["lon"], 2))
-        latlon_bias[key].append(r)
+        city_of[key] = r["city"]
+        m = int(r["date"][5:7])
+        cells[(key[0], key[1], m)].append(r["residual"])
+        cells[(key[0], key[1], 0)].append(r["residual"])
 
     with open(BIAS_CSV, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["city", "lat", "lon", "n", "mean_bias_c", "damped_bias_c", "reliable"])
+        writer = csv.DictWriter(f, fieldnames=["city", "lat", "lon", "month", "n", "mean_bias_c", "damped_bias_c", "reliable"])
         writer.writeheader()
-        for (lat, lon), trades in latlon_bias.items():
-            n = len(trades)
-            m = mean(r["residual"] for r in trades)
-            damped = m * min(n / DAMPING_FULL_N, 1.0)
+        for (lat, lon, month), residuals in sorted(cells.items()):
+            n = len(residuals)
+            mb = mean(residuals)
+            damped = mb * min(n / DAMPING_FULL_N, 1.0)
             writer.writerow({
-                "city":          trades[0]["city"],
+                "city":          city_of[(lat, lon)],
                 "lat":           lat,
                 "lon":           lon,
+                "month":         month,
                 "n":             n,
-                "mean_bias_c":   round(m, 3),
+                "mean_bias_c":   round(mb, 3),
                 "damped_bias_c": round(damped, 3),
                 "reliable":      int(n >= MIN_TRADES_FOR_CORRECTION),
             })
 
+    n_season_cells = sum(1 for (la, lo, mo), t in cells.items() if mo != 0 and len(t) >= MIN_TRADES_FOR_CORRECTION)
+    n_locations = len({(la, lo) for (la, lo, mo) in cells})
     print(f"City bias data written → {BIAS_CSV}")
-    print(f"({sum(1 for (lat,lon),t in latlon_bias.items() if len(t) >= MIN_TRADES_FOR_CORRECTION)} cities with reliable correction)\n")
+    print(f"({n_locations} locations, {n_season_cells} reliable seasonal cells)\n")
 
 
 if __name__ == "__main__":
