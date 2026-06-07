@@ -212,10 +212,17 @@ def _apply_kde(
     fallback: float,
 ) -> float:
     try:
+        # Degenerate spread (e.g. all-zero precipitation members on a dry day) makes
+        # gaussian_kde singular → nan density. Fall back to the plain fraction.
+        if float(np.std(members)) == 0.0:
+            return fallback
         kde = gaussian_kde(members, bw_method="scott")
         x_eval = np.linspace(min(members) - 20, max(members) + 20, 500)
         density = kde(x_eval)
-        density /= density.sum()
+        total = density.sum()
+        if not np.isfinite(total) or total <= 0:
+            return fallback
+        density /= total
         if direction == "above":
             p = float(density[x_eval >= threshold].sum())
         elif direction == "below":
@@ -225,6 +232,8 @@ def _apply_kde(
         elif direction == "equal":
             p = float(density[(x_eval >= threshold - 0.5) & (x_eval <= threshold + 0.5)].sum())
         else:
+            return fallback
+        if not np.isfinite(p):
             return fallback
         return float(np.clip(p, 0.001, 0.999))
     except Exception:

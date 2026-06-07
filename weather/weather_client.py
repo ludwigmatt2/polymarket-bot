@@ -210,6 +210,73 @@ class WeatherClient:
             fetched_at=datetime.utcnow(),
         )
 
+    def get_historical_ensemble_forecast(
+        self,
+        location: Location,
+        target_date: date,
+        metric: str,
+        models: list[str] | None = None,
+    ) -> EnsembleForecast:
+        """
+        Like get_ensemble_forecast but addresses a PAST date via start_date/end_date
+        instead of forecast_days. Used by the replay backtest harness to refetch the
+        ensemble members for a resolved trade so raw_p can be recomputed under a
+        candidate config. model_means are left empty — compute_probability derives
+        spread from the per-model breakdown, not from model_means.
+        """
+        models = models or ENSEMBLE_MODELS
+        if metric not in self.METRIC_DAILY_PARAMS:
+            raise ValueError(f"Unsupported metric '{metric}'. Supported: {list(self.METRIC_DAILY_PARAMS)}")
+
+        member_arrays: dict[str, list[float]] = {}
+        for model in models:
+            try:
+                members = self._fetch_historical_ensemble_members(location, target_date, metric, model)
+                if members:
+                    member_arrays[model] = members
+            except Exception:
+                continue
+
+        return EnsembleForecast(
+            lat=location.lat,
+            lon=location.lon,
+            target_date=target_date,
+            metric=metric,
+            member_arrays=member_arrays,
+            model_means={},
+            fetched_at=datetime.utcnow(),
+        )
+
+    def _fetch_historical_ensemble_members(
+        self,
+        location: Location,
+        target_date: date,
+        metric: str,
+        model: str,
+    ) -> list[float]:
+        """Fetch ensemble members for a single model on a past date via start/end date."""
+        params = {
+            "latitude": location.lat,
+            "longitude": location.lon,
+            "models": model,
+            "daily": self.METRIC_DAILY_PARAMS[metric],
+            "start_date": target_date.isoformat(),
+            "end_date": target_date.isoformat(),
+            "timezone": location.timezone,
+        }
+        r = requests.get(OPEN_METEO_ENSEMBLE_URL, params=params, timeout=OPEN_METEO_REQUEST_TIMEOUT)
+        r.raise_for_status()
+        daily = r.json().get("daily", {})
+        time_index = _find_time_index(daily, target_date)
+        members: list[float] = []
+        for key, values in daily.items():
+            if key.startswith(metric) and "member" in key:
+                if time_index is not None and time_index < len(values):
+                    v = values[time_index]
+                    if v is not None:
+                        members.append(float(v))
+        return members
+
     def get_historical_actual(
         self,
         location: Location,
