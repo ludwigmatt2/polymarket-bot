@@ -8,6 +8,7 @@ run for 4-6 weeks (20+ resolved trades) before live trading is unlocked.
 from __future__ import annotations
 
 import csv
+import json
 import subprocess
 import uuid
 from datetime import datetime, timezone
@@ -35,6 +36,9 @@ CSV_HEADERS = [
     "metric", "threshold", "threshold_high", "weather_direction", "lat", "lon", "location_tz",
     "actual_outcome", "resolved_at", "pnl_usd", "brier_score",
     "cumulative_pnl", "cumulative_brier",
+    # Phase 0: appended at the end so pre-Phase-0 rows (which lack them) still parse —
+    # DictReader fills missing trailing columns, _load_all backfills "" for them.
+    "raw_p", "model_breakdown_json",
 ]
 
 # Brier score for an uninformed 50/50 forecast (climatology baseline)
@@ -92,6 +96,8 @@ class PaperTrader:
             lat=signal.market.location.lat,
             lon=signal.market.location.lon,
             location_tz=signal.market.location.timezone or "UTC",
+            raw_p=signal.prob_result.raw_p,
+            model_breakdown_json=json.dumps(signal.prob_result.model_breakdown),
         )
         self._append_trade(trade)
         self._existing_keys.add(key)
@@ -228,8 +234,13 @@ class PaperTrader:
             t["brier_score"] = round(_brier(model_p, outcome), 4)
             resolved += 1
 
+            # Phase 0 fix: the calibrator is applied to raw_p at inference
+            # (probability_model.py: calibrated_p = _apply_calibration(raw_p, ...)),
+            # so it must be TRAINED on raw_p — not the calibrated+shrunk model_p.
+            # Fall back to model_p only for pre-Phase-0 rows that lack raw_p.
             if model is not None:
-                model.log_observation(model_p, outcome, direction=w_dir)
+                raw_p = float(t.get("raw_p") or t["model_p"])
+                model.log_observation(raw_p, outcome, direction=w_dir)
 
         if resolved:
             # Back-fill cumulative columns across all rows in chronological order
@@ -369,6 +380,8 @@ class PaperTrader:
                 "brier_score": "",
                 "cumulative_pnl": "",
                 "cumulative_brier": "",
+                "raw_p": trade.raw_p,
+                "model_breakdown_json": trade.model_breakdown_json,
             })
 
     def _load_all(self) -> list[dict]:

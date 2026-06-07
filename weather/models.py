@@ -142,6 +142,11 @@ class PaperTrade:
     lat: float = 0.0
     lon: float = 0.0
     location_tz: str = "UTC"     # timezone used when this trade was forecast; E1 fix
+    # Phase 0: persist the calibrator input (raw_p) and per-model breakdown so the
+    # calibrator trains on the same scale it is applied to, and so per-model skill
+    # (Phase 4) can be scored from history. raw_p is pre-calibration, pre-shrinkage.
+    raw_p: float = 0.5
+    model_breakdown_json: str = ""   # json.dumps(prob_result.model_breakdown)
     actual_outcome: bool | None = None
     resolved_at: datetime | None = None
     pnl_usd: float | None = None

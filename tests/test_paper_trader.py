@@ -158,6 +158,54 @@ def _write_unresolved_trade(trader: PaperTrader, location_tz: str) -> None:
         writer.writerow(row)
 
 
+class TestPhase0CalibrationInput:
+    """Phase 0: the calibrator must be trained on raw_p, not the calibrated+shrunk model_p."""
+
+    def _write_unresolved_with_raw_p(self, trader, raw_p, model_p):
+        past = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+        row = {f: "" for f in CSV_HEADERS}
+        row.update({
+            "trade_id": "t0001", "market_id": "mkt_raw", "market_title": "raw_p test",
+            "signal_time": past, "entry_price": 0.50, "model_p": model_p, "direction": "YES",
+            "size_usd": 25.0, "size_factor": 1.0, "edge_pp": 0.10, "ensemble_spread": 0.05,
+            "confidence_score": 0.70, "resolution_date": past, "metric": "temperature_2m_max",
+            "threshold": 25.0, "weather_direction": "above", "lat": 35.68, "lon": 139.69,
+            "location_tz": "UTC", "raw_p": raw_p,
+        })
+        trader.log_path.parent.mkdir(exist_ok=True)
+        with open(trader.log_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_HEADERS, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerow(row)
+
+    def test_auto_resolve_logs_raw_p_not_model_p(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        self._write_unresolved_with_raw_p(trader, raw_p=0.42, model_p=0.61)
+
+        client = MagicMock()
+        client.get_historical_actual.return_value = 26.0  # above 25 → outcome True
+        model = MagicMock()
+
+        trader.auto_resolve(client, model=model)
+
+        model.log_observation.assert_called_once()
+        logged_p = model.log_observation.call_args[0][0]
+        assert logged_p == pytest.approx(0.42), "calibrator must receive raw_p, not model_p"
+
+    def test_auto_resolve_falls_back_to_model_p_for_pre_phase0_rows(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        self._write_unresolved_with_raw_p(trader, raw_p="", model_p=0.61)  # legacy row
+
+        client = MagicMock()
+        client.get_historical_actual.return_value = 26.0
+        model = MagicMock()
+
+        trader.auto_resolve(client, model=model)
+
+        logged_p = model.log_observation.call_args[0][0]
+        assert logged_p == pytest.approx(0.61), "legacy rows fall back to model_p"
+
+
 class TestTimezoneResolution:
     def test_auto_resolve_uses_stored_tz(self, tmp_path):
         """auto_resolve must pass location_tz to get_historical_actual, not UTC."""
