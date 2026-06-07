@@ -14,6 +14,7 @@ Core logic:
 from __future__ import annotations
 
 import csv
+import json
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -24,8 +25,95 @@ _log = logging.getLogger(__name__)
 import numpy as np
 from scipy.stats import gaussian_kde
 
-from .config import MAX_ENSEMBLE_SPREAD, MIN_ENSEMBLE_MEMBERS
+from .city_bias import _haversine
+from .config import (
+    HISTORICAL_SKILL_PATH,
+    MAX_ENSEMBLE_SPREAD,
+    MIN_ENSEMBLE_MEMBERS,
+    MIN_SKILL_OBS,
+    MOS_ENABLED,
+    MOS_METRICS,
+)
 from .models import EnsembleForecast, RawProbabilityResult
+
+
+class HistoricalSkillCorrector:
+    """
+    Phase 1 non-parametric MOS. Loads logs/historical_skill.json (built by
+    build_historical_skill.py from the Previous-Runs forecast-error record) and
+    shifts ensemble members by −mean_error for the matching (city, lead, month),
+    removing the model's systematic warm/cold bias before raw_p is counted.
+
+    Only `enabled_metrics` are corrected (validated to help; precipitation excluded).
+    Cells below MIN_SKILL_OBS fall back: (lead,month) → (lead, all-months) →
+    (nearest lead, …). Returns members unchanged when no trustworthy cell exists.
+    """
+
+    def __init__(
+        self,
+        path: Path = Path(HISTORICAL_SKILL_PATH),
+        enabled_metrics: frozenset[str] = MOS_METRICS,
+        max_distance_km: float = 100.0,
+    ):
+        self.enabled_metrics = enabled_metrics
+        self.max_distance_km = max_distance_km
+        self._cities: list[dict] = []
+        self.load_error: str | None = None
+        if path.exists():
+            try:
+                table = json.loads(path.read_text())
+                self._cities = list(table.values())
+            except Exception as exc:
+                self.load_error = str(exc)
+                _log.warning("Historical skill load failed — MOS disabled: %s", exc)
+
+    @property
+    def is_loaded(self) -> bool:
+        return bool(self._cities)
+
+    def covers(self, metric: str) -> bool:
+        """True if MOS owns correction for this metric (so flat city bias must stand down)."""
+        return MOS_ENABLED and self.is_loaded and metric in self.enabled_metrics
+
+    def _nearest_city(self, lat: float, lon: float) -> dict | None:
+        best, best_d = None, float("inf")
+        for c in self._cities:
+            d = _haversine(lat, lon, c["lat"], c["lon"])
+            if d < best_d:
+                best_d, best = d, c
+        return best if best and best_d < self.max_distance_km else None
+
+    def lookup_shift(self, lat: float, lon: float, metric: str, lead_day: int, month: int) -> float | None:
+        """Return the °C member shift (mean_error) for this cell, or None if untrusted."""
+        if not MOS_ENABLED or metric not in self.enabled_metrics:
+            return None
+        city = self._nearest_city(lat, lon)
+        if not city:
+            return None
+        ms = city.get("metrics", {}).get(metric)
+        if not ms:
+            return None
+        lead = max(1, min(int(round(lead_day)), 5))
+        # priority: exact (lead,month) → (lead, all-months) → nearest lead (month) → nearest lead (all-months)
+        ordered_leads = sorted(ms.keys(), key=lambda L: abs(int(L) - lead))
+        candidates = [ms.get(str(lead), {}).get(str(month)),
+                      ms.get(str(lead), {}).get("0")]
+        for L in ordered_leads:
+            candidates.append(ms[L].get(str(month)))
+            candidates.append(ms[L].get("0"))
+        for cell in candidates:
+            if cell and cell.get("n", 0) >= MIN_SKILL_OBS:
+                return cell["mean_error"]
+        return None
+
+    def adjust_members(
+        self, members: list[float], lat: float, lon: float, metric: str, lead_day: int, month: int
+    ) -> list[float]:
+        """Shift members DOWN by mean_error (forecast−actual); warm bias ⇒ shift down."""
+        shift = self.lookup_shift(lat, lon, metric, lead_day, month)
+        if shift is None:
+            return members
+        return [m - shift for m in members]
 
 
 class ProbabilityModel:
@@ -33,8 +121,18 @@ class ProbabilityModel:
     PLATT_THRESHOLD = 300       # switch from Platt to isotonic above this
     REFIT_INTERVAL = 10         # refit calibrators every N new observations
 
-    def __init__(self, calibration_log_path: Path = Path("logs/calibration_log.csv")):
+    def __init__(
+        self,
+        calibration_log_path: Path = Path("logs/calibration_log.csv"),
+        skill_corrector: "HistoricalSkillCorrector | None" = None,
+    ):
         self.calibration_log_path = calibration_log_path
+        # Phase 1 MOS. Auto-load by default: a no-op when historical_skill.json is
+        # absent or the metric isn't covered, and only active when callers pass
+        # lead_day/month (the live signal path does; most unit tests don't).
+        if skill_corrector is None:
+            skill_corrector = HistoricalSkillCorrector()
+        self.skill_corrector = skill_corrector
         self._calibrator: Any = None                               # global calibrator
         self._calibrators_by_dir: dict[str, Any] = {}             # per-direction
         self._calibration_obs: list[tuple[float, float]] = []     # (model_p, actual) global
@@ -48,9 +146,27 @@ class ProbabilityModel:
         threshold: float,
         direction: str,
         threshold_high: float | None = None,
+        lead_day: int | None = None,
+        month: int | None = None,
     ) -> RawProbabilityResult:
-        """Full pipeline: raw P → KDE smoothing → calibration (direction-aware)."""
-        members = forecast.all_members
+        """Full pipeline: (MOS member-shift) → raw P → KDE smoothing → calibration."""
+        member_arrays = forecast.member_arrays
+        # Phase 1 MOS: shift each model's members by −mean_error before counting,
+        # so raw_p itself is bias-corrected. Applied per-model so the breakdown and
+        # the pooled fraction stay consistent. Needs lead/month from the caller.
+        if (
+            self.skill_corrector is not None
+            and lead_day is not None
+            and month is not None
+            and self.skill_corrector.covers(forecast.metric)
+        ):
+            shift = self.skill_corrector.lookup_shift(
+                forecast.lat, forecast.lon, forecast.metric, lead_day, month
+            )
+            if shift is not None:
+                member_arrays = {m: [v - shift for v in vals] for m, vals in member_arrays.items()}
+
+        members = [v for vals in member_arrays.values() for v in vals]
         if not members:
             return RawProbabilityResult(
                 raw_p=0.5, calibrated_p=0.5,
@@ -61,7 +177,7 @@ class ProbabilityModel:
             )
 
         model_breakdown: dict[str, float] = {}
-        for model, model_members in forecast.member_arrays.items():
+        for model, model_members in member_arrays.items():
             if model_members:
                 model_breakdown[model] = _fraction_satisfying(
                     model_members, threshold, direction, threshold_high

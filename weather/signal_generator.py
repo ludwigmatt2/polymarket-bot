@@ -87,11 +87,25 @@ class SignalGenerator:
                 metric=market.metric,
             )
 
-        # City bias correction: adjust threshold to compensate for systematic
-        # model warm/cold bias at this location.
-        bias_offset = self.bias_corrector.get_offset(
-            market.location.lat, market.location.lon
-        )
+        now = datetime.now(timezone.utc)
+        days_to_res = (market.resolution_date - now).total_seconds() / 86400
+        lead_day = max(1, round(days_to_res))
+        month = market.resolution_date.month
+
+        # Bias correction. Phase 1 MOS (member-shift inside compute_probability) owns
+        # temperature correction where it has data; in that case the flat Phase-2 city
+        # bias must stand down to avoid double-correcting. The flat threshold offset is
+        # therefore applied ONLY to temperature metrics that MOS does not cover — and
+        # never to precipitation (a °C offset on a mm threshold is meaningless).
+        corrector = getattr(self.model, "skill_corrector", None)
+        mos_covers = corrector is not None and corrector.covers(market.metric)
+        is_temp = market.metric in ("temperature_2m_max", "temperature_2m_min")
+        if is_temp and not mos_covers:
+            bias_offset = self.bias_corrector.get_offset(
+                market.location.lat, market.location.lon
+            )
+        else:
+            bias_offset = 0.0
         adj_threshold      = market.threshold - bias_offset
         adj_threshold_high = (market.threshold_high - bias_offset
                                if market.threshold_high is not None else None)
@@ -101,10 +115,9 @@ class SignalGenerator:
             threshold=adj_threshold,
             direction=market.direction,
             threshold_high=adj_threshold_high,
+            lead_day=lead_day,
+            month=month,
         )
-
-        now = datetime.now(timezone.utc)
-        days_to_res = (market.resolution_date - now).total_seconds() / 86400
 
         gate_passed, rejection_reason, confidence_score = self._quality_gates(
             market, forecast, prob_result, now, days_to_res

@@ -73,7 +73,26 @@ OPEN_METEO_ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
 OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+# Previous Runs API: lead-time-specific past forecasts (temperature_2m_previous_dayN).
+# Source for Phase 1 historical-skill / MOS error stats. Retained back to ~Jan 2024.
+OPEN_METEO_PREVIOUS_RUNS_URL = "https://previous-runs-api.open-meteo.com/v1/forecast"
 OPEN_METEO_REQUEST_TIMEOUT = 15  # seconds
+
+# ── Phase 1 — Historical skill / MOS correction ────────────────────────────────
+# Minimum forecast-error observations in a (city, lead, month) cell before the MOS
+# member-shift is trusted and applied; thin cells fall back (month→0, then nearest lead).
+MIN_SKILL_OBS = 30
+HISTORICAL_SKILL_PATH = "logs/historical_skill.json"
+# Metrics MOS corrects (validated out-of-sample to beat raw AND flat city bias by
+# +6–8% / +4–7% MAE on the 2024+ Previous-Runs record). MOS owns temperature
+# correction; where MOS covers a metric, the flat Phase-2 city bias is NOT also
+# applied (it would double-correct). Precipitation is excluded (non-Gaussian).
+MOS_METRICS = frozenset({"temperature_2m_max", "temperature_2m_min"})
+# Kill switch. MOS is validated on out-of-sample forecast MAE (the operational MOS
+# standard), which is a proxy for live Brier; the definitive per-direction Brier
+# check accrues over ~2–3 weeks via the exact-replay harness. Flip to False to
+# disable the member-shift instantly if that native check ever regresses.
+MOS_ENABLED = True
 
 # ── Lead-time skill decay ──────────────────────────────────────────────────────
 LEAD_TIME_DECAY_PER_DAY = 0.05   # Shrink model_p 5% per day beyond day-1 toward 0.5
