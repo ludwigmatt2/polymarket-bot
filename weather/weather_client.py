@@ -266,16 +266,7 @@ class WeatherClient:
         }
         r = requests.get(OPEN_METEO_ENSEMBLE_URL, params=params, timeout=OPEN_METEO_REQUEST_TIMEOUT)
         r.raise_for_status()
-        daily = r.json().get("daily", {})
-        time_index = _find_time_index(daily, target_date)
-        members: list[float] = []
-        for key, values in daily.items():
-            if key.startswith(metric) and "member" in key:
-                if time_index is not None and time_index < len(values):
-                    v = values[time_index]
-                    if v is not None:
-                        members.append(float(v))
-        return members
+        return _extract_members(r.json().get("daily", {}), metric, target_date)
 
     def get_historical_actual(
         self,
@@ -359,20 +350,7 @@ class WeatherClient:
         }
         r = requests.get(OPEN_METEO_ENSEMBLE_URL, params=params, timeout=OPEN_METEO_REQUEST_TIMEOUT)
         r.raise_for_status()
-        data = r.json()
-
-        daily = data.get("daily", {})
-        time_index = _find_time_index(daily, target_date)
-
-        members: list[float] = []
-        for key, values in daily.items():
-            if key.startswith(metric) and "member" in key:
-                if time_index is not None and time_index < len(values):
-                    v = values[time_index]
-                    if v is not None:
-                        members.append(float(v))
-
-        return members
+        return _extract_members(r.json().get("daily", {}), metric, target_date)
 
     def _fetch_forecast_means(
         self,
@@ -507,6 +485,20 @@ def _find_time_index(daily: dict, target_date: date) -> int | None:
     times = daily.get("time", [])
     target_str = target_date.isoformat()
     return times.index(target_str) if target_str in times else None
+
+
+def _extract_members(daily: dict, metric: str, target_date: date) -> list[float]:
+    """Pull all ensemble member values for target_date from an Open-Meteo daily block."""
+    time_index = _find_time_index(daily, target_date)
+    if time_index is None:
+        return []
+    members: list[float] = []
+    for key, values in daily.items():
+        if key.startswith(metric) and "member" in key and time_index < len(values):
+            v = values[time_index]
+            if v is not None:
+                members.append(float(v))
+    return members
 
 
 @lru_cache(maxsize=256)

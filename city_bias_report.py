@@ -24,6 +24,7 @@ from pathlib import Path
 from statistics import mean, stdev
 
 sys.path.insert(0, str(Path(__file__).parent))
+from weather._io import atomic_write_csv
 from weather.models import Location
 from weather.paper_trader import _evaluate_outcome
 from weather.weather_client import WeatherClient
@@ -212,23 +213,24 @@ def main() -> None:
         cells[(key[0], key[1], m)].append(r["residual"])
         cells[(key[0], key[1], 0)].append(r["residual"])
 
-    with open(BIAS_CSV, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["city", "lat", "lon", "month", "n", "mean_bias_c", "damped_bias_c", "reliable"])
-        writer.writeheader()
-        for (lat, lon, month), residuals in sorted(cells.items()):
-            n = len(residuals)
-            mb = mean(residuals)
-            damped = mb * min(n / DAMPING_FULL_N, 1.0)
-            writer.writerow({
-                "city":          city_of[(lat, lon)],
-                "lat":           lat,
-                "lon":           lon,
-                "month":         month,
-                "n":             n,
-                "mean_bias_c":   round(mb, 3),
-                "damped_bias_c": round(damped, 3),
-                "reliable":      int(n >= MIN_TRADES_FOR_CORRECTION),
-            })
+    rows = []
+    for (lat, lon, month), residuals in sorted(cells.items()):
+        n = len(residuals)
+        mb = mean(residuals)
+        damped = mb * min(n / DAMPING_FULL_N, 1.0)
+        rows.append({
+            "city":          city_of[(lat, lon)],
+            "lat":           lat,
+            "lon":           lon,
+            "month":         month,
+            "n":             n,
+            "mean_bias_c":   round(mb, 3),
+            "damped_bias_c": round(damped, 3),
+            "reliable":      int(n >= MIN_TRADES_FOR_CORRECTION),
+        })
+    # Atomic write — CityBiasCorrector reads this file live; a torn write would be
+    # silently loaded as corrupt offsets.
+    atomic_write_csv(BIAS_CSV, ["city", "lat", "lon", "month", "n", "mean_bias_c", "damped_bias_c", "reliable"], rows)
 
     n_season_cells = sum(1 for (la, lo, mo), t in cells.items() if mo != 0 and len(t) >= MIN_TRADES_FOR_CORRECTION)
     n_locations = len({(la, lo) for (la, lo, mo) in cells})

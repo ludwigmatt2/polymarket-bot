@@ -96,16 +96,13 @@ class HistoricalSkillCorrector:
         if not ms:
             return None
         lead = max(1, min(int(round(lead_day)), 5))
-        # priority: exact (lead,month) → (lead, all-months) → nearest lead (month) → nearest lead (all-months)
-        ordered_leads = sorted(ms.keys(), key=lambda L: abs(int(L) - lead))
-        candidates = [ms.get(str(lead), {}).get(str(month)),
-                      ms.get(str(lead), {}).get("0")]
-        for L in ordered_leads:
-            candidates.append(ms[L].get(str(month)))
-            candidates.append(ms[L].get("0"))
-        for cell in candidates:
-            if cell and cell.get("n", 0) >= MIN_SKILL_OBS:
-                return cell["mean_error"]
+        # First trusted cell wins, walking leads nearest-first; within each lead try the
+        # exact month, then the all-season (month 0) fallback. The requested lead, if
+        # present, sorts first — so this also covers the exact (lead, month) case.
+        for L in sorted(ms.keys(), key=lambda k: abs(int(k) - lead)):
+            for cell in (ms[L].get(str(month)), ms[L].get("0")):
+                if cell and cell.get("n", 0) >= MIN_SKILL_OBS:
+                    return cell["mean_error"]
         return None
 
     def adjust_members(
@@ -171,15 +168,20 @@ class ProbabilityModel:
             if shift is not None:
                 member_arrays = {m: [v - shift for v in vals] for m, vals in member_arrays.items()}
 
-        # Phase 4: pool members and build a parallel per-member weight vector so the
-        # more skillful model (ECMWF) gets amplified beyond its raw member count.
-        # Equal weights reproduce the pre-Phase-4 member-pooled behavior exactly.
+        # Phase 4: in one pass, pool members, build the parallel per-member weight
+        # vector (so the more skillful model is amplified beyond its raw member count),
+        # and compute each model's breakdown fraction. Equal weights reproduce the
+        # pre-Phase-4 member-pooled behavior exactly.
         members: list[float] = []
         member_weights: list[float] = []
+        model_breakdown: dict[str, float] = {}
         for model, vals in member_arrays.items():
+            if not vals:
+                continue
             w = self.model_weights.get(model, 1.0) if MODEL_WEIGHTING_ENABLED else 1.0
             members.extend(vals)
             member_weights.extend([w] * len(vals))
+            model_breakdown[model] = _fraction_satisfying(vals, threshold, direction, threshold_high)
 
         if not members:
             return RawProbabilityResult(
@@ -189,13 +191,6 @@ class ProbabilityModel:
                 model_breakdown={}, threshold=threshold,
                 direction=direction, metric=forecast.metric,
             )
-
-        model_breakdown: dict[str, float] = {}
-        for model, model_members in member_arrays.items():
-            if model_members:
-                model_breakdown[model] = _fraction_satisfying(
-                    model_members, threshold, direction, threshold_high
-                )
 
         raw_p = _fraction_satisfying(members, threshold, direction, threshold_high, member_weights)
 

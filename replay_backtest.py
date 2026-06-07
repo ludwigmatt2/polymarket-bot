@@ -127,8 +127,7 @@ def production_predict(
     No calibrator is applied — the production calibrator was reset to clean state in
     Phase 0, so current production runs uncalibrated. Returns None if no members.
     """
-    flat = [v for vals in members_by_model.values() for v in vals]
-    if not flat:
+    if not any(members_by_model.values()):
         return None
     direction = trade["weather_direction"]
     threshold, threshold_high = _thresholds(trade)

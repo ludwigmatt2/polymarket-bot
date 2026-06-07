@@ -302,11 +302,9 @@ def main() -> None:
         table[_city_key(city["lat"], city["lon"])] = entry
         for metric, errs in errors.items():
             city_structs[metric].append(errs)
-        n_obs = sum(
-            cell["n"]
-            for m in entry["metrics"].values() for lead in m.values() for cell in lead.values()
-        )
-        print(f"  [{i}/{len(cities)}] {city['city']:<14} cells={sum(len(l) for m in entry['metrics'].values() for l in m.values())} obs={n_obs}")
+        all_cells = [cell for m in entry["metrics"].values() for lead in m.values() for cell in lead.values()]
+        n_obs = sum(cell["n"] for cell in all_cells)
+        print(f"  [{i}/{len(cities)}] {city['city']:<14} cells={len(all_cells)} obs={n_obs}")
 
     # ── Out-of-sample validation (the acceptance gate) ───────────────────────────
     # The decision metric: does per-(lead,month) MOS beat the flat per-city mean

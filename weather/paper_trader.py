@@ -106,7 +106,9 @@ class PaperTrader:
 
     def _check_milestone(self, interval: int = 100) -> None:
         """Fire a macOS notification when total logged trades crosses a multiple of interval."""
-        count = sum(1 for _ in self._load_all())
+        # _existing_keys already holds one entry per logged (market_id, direction) and is
+        # maintained on every append — use it instead of re-reading the whole CSV each call.
+        count = len(self._existing_keys or ())
         if count % interval == 0:
             msg = (
                 f"Polymarket bot hit {count} paper trades. "
