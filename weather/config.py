@@ -101,6 +101,19 @@ LEAD_TIME_DECAY_PER_DAY = 0.05   # Shrink model_p 5% per day beyond day-1 toward
 # GFS: 31 members; ICON-EPS: 40 members; ECMWF IFS: 50 members
 ENSEMBLE_MODELS = ["gfs_seamless", "icon_seamless", "ecmwf_ifs025"]
 
+# ── Phase 4 — Per-model skill weighting ────────────────────────────────────────
+# Member-level weights: each model's ensemble members are weighted by these factors
+# when computing the weighted fraction + weighted KDE, amplifying the more skillful
+# model beyond its raw member count (ECMWF already has the most members). This is a
+# LABELED LITERATURE PRIOR (ECMWF is the most skillful global model at 3–7 day leads),
+# empirically confirmed for our cities via Previous-Runs lead-3 MAE (ECMWF<ICON<GFS;
+# inverse-MAE ≈ 1.0/1.2/1.4). model_skill_tracker.py replaces it with fitted weights
+# once enough resolved trades carry model_breakdown_json. Equal weights reproduce the
+# pre-Phase-4 member-pooled behavior exactly.
+MODEL_WEIGHTS = {"ecmwf_ifs025": 1.5, "icon_seamless": 1.1, "gfs_seamless": 1.0}
+# Kill switch — False reverts to equal member pooling (no weighting).
+MODEL_WEIGHTING_ENABLED = True
+
 # Deterministic models used for cross-model spread (uncertainty proxy)
 FORECAST_MODELS = ["gfs_seamless", "ecmwf_ifs025", "icon_seamless"]
 

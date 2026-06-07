@@ -31,6 +31,8 @@ from .config import (
     MAX_ENSEMBLE_SPREAD,
     MIN_ENSEMBLE_MEMBERS,
     MIN_SKILL_OBS,
+    MODEL_WEIGHTING_ENABLED,
+    MODEL_WEIGHTS,
     MOS_ENABLED,
     MOS_METRICS,
 )
@@ -125,8 +127,11 @@ class ProbabilityModel:
         self,
         calibration_log_path: Path = Path("logs/calibration_log.csv"),
         skill_corrector: "HistoricalSkillCorrector | None" = None,
+        model_weights: dict[str, float] | None = None,
     ):
         self.calibration_log_path = calibration_log_path
+        # Phase 4: per-model member weights. None → the labeled literature prior.
+        self.model_weights = MODEL_WEIGHTS if model_weights is None else model_weights
         # Phase 1 MOS. Auto-load by default: a no-op when historical_skill.json is
         # absent or the metric isn't covered, and only active when callers pass
         # lead_day/month (the live signal path does; most unit tests don't).
@@ -166,7 +171,16 @@ class ProbabilityModel:
             if shift is not None:
                 member_arrays = {m: [v - shift for v in vals] for m, vals in member_arrays.items()}
 
-        members = [v for vals in member_arrays.values() for v in vals]
+        # Phase 4: pool members and build a parallel per-member weight vector so the
+        # more skillful model (ECMWF) gets amplified beyond its raw member count.
+        # Equal weights reproduce the pre-Phase-4 member-pooled behavior exactly.
+        members: list[float] = []
+        member_weights: list[float] = []
+        for model, vals in member_arrays.items():
+            w = self.model_weights.get(model, 1.0) if MODEL_WEIGHTING_ENABLED else 1.0
+            members.extend(vals)
+            member_weights.extend([w] * len(vals))
+
         if not members:
             return RawProbabilityResult(
                 raw_p=0.5, calibrated_p=0.5,
@@ -183,10 +197,10 @@ class ProbabilityModel:
                     model_members, threshold, direction, threshold_high
                 )
 
-        raw_p = _fraction_satisfying(members, threshold, direction, threshold_high)
+        raw_p = _fraction_satisfying(members, threshold, direction, threshold_high, member_weights)
 
         if len(members) >= 10:
-            raw_p = _apply_kde(members, threshold, direction, threshold_high, raw_p)
+            raw_p = _apply_kde(members, threshold, direction, threshold_high, raw_p, member_weights)
 
         calibrated_p = self._apply_calibration(raw_p, direction)
 
@@ -326,13 +340,17 @@ def _apply_kde(
     direction: str,
     threshold_high: float | None,
     fallback: float,
+    weights: list[float] | None = None,
 ) -> float:
     try:
         # Degenerate spread (e.g. all-zero precipitation members on a dry day) makes
         # gaussian_kde singular → nan density. Fall back to the plain fraction.
         if float(np.std(members)) == 0.0:
             return fallback
-        kde = gaussian_kde(members, bw_method="scott")
+        # Phase 4: per-member weights amplify the more skillful model's density.
+        # Uniform weights are equivalent to no weights.
+        w = np.asarray(weights, dtype=float) if weights is not None else None
+        kde = gaussian_kde(members, bw_method="scott", weights=w)
         x_eval = np.linspace(min(members) - 20, max(members) + 20, 500)
         density = kde(x_eval)
         total = density.sum()
@@ -361,15 +379,23 @@ def _fraction_satisfying(
     threshold: float,
     direction: str,
     threshold_high: float | None = None,
+    weights: list[float] | None = None,
 ) -> float:
     if not members:
         return 0.5
     if direction == "above":
-        count = sum(1 for v in members if v > threshold)
+        sat = [v > threshold for v in members]
     elif direction == "below":
-        count = sum(1 for v in members if v < threshold)
+        sat = [v < threshold for v in members]
     elif direction == "range" and threshold_high is not None:
-        count = sum(1 for v in members if threshold <= v <= threshold_high)
+        sat = [threshold <= v <= threshold_high for v in members]
     else:  # "equal"
-        count = sum(1 for v in members if abs(v - threshold) <= 0.5)
-    return float(np.clip(count / len(members), 0.001, 0.999))
+        sat = [abs(v - threshold) <= 0.5 for v in members]
+    if weights is not None:
+        # Phase 4: weighted fraction = Σ w·[satisfies] / Σ w. Uniform weights ≡ unweighted.
+        total_w = sum(weights)
+        num = sum(w for s, w in zip(sat, weights) if s)
+        frac = num / total_w if total_w else 0.5
+    else:
+        frac = sum(sat) / len(members)
+    return float(np.clip(frac, 0.001, 0.999))

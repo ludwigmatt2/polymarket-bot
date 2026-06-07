@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Callable
 
 from weather.city_bias import CityBiasCorrector
-from weather.config import LEAD_TIME_DECAY_PER_DAY, MAX_ENSEMBLE_SPREAD
+from weather.config import LEAD_TIME_DECAY_PER_DAY, MAX_ENSEMBLE_SPREAD, MODEL_WEIGHTS
 from weather.models import Location
 from weather.probability_model import _apply_kde, _fraction_satisfying
 from weather.weather_client import WeatherClient
@@ -83,10 +83,10 @@ def _spread(breakdown: dict[str, float]) -> float:
     return math.sqrt(sum((p - mean_p) ** 2 for p in probs) / len(probs))
 
 
-def _raw_p(members: list[float], threshold, direction, threshold_high) -> float:
-    raw_p = _fraction_satisfying(members, threshold, direction, threshold_high)
+def _raw_p(members: list[float], threshold, direction, threshold_high, weights=None) -> float:
+    raw_p = _fraction_satisfying(members, threshold, direction, threshold_high, weights)
     if len(members) >= 10:
-        raw_p = _apply_kde(members, threshold, direction, threshold_high, raw_p)
+        raw_p = _apply_kde(members, threshold, direction, threshold_high, raw_p, weights)
     return raw_p
 
 
@@ -138,15 +138,17 @@ def production_predict(
 
     if member_shift:
         members_by_model = {m: [v - member_shift for v in vals] for m, vals in members_by_model.items()}
-        flat = [v for vals in members_by_model.values() for v in vals]
 
     breakdown = _model_breakdown(members_by_model, threshold, direction, threshold_high)
 
-    if weights:
-        total_w = sum(weights.get(m, 1.0) for m in breakdown)
-        raw_p = sum(weights.get(m, 1.0) * p for m, p in breakdown.items()) / total_w if total_w else 0.5
-    else:
-        raw_p = _raw_p(flat, threshold, direction, threshold_high)
+    # Pool members and (Phase 4) build a parallel per-member weight vector, mirroring
+    # ProbabilityModel.compute_probability — member-level weighted fraction + weighted KDE.
+    flat, member_w = [], []
+    for model, vals in members_by_model.items():
+        w = weights.get(model, 1.0) if weights else 1.0
+        flat.extend(vals)
+        member_w.extend([w] * len(vals))
+    raw_p = _raw_p(flat, threshold, direction, threshold_high, member_w if weights else None)
 
     return _shrink(raw_p, _days_to_res(trade), _spread(breakdown))
 
@@ -335,6 +337,30 @@ def nobias_config() -> BacktestConfig:
     return BacktestConfig("nobias", predict)
 
 
+def weighted_config() -> BacktestConfig:
+    """Phase 4 in isolation: no bias, no MOS — just the per-model weight prior."""
+    def predict(members_by_model, trade):
+        return production_predict(members_by_model, trade, weights=MODEL_WEIGHTS)
+    return BacktestConfig("weighted", predict)
+
+
+def mos_weighted_config() -> BacktestConfig:
+    """Shipped reality: MOS member-shift + per-model weighting (marginal weighting on top of MOS)."""
+    from weather.probability_model import HistoricalSkillCorrector
+    mos = HistoricalSkillCorrector()
+
+    def predict(members_by_model, trade):
+        lat, lon, metric = float(trade["lat"]), float(trade["lon"]), trade["metric"]
+        res = datetime.fromisoformat(trade["resolution_date"])
+        sig = datetime.fromisoformat(trade["signal_time"])
+        lead = max(1, round((res - sig).total_seconds() / 86400))
+        shift = mos.lookup_shift(lat, lon, metric, lead, res.month) or 0.0
+        bias = 0.0 if mos.covers(metric) else _PROD_BIAS.get_offset(lat, lon)
+        return production_predict(members_by_model, trade, bias_offset=bias,
+                                  member_shift=shift, weights=MODEL_WEIGHTS)
+    return BacktestConfig("mos_weighted", predict)
+
+
 # Registry of named configs so the CLI / later phases can address them by name.
 # `baseline` reflects whatever the production CityBiasCorrector currently does, so
 # to A/B a bias change, compare against `nobias` (the ablation) rather than baseline.
@@ -342,6 +368,8 @@ CONFIG_REGISTRY: dict[str, Callable[[], BacktestConfig]] = {
     "baseline": baseline_config,
     "nobias": nobias_config,
     "mos": mos_config,
+    "weighted": weighted_config,
+    "mos_weighted": mos_weighted_config,
 }
 
 
