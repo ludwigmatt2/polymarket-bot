@@ -14,6 +14,7 @@ Gate structure (evaluated in order):
   Gate 8:   Composite confidence — weighted spread + timing + calibration score?
   Gate 9.5: Equal extreme-price   — crowd >85% confident = market has station data.
   Gate 9.6: Equal YES blocked     — model overestimates P(exact hit); 20% WR vs 85% for NO.
+  Gate 9.7: Low-priced YES        — market_p < 15¢ YES bets: 9.4% WR, -8.1% ROI (355-trade data).
 
 A Signal is produced for every evaluation. quality_gate_passed=False signals carry
 a rejection_reason string naming the gate that blocked them.
@@ -41,6 +42,7 @@ from .config import (
     MIN_ENTRY_HOURS_AHEAD,
     MIN_MARKET_LIQUIDITY_USD,
     MIN_NET_EV_PP,
+    MIN_YES_ENTRY_PRICE,
     ROUND_TRIP_FEE,
     VELOCITY_WINDOW_HOURS,
 )
@@ -224,6 +226,12 @@ class SignalGenerator:
         # gate may occasionally block a post-shrinkage NO trade (conservative, acceptable).
         if BLOCK_EQUAL_YES and market.direction == "equal" and prob.calibrated_p > market.yes_price:
             return False, "gate9.6_equal_yes_blocked", 0.0
+
+        # Gate 9.7: Low-priced YES blocked — market near-zero on YES, model consistently wrong.
+        # 355-trade data: YES bets with market_p < 15¢ → 9.4% WR, -8.1% ROI (53 trades).
+        # Cutting these recovers $95 and lifts overall ROI 37% → 45%.
+        if prob.calibrated_p > market.yes_price and market.yes_price < MIN_YES_ENTRY_PRICE:
+            return False, f"gate9.7_low_priced_yes:{market.yes_price:.3f}", 0.0
 
         # Gate 4: Fee-adjusted edge (blocks the majority of candidate trades)
         gross_ev = abs(prob.calibrated_p - market.yes_price)

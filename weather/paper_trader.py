@@ -8,6 +8,7 @@ run for 4-6 weeks (20+ resolved trades) before live trading is unlocked.
 from __future__ import annotations
 
 import csv
+import subprocess
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -94,7 +95,25 @@ class PaperTrader:
         )
         self._append_trade(trade)
         self._existing_keys.add(key)
+        self._check_milestone()
         return trade
+
+    def _check_milestone(self, interval: int = 100) -> None:
+        """Fire a macOS notification when total logged trades crosses a multiple of interval."""
+        count = sum(1 for _ in self._load_all())
+        if count % interval == 0:
+            msg = (
+                f"Polymarket bot hit {count} paper trades. "
+                "Time to review calibration and update the gates."
+            )
+            try:
+                subprocess.run(
+                    ["osascript", "-e",
+                     f'display notification "{msg}" with title "Calibration Review Due"'],
+                    check=False, timeout=5,
+                )
+            except Exception:
+                pass
 
     def resolve_trade(self, trade_id: str, actual_outcome: bool) -> PaperTrade | None:
         """

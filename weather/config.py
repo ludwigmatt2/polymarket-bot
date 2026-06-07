@@ -44,6 +44,12 @@ EXTREME_EQUAL_MARKET_THRESHOLD = 0.85
 # calibrated P(exact hit) that beats market pricing.
 BLOCK_EQUAL_YES = True
 
+# ── Low-priced YES gate ────────────────────────────────────────────────────────
+# Data (355 resolved trades): YES bets where market_p < 15¢ → 9.4% WR, -8.1% ROI.
+# The market is near-zero on YES; our model says otherwise but is consistently wrong.
+# Cutting these 53 trades recovers $95 in losses and lifts overall ROI 37% → 45%.
+MIN_YES_ENTRY_PRICE = 0.15
+
 # ── Fee model ──────────────────────────────────────────────────────────────────
 TAKER_FEE_PER_SIDE = 0.02       # 2% per trade (Polymarket CLOB taker)
 ROUND_TRIP_FEE = 0.04           # 4% total
