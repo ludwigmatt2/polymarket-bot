@@ -446,6 +446,11 @@ class WeatherMarketScanner:
         if not description:
             return True
 
+        # Strip example/parenthetical values before extracting thresholds — Polymarket
+        # boilerplate includes "(eg, 9.1°C)" in every daily-temp description, which is
+        # not a threshold and must not count as conflicting evidence.
+        description = re.sub(r"\((?:e\.?g\.?|example)[^)]*\)", "", description, flags=re.IGNORECASE)
+
         desc = description.lower()
 
         # Check direction agreement when description has explicit above/below language

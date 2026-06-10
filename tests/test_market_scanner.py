@@ -144,6 +144,35 @@ class TestDescriptionCrossCheck:
         wm = scanner._parse_market(gm)
         assert wm is not None
 
+    def test_example_degree_value_in_boilerplate_passes(self):
+        """Regression (Jun 2026 drought): Polymarket boilerplate contains an EXAMPLE
+        value "(eg, 9.1°C)" that is not a threshold. E4 must not treat it as
+        conflicting evidence — doing so dropped every daily temp market for 7 days."""
+        scanner = _make_scanner_with_geocode()
+        gm = _make_gamma_market(
+            title="Highest temperature in London on June 10? - Will the highest temperature in London be 24°C or below on June 10?",
+            description=(
+                "This market will resolve to the temperature range that contains the "
+                "highest temperature recorded in degrees Celsius on 10 Jun '26. The "
+                "resolution source for this market measures temperatures in Celsius to "
+                "one decimal place (eg, 9.1°C). Thus, this is the level of precision "
+                "that will be used when resolving the market."
+            ),
+        )
+        wm = scanner._parse_market(gm)
+        assert wm is not None and wm is not _MISMATCH_DROP
+
+    def test_example_with_eg_dots_stripped(self):
+        """Variant spellings: (e.g. 9.1°C) and (example: 9.1°C) are also stripped."""
+        scanner = _make_scanner_with_geocode()
+        for variant in ("(e.g. 9.1°C)", "(e.g., 9.1°C)", "(example: 9.1°C)"):
+            gm = _make_gamma_market(
+                title="Highest temperature in London on June 10? - Will the highest temperature in London be 24°C or below on June 10?",
+                description=f"Temperatures are measured to one decimal place {variant}.",
+            )
+            wm = scanner._parse_market(gm)
+            assert wm is not None and wm is not _MISMATCH_DROP, variant
+
 
 class TestZeroMarketsAlarm:
     """E3: zero-results scan must log a warning and write scanner_alarm.csv."""
