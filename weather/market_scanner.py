@@ -25,7 +25,9 @@ _log = logging.getLogger(__name__)
 
 from .config import (
     MAX_DAYS_TO_RESOLUTION,
+    MIN_FETCHED_FOR_PARSE_ALARM,
     MIN_MARKET_LIQUIDITY_USD,
+    MIN_PARSE_RATE,
     WEATHER_SEARCH_TERMS,
 )
 from .models import Location, WeatherMarket
@@ -214,6 +216,24 @@ class WeatherMarketScanner:
             _append_csv_log(UNPARSEABLE_LOG, unparseable, _UNPARSEABLE_FIELDS)
 
         print(f"    parsed {len(parsed)} / {len(raw_markets)}  ({len(unparseable)} unparseable → logs/unparseable_markets.csv)")
+
+        # Parse-rate alarm: a silent parser regression (e.g. the Jun 2026 E4 bug)
+        # shows up as a collapsed parse rate long before anyone notices missing trades.
+        if len(raw_markets) >= MIN_FETCHED_FOR_PARSE_ALARM:
+            parse_rate = len(parsed) / len(raw_markets)
+            if parse_rate < MIN_PARSE_RATE:
+                _log.warning(
+                    "Parse rate collapsed: %d/%d (%.0f%%) — possible parser regression. "
+                    "Check logs/parser_mismatch.csv and logs/unparseable_markets.csv.",
+                    len(parsed), len(raw_markets), parse_rate * 100,
+                )
+                _append_csv_log(SCANNER_ALARM_LOG, [{
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "source": self._source,
+                    "search_terms": ",".join(WEATHER_SEARCH_TERMS[:5]),
+                    "reason": f"low_parse_rate:{len(parsed)}/{len(raw_markets)}",
+                }], _ALARM_FIELDS)
+
         tradeable = self._filter_tradeable(parsed)
         # Fetch live CLOB order-book depth only for markets that survived all other filters.
         # This avoids 2 sidecar API calls per scanned market on every scan cycle.

@@ -9,12 +9,27 @@ satisfying the condition — no assumptions about the distribution shape.
 from __future__ import annotations
 
 import calendar
+import logging
 import time
 from datetime import date, datetime, timedelta
 from functools import lru_cache
 from typing import Any
 
 import requests
+
+_log = logging.getLogger(__name__)
+
+
+def _get_with_retry(url: str, params: dict, timeout: float) -> requests.Response:
+    """GET with a single retry after a pause on 429 — Open-Meteo's free tier
+    rate-limits per minute; one scan evaluates hundreds of bucket markets and
+    can trip it mid-run."""
+    r = requests.get(url, params=params, timeout=timeout)
+    if r.status_code == 429:
+        time.sleep(2.0)
+        r = requests.get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    return r
 
 from .config import (
     ENSEMBLE_MODELS,
@@ -30,6 +45,15 @@ from .models import EnsembleForecast, Location
 
 class WeatherClient:
     """Fetches ensemble weather forecasts from Open-Meteo (free, no API key)."""
+
+    # ~10 bucket markets share each (city, date, metric); without a cache every
+    # one of them refetches the same ensemble — ~6 API calls per market trips
+    # Open-Meteo's per-minute limit mid-scan and whole city/date blocks silently
+    # come back with 0 members (rejected by gate 2.5).
+    FORECAST_CACHE_TTL_S = 900
+
+    def __init__(self) -> None:
+        self._forecast_cache: dict[tuple, tuple[float, EnsembleForecast]] = {}
 
     METRIC_DAILY_PARAMS = {
         "temperature_2m_max": "temperature_2m_max",
@@ -187,6 +211,11 @@ class WeatherClient:
         if metric not in self.METRIC_DAILY_PARAMS:
             raise ValueError(f"Unsupported metric '{metric}'. Supported: {list(self.METRIC_DAILY_PARAMS)}")
 
+        cache_key = (location.lat, location.lon, target_date, metric, tuple(models))
+        cached = self._forecast_cache.get(cache_key)
+        if cached is not None and time.monotonic() - cached[0] < self.FORECAST_CACHE_TTL_S:
+            return cached[1]
+
         member_arrays: dict[str, list[float]] = {}
 
         for model in models:
@@ -194,13 +223,17 @@ class WeatherClient:
                 members = self._fetch_ensemble_members(location, target_date, metric, model)
                 if members:
                     member_arrays[model] = members
-            except Exception:
-                continue  # Degrade gracefully — use remaining models
+            except Exception as exc:
+                # Degrade gracefully — use remaining models, but never silently:
+                # swallowed failures here looked like "0 members" for 7 days.
+                _log.warning("Ensemble fetch failed: %s %s %s %s: %s",
+                             location.city, target_date, metric, model, exc)
+                continue
 
         # Cross-model means for uncertainty (spread) calculation
         model_means = self._fetch_forecast_means(location, target_date, metric)
 
-        return EnsembleForecast(
+        forecast = EnsembleForecast(
             lat=location.lat,
             lon=location.lon,
             target_date=target_date,
@@ -209,6 +242,11 @@ class WeatherClient:
             model_means=model_means,
             fetched_at=datetime.utcnow(),
         )
+        # Cache only usable results — a transient failure should be retried by
+        # the next market in the block, not pinned for the TTL.
+        if member_arrays:
+            self._forecast_cache[cache_key] = (time.monotonic(), forecast)
+        return forecast
 
     def get_historical_ensemble_forecast(
         self,
@@ -264,8 +302,7 @@ class WeatherClient:
             "end_date": target_date.isoformat(),
             "timezone": location.timezone,
         }
-        r = requests.get(OPEN_METEO_ENSEMBLE_URL, params=params, timeout=OPEN_METEO_REQUEST_TIMEOUT)
-        r.raise_for_status()
+        r = _get_with_retry(OPEN_METEO_ENSEMBLE_URL, params, OPEN_METEO_REQUEST_TIMEOUT)
         return _extract_members(r.json().get("daily", {}), metric, target_date)
 
     def get_historical_actual(
@@ -348,8 +385,7 @@ class WeatherClient:
             "forecast_days": forecast_days,
             "timezone": location.timezone,
         }
-        r = requests.get(OPEN_METEO_ENSEMBLE_URL, params=params, timeout=OPEN_METEO_REQUEST_TIMEOUT)
-        r.raise_for_status()
+        r = _get_with_retry(OPEN_METEO_ENSEMBLE_URL, params, OPEN_METEO_REQUEST_TIMEOUT)
         return _extract_members(r.json().get("daily", {}), metric, target_date)
 
     def _fetch_forecast_means(
@@ -376,9 +412,7 @@ class WeatherClient:
                     "forecast_days": forecast_days,
                     "timezone": location.timezone,
                 }
-                r = requests.get(OPEN_METEO_FORECAST_URL, params=params,
-                                 timeout=OPEN_METEO_REQUEST_TIMEOUT)
-                r.raise_for_status()
+                r = _get_with_retry(OPEN_METEO_FORECAST_URL, params, OPEN_METEO_REQUEST_TIMEOUT)
                 daily = r.json().get("daily", {})
                 idx = _find_time_index(daily, target_date)
                 if idx is not None:

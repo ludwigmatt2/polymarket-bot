@@ -26,6 +26,14 @@ GATE8_SPREAD_WEIGHT = 0.40
 GATE8_TIMING_WEIGHT = 0.35
 GATE8_CALIB_WEIGHT = 0.25
 
+# ── Scanner health alarm ───────────────────────────────────────────────────────
+# Healthy scans parse ~90% of fetched markets; the Jun 2026 E4 regression ran at
+# ~10% for 7 days with zero alerts. Alarm (log + scanner_alarm.csv → Telegram)
+# when the rate drops below this. Only checked when enough markets were fetched
+# for the rate to be meaningful.
+MIN_PARSE_RATE = 0.30
+MIN_FETCHED_FOR_PARSE_ALARM = 50
+
 # ── Market filters ─────────────────────────────────────────────────────────────
 MIN_MARKET_LIQUIDITY_USD = 50.0  # Lowered to include monthly precipitation markets
 BOOK_DEPTH_MIN_MULTIPLIER = 3   # Gate 5: require N× min liquidity in live CLOB book depth

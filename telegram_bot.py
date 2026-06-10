@@ -981,9 +981,36 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 _seen_signals_mtimes:  dict[int, float] = {}
 _seen_resolved_mtimes: dict[int, float] = {}
+_seen_alarm_mtime: float = 0.0
+_SCANNER_ALARM_LOG = Path("logs/scanner_alarm.csv")
 
 async def check_alerts(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     bot = ctx.bot
+
+    # Scanner health alarms (zero markets / parse-rate collapse) → admin only.
+    # The E4 regression ran silently for 7 days because nothing read this file.
+    global _seen_alarm_mtime
+    if _SCANNER_ALARM_LOG.exists():
+        mtime = _SCANNER_ALARM_LOG.stat().st_mtime
+        if mtime > _seen_alarm_mtime:
+            first_check = _seen_alarm_mtime == 0.0
+            _seen_alarm_mtime = mtime
+            if not first_check:  # don't replay old alarms on bot restart
+                try:
+                    with open(_SCANNER_ALARM_LOG) as f:
+                        rows = list(csv.DictReader(f))
+                    last = rows[-1] if rows else {}
+                    await bot.send_message(
+                        ADMIN_ID,
+                        f"🚨 *Scanner alarm*\n"
+                        f"Reason: `{last.get('reason', '?')}`\n"
+                        f"Source: {last.get('source', '?')}  ·  {last.get('timestamp', '')[:16]}\n"
+                        f"_Check logs/scanner\\_alarm.csv_",
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
+
     for uid in all_user_ids():
         signals_file  = _signals_path(uid)
         resolved_file = _resolved_path(uid)

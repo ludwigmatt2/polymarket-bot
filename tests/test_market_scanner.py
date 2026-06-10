@@ -216,3 +216,51 @@ class TestZeroMarketsAlarm:
         assert len(result) == 1
         alarm_path = tmp_path / "logs" / "scanner_alarm.csv"
         assert not alarm_path.exists()
+
+
+class TestParseRateAlarm:
+    """Parse-rate collapse alarm: the Jun 2026 E4 regression dropped 90% of markets
+    silently for 7 days. A collapsed parsed/fetched ratio must write scanner_alarm.csv."""
+
+    @staticmethod
+    def _junk(i):
+        gm = _make_gamma_market(
+            condition_id=f"junk{i}",
+            description="Resolves YES if the Lakers win.",
+        )
+        # _GammaMarket derives title from event+question; override to be unparseable
+        gm.title = "Will the Lakers win the 2026 NBA Finals?"
+        return gm
+
+    def test_alarm_on_parse_collapse(self, tmp_path, monkeypatch, caplog):
+        import logging
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "logs").mkdir()
+        scanner = _make_scanner_with_geocode()
+        monkeypatch.setattr(scanner, "_search_keywords",
+                            lambda: [self._junk(i) for i in range(60)])
+        with caplog.at_level(logging.WARNING, logger="weather.market_scanner"):
+            scanner.scan()
+        alarm_path = tmp_path / "logs" / "scanner_alarm.csv"
+        assert alarm_path.exists()
+        assert "low_parse_rate" in alarm_path.read_text()
+        assert any("parse rate" in r.message.lower() for r in caplog.records)
+
+    def test_no_alarm_below_min_fetch(self, tmp_path, monkeypatch):
+        """Tiny fetches (off-hours, API hiccups) must not alarm on rate alone."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "logs").mkdir()
+        scanner = _make_scanner_with_geocode()
+        monkeypatch.setattr(scanner, "_search_keywords",
+                            lambda: [self._junk(i) for i in range(10)])
+        scanner.scan()
+        assert not (tmp_path / "logs" / "scanner_alarm.csv").exists()
+
+    def test_no_alarm_on_healthy_parse(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "logs").mkdir()
+        scanner = _make_scanner_with_geocode()
+        monkeypatch.setattr(scanner, "_search_keywords",
+                            lambda: [_make_gamma_market(condition_id=f"ok{i}") for i in range(60)])
+        scanner.scan()
+        assert not (tmp_path / "logs" / "scanner_alarm.csv").exists()
