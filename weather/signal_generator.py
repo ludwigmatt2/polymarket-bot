@@ -130,11 +130,18 @@ class SignalGenerator:
 
         model_p = prob_result.calibrated_p
 
-        # Lead-time + spread shrinkage: shrink model_p toward 0.5.
+        # Lead-time + spread shrinkage: shrink model_p toward the MARKET price.
         # skill: 5%/day decay beyond day-1; spread_factor: 0 at MAX_ENSEMBLE_SPREAD.
+        # The anchor must be the market price, not 0.5: the no-information limit for
+        # a multi-bucket market is the crowd's price, not a coin flip. Shrinking
+        # toward 0.5 manufactured phantom YES signals on low-probability buckets
+        # (e.g. calibrated_p=0.06 < market 0.22, shrunk to 0.37 > 0.22 → direction
+        # flipped to YES purely by shrinkage geometry; YES-range went 0/35 this way).
+        # Anchored at market price, shrinkage scales the edge toward zero and can
+        # never flip the trade direction.
         skill = max(0.5, 1.0 - LEAD_TIME_DECAY_PER_DAY * max(0.0, days_to_res - 1.0))
         spread_factor = max(0.0, 1.0 - prob_result.ensemble_spread / MAX_ENSEMBLE_SPREAD)
-        model_p = 0.5 + (model_p - 0.5) * skill * spread_factor
+        model_p = market.yes_price + (model_p - market.yes_price) * skill * spread_factor
 
         # Re-check gate 4 after both shrinkages
         if gate_passed:
@@ -236,8 +243,8 @@ class SignalGenerator:
 
         # Gate 9.6: Equal YES blocked — model overestimates P(exact hit).
         # 160-trade backtest: equal YES = 20% WR; equal NO = 85% WR.
-        # Uses pre-shrinkage calibrated_p; shrinkage can flip direction near 0.5, so this
-        # gate may occasionally block a post-shrinkage NO trade (conservative, acceptable).
+        # Uses pre-shrinkage calibrated_p; since shrinkage anchors at the market price,
+        # the post-shrinkage direction always matches, so this is exact.
         if BLOCK_EQUAL_YES and market.direction == "equal" and prob.calibrated_p > market.yes_price:
             return False, "gate9.6_equal_yes_blocked", 0.0
 

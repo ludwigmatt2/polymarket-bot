@@ -306,14 +306,16 @@ class TestEdgeCalculation:
     def test_edge_is_absolute_difference(self):
         gen = _make_generator(model_p=0.80)
         signal = gen.evaluate(_make_market(yes_price=0.30))
-        # model_p=0.80 → after lead-time+spread shrinkage (skill≈1, spread_factor≈1 at 1d out)
-        # signal is evaluated at days_to_res≈1, so edge reflects post-shrinkage model_p
-        assert signal.edge_pp == pytest.approx(0.4025, abs=0.01)
+        # Shrinkage anchors at the market price: edge = |calibrated_p - market| * k.
+        # days_out=3, spread=0.05 → k = skill(0.9) * spread_factor(0.75) = 0.675.
+        # edge = 0.50 * 0.675 = 0.3375
+        assert signal.edge_pp == pytest.approx(0.3375, abs=0.01)
 
     def test_net_ev_gate_threshold(self):
-        # Minimum passing gross edge = ROUND_TRIP_FEE + MIN_NET_EV_PP
-        min_gross = ROUND_TRIP_FEE + MIN_NET_EV_PP  # 0.08
-        gen = _make_generator(model_p=0.30 + min_gross + 0.001)  # just above threshold
+        # Post-shrinkage gate 4 requires |calibrated_p - market| * k ≥ fee + min_ev,
+        # so the minimum passing gross edge is (ROUND_TRIP_FEE + MIN_NET_EV_PP) / k.
+        min_gross = (ROUND_TRIP_FEE + MIN_NET_EV_PP) / 0.675  # k for days_out=3, spread=0.05
+        gen = _make_generator(model_p=0.30 + min_gross + 0.005)  # just above threshold
         signal = gen.evaluate(_make_market(yes_price=0.30))
         assert signal.quality_gate_passed is True
 
@@ -321,3 +323,31 @@ class TestEdgeCalculation:
         gen = _make_generator(model_p=0.80)
         s1 = gen.evaluate(_make_market(yes_price=0.30))
         assert 0.0 <= s1.confidence_score <= 1.0
+
+
+class TestShrinkageAnchoredAtMarket:
+    """Regression (Jun 2026): shrinkage toward 0.5 manufactured phantom YES signals.
+
+    With calibrated_p=0.055 and market at 0.22, the old 0.5-anchored shrinkage
+    produced model_p≈0.37 > 0.22 — flipping a raw NO view into a YES bet purely
+    by shrinkage geometry. Every such YES-range trade lost (0/35). Anchoring at
+    the market price makes a direction flip impossible.
+    """
+
+    def test_shrinkage_never_flips_direction(self):
+        gen = _make_generator(model_p=0.055)   # raw view: well below market
+        signal = gen.evaluate(_make_market(yes_price=0.22))
+        assert signal.direction == "NO"
+        assert signal.model_p < 0.22
+
+    def test_shrunk_model_p_lies_between_market_and_calibrated(self):
+        gen = _make_generator(model_p=0.80)
+        signal = gen.evaluate(_make_market(yes_price=0.30))
+        assert 0.30 < signal.model_p < 0.80
+
+    def test_heavier_shrinkage_only_reduces_edge(self):
+        gen = _make_generator(model_p=0.80)
+        near = gen.evaluate(_make_market(yes_price=0.30, days_out=1))
+        far = gen.evaluate(_make_market(yes_price=0.30, days_out=5))
+        assert far.edge_pp < near.edge_pp
+        assert near.direction == far.direction == "YES"

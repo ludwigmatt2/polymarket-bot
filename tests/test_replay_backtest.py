@@ -18,6 +18,7 @@ def _trade(weather_direction="above", direction="YES", threshold=25.0,
         "actual_outcome": str(outcome), "metric": "temperature_2m_max",
         "lat": str(lat), "lon": str(lon), "location_tz": "UTC",
         "signal_time": sig.isoformat(), "resolution_date": res.isoformat(),
+        "entry_price": "0.30",   # side price; _market_yes_price converts NO → 1-entry
     }
 
 

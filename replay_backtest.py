@@ -96,10 +96,18 @@ def _days_to_res(trade: dict) -> float:
     return (res - sig).total_seconds() / 86400.0
 
 
-def _shrink(p: float, days_to_res: float, spread: float) -> float:
+def _market_yes_price(trade: dict) -> float:
+    """entry_price is the price of the side bought; convert to YES space."""
+    entry = float(trade["entry_price"])
+    return entry if trade["direction"] == "YES" else 1.0 - entry
+
+
+def _shrink(p: float, days_to_res: float, spread: float, market_p: float) -> float:
+    # Mirrors SignalGenerator: shrink toward the MARKET price (no-information limit),
+    # never 0.5 — anchoring at 0.5 manufactured phantom direction flips.
     skill = max(0.5, 1.0 - LEAD_TIME_DECAY_PER_DAY * max(0.0, days_to_res - 1.0))
     spread_factor = max(0.0, 1.0 - spread / MAX_ENSEMBLE_SPREAD)
-    return 0.5 + (p - 0.5) * skill * spread_factor
+    return market_p + (p - market_p) * skill * spread_factor
 
 
 def _thresholds(trade: dict) -> tuple[float, float | None]:
@@ -149,7 +157,7 @@ def production_predict(
         member_w.extend([w] * len(vals))
     raw_p = _raw_p(flat, threshold, direction, threshold_high, member_w if weights else None)
 
-    return _shrink(raw_p, _days_to_res(trade), _spread(breakdown))
+    return _shrink(raw_p, _days_to_res(trade), _spread(breakdown), _market_yes_price(trade))
 
 
 def baseline_config() -> BacktestConfig:
