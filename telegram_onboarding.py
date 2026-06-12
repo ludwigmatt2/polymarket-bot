@@ -220,8 +220,13 @@ async def onboarding_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> in
 
     if tb.is_authorized(uid):
         role = tb.get_role(uid)
+        mode = tb.get_mode(uid)
         await update.message.reply_text(
-            f"👋 *Polymarket Bot*\nRole: `{role}`\n\nUse the buttons or type /help.",
+            f"👋 *Polymarket Weather Bot*\n"
+            f"Role: `{role}` · Mode: {mode}\n\n"
+            f"The bot scans weather prediction markets twice daily, runs a calibrated "
+            f"ensemble forecast model, and mirrors signals to your account.\n\n"
+            f"Use the buttons below or type /help for all commands.",
             reply_markup=tb.main_kb(uid),
             parse_mode="Markdown",
         )

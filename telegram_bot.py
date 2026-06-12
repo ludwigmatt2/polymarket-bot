@@ -1257,6 +1257,43 @@ async def check_alerts(ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+_USER_COMMANDS = [
+    ("help",        "All commands & usage"),
+    ("status",      "Portfolio overview: return %, win rate, gates"),
+    ("wallet",      "Balance, deployed capital & PnL breakdown"),
+    ("positions",   "Open trades grouped by date & city"),
+    ("trades",      "Last resolved trades"),
+    ("signals",     "Signals from the last scan"),
+    ("why",         "Full reasoning behind a trade"),
+    ("scanreport",  "Scan funnel: fetched → gates → taken"),
+    ("losses",      "Losing trades with causes"),
+    ("deposit",     "Record a deposit"),
+    ("withdraw",    "Record a withdrawal"),
+    ("scan",        "Trigger a market scan"),
+    ("resolve",     "Auto-resolve pending trades"),
+    ("mymode",      "View or change trading mode (paper/live)"),
+    ("wallet_setup","Create or connect your trading wallet"),
+]
+
+_ADMIN_COMMANDS = _USER_COMMANDS + [
+    ("invite",      "Generate an invite link"),
+    ("adduser",     "Add a user by Telegram ID"),
+    ("removeuser",  "Remove a user"),
+    ("users",       "List all registered users"),
+    ("setup",       "Save credentials (legacy)"),
+]
+
+async def _register_commands(app) -> None:
+    from telegram import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeChat
+    user_cmds  = [BotCommand(c, d) for c, d in _USER_COMMANDS]
+    admin_cmds = [BotCommand(c, d) for c, d in _ADMIN_COMMANDS]
+    await app.bot.set_my_commands(user_cmds, scope=BotCommandScopeAllPrivateChats())
+    try:
+        await app.bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(ADMIN_ID))
+    except Exception:
+        pass  # admin not yet started the chat — will update on next restart
+
+
 async def _run() -> None:
     _seed_admin()
     _migrate_global_wallet()
@@ -1296,6 +1333,7 @@ async def _run() -> None:
 
     async with app:
         await app.start()
+        await _register_commands(app)
         app.job_queue.run_repeating(check_alerts, interval=120, first=10)
         await app.updater.start_polling(drop_pending_updates=True)
         print("Polymarket Bot online.", flush=True)
