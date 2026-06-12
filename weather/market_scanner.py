@@ -167,6 +167,8 @@ class WeatherMarketScanner:
         self._poly = poly if poly is not None else self._make_default_poly()
         self._weather_client = weather_client or WeatherClient()
         self._geocache: dict[str, Location | None] = {}
+        # Funnel counts from the most recent scan() — consumed by /scanreport.
+        self.last_funnel: dict[str, int] = {}
 
     @staticmethod
     def _make_default_poly():
@@ -240,6 +242,12 @@ class WeatherMarketScanner:
         for wm in tradeable:
             wm.book_depth_usd = self._fetch_book_depth_usd(wm.market_id, wm.yes_price)
         print(f"    tradeable after filters: {len(tradeable)} / {len(parsed)}")
+        self.last_funnel = {
+            "fetched": len(raw_markets),
+            "parsed": len(parsed),
+            "unparseable": len(unparseable),
+            "tradeable": len(tradeable),
+        }
         return tradeable
 
     def _search_keywords(self) -> list[_GammaMarket]:

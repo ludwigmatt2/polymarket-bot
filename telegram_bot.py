@@ -58,18 +58,17 @@ def user_signals_file(uid: int) -> Path:
 def user_resolved_file(uid: int) -> Path:
     return user_log_dir(uid) / "last_resolved.json"
 
-# Fallback to root logs/ when per-user files don't exist (launchd writes there)
+# The admin's data IS the root logs/ (the scan runs there; fan-out mirrors to
+# everyone else). Non-admin users never fall back to root — a fresh user must
+# see an empty slate, not the owner's portfolio.
 def _trades_csv_path(uid: int) -> Path:
-    p = user_trades_csv(uid)
-    return p if p.exists() else ROOT / "logs" / "paper_trades.csv"
+    return ROOT / "logs" / "paper_trades.csv" if uid == ADMIN_ID else user_trades_csv(uid)
 
 def _signals_path(uid: int) -> Path:
-    p = user_signals_file(uid)
-    return p if p.exists() else ROOT / "logs" / "last_signals.json"
+    return ROOT / "logs" / "last_signals.json" if uid == ADMIN_ID else user_signals_file(uid)
 
 def _resolved_path(uid: int) -> Path:
-    p = user_resolved_file(uid)
-    return p if p.exists() else ROOT / "logs" / "last_resolved.json"
+    return ROOT / "logs" / "last_resolved.json" if uid == ADMIN_ID else user_resolved_file(uid)
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -158,26 +157,39 @@ def require_auth(admin_only: bool = False):
     return decorator
 
 
-# ── Wallet ────────────────────────────────────────────────────────────────────
+# ── Wallet (per-user ledger; audit C3) ───────────────────────────────────────
 
-def read_wallet() -> dict:
-    if not WALLET_FILE.exists():
+def user_wallet_file(uid: int) -> Path:
+    return user_log_dir(uid) / "wallet.json"
+
+def _migrate_global_wallet() -> None:
+    """One-time: move the legacy global ledger to the admin's per-user file."""
+    admin_wallet = user_wallet_file(ADMIN_ID)
+    if WALLET_FILE.exists() and not admin_wallet.exists():
+        admin_wallet.parent.mkdir(parents=True, exist_ok=True)
+        admin_wallet.write_text(WALLET_FILE.read_text())
+        WALLET_FILE.rename(WALLET_FILE.with_suffix(".json.pre_per_user_migration"))
+
+def read_wallet(uid: int) -> dict:
+    f = user_wallet_file(uid)
+    if not f.exists():
         return {"transactions": []}
-    return json.loads(WALLET_FILE.read_text())
+    return json.loads(f.read_text())
 
-def append_wallet_transaction(tx_type: str, amount: float, note: str = "") -> None:
-    data = read_wallet()
+def append_wallet_transaction(uid: int, tx_type: str, amount: float, note: str = "") -> None:
+    data = read_wallet(uid)
     data["transactions"].append({
         "type": tx_type,
         "amount": amount,
         "timestamp": datetime.utcnow().isoformat(),
         "note": note,
     })
-    WALLET_FILE.parent.mkdir(exist_ok=True)
-    atomic_write_text(WALLET_FILE, json.dumps(data, indent=2))
+    f = user_wallet_file(uid)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(f, json.dumps(data, indent=2))
 
 def wallet_stats(uid: int) -> dict:
-    txns = read_wallet().get("transactions", [])
+    txns = read_wallet(uid).get("transactions", [])
     deposited = sum(t["amount"] for t in txns if t["type"] == "deposit")
     withdrawn = sum(t["amount"] for t in txns if t["type"] == "withdraw")
 
@@ -398,7 +410,7 @@ def fmt_status(uid: int) -> str:
 def fmt_wallet(uid: int) -> str:
     ws   = wallet_stats(uid)
     mode = get_mode(uid)
-    txns = read_wallet().get("transactions", [])
+    txns = read_wallet(uid).get("transactions", [])
 
     lines = [f"*💼 Wallet* — {mode}\n"]
 
@@ -589,34 +601,32 @@ def confirm_kb(action: str, label: str) -> InlineKeyboardMarkup:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+# One scan serves all users (one model, fan-out mirrors results). The lock keeps
+# concurrent /scan presses from spawning parallel subprocesses that would hammer
+# the forecast APIs and race on the CSVs.
+_bot_run_lock = asyncio.Lock()
+
 async def run_bot_async(mode: str, uid: int) -> tuple[str, str, int]:
-    """Run weather_bot.py async for a specific user."""
-    log_dir = user_log_dir(uid)
-    log_dir.mkdir(parents=True, exist_ok=True)
-    args = [PYTHON, "weather_bot.py", "--mode", mode, "--log-dir", str(log_dir)]
-    if mode == "paper":
-        args += ["--interval", "0"]
-    env = os.environ.copy()
-    # Prefer encrypted secrets backend; fall back to legacy plaintext in users.json
-    private_key = get_user_key(uid) or get_user_private_key(uid)
-    if private_key:
-        env["POLYMARKET_PRIVATE_KEY"] = private_key
-        proxy = _load_users().get(uid, {}).get("proxy_address")
-        if proxy:
-            env["POLYMARKET_PROXY_ADDRESS"] = proxy
-    proc = await asyncio.create_subprocess_exec(
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=ROOT,
-        env=env,
-    )
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
-    except asyncio.TimeoutError:
-        proc.kill()
-        return "", "Timed out after 300s.", -1
-    return stdout.decode(), stderr.decode(), proc.returncode or 0
+    """Run weather_bot.py globally: root scan/resolve + fan-out to all users."""
+    if _bot_run_lock.locked():
+        return "", "A scan or resolve is already running — try again in a minute.", -2
+    async with _bot_run_lock:
+        args = [PYTHON, "weather_bot.py", "--mode", mode, "--all-users"]
+        if mode == "paper":
+            args += ["--interval", "0"]
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=ROOT,
+            env=os.environ.copy(),
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return "", "Timed out after 300s.", -1
+        return stdout.decode(), stderr.decode(), proc.returncode or 0
 
 
 # ── Command handlers ───────────────────────────────────────────────────────────
@@ -702,7 +712,7 @@ async def cmd_trades(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         fmt_trades(uid, n), reply_markup=main_kb(uid), parse_mode="Markdown",
     )
 
-@require_auth(admin_only=True)
+@require_auth()
 async def cmd_deposit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Record a deposit. Usage: /deposit <amount> [note]"""
     if not ctx.args:
@@ -720,7 +730,7 @@ async def cmd_deposit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Amount must be a positive finite number.")
         return
     note = " ".join(ctx.args[1:]) if len(ctx.args) > 1 else ""
-    append_wallet_transaction("deposit", amount, note)
+    append_wallet_transaction(update.effective_user.id, "deposit", amount, note)
     ws = wallet_stats(update.effective_user.id)
     await update.message.reply_text(
         f"✅ *Deposit recorded:* +${amount:,.2f}\n"
@@ -729,7 +739,7 @@ async def cmd_deposit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
 
-@require_auth(admin_only=True)
+@require_auth()
 async def cmd_withdraw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Record a withdrawal. Usage: /withdraw <amount> [note]"""
     if not ctx.args:
@@ -747,7 +757,7 @@ async def cmd_withdraw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Amount must be a positive finite number.")
         return
     note = " ".join(ctx.args[1:]) if len(ctx.args) > 1 else ""
-    append_wallet_transaction("withdraw", amount, note)
+    append_wallet_transaction(update.effective_user.id, "withdraw", amount, note)
     ws = wallet_stats(update.effective_user.id)
     await update.message.reply_text(
         f"✅ *Withdrawal recorded:* -${amount:,.2f}\n"
@@ -761,7 +771,9 @@ async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     msg = await update.effective_message.reply_text("🔍 Scanning Polymarket...")
     stdout, stderr, rc = await run_bot_async("paper", uid)
-    if rc != 0:
+    if rc == -2:
+        await msg.edit_text(f"⏳ {stderr}", reply_markup=main_kb(uid))
+    elif rc != 0:
         err = (stderr or stdout or "Unknown error")[-300:].strip()
         await msg.edit_text(
             f"❌ Scan failed\n```\n{err}\n```", reply_markup=main_kb(uid), parse_mode="Markdown"
@@ -775,7 +787,9 @@ async def cmd_resolve(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     msg = await update.effective_message.reply_text("⏳ Running auto-resolve...")
     stdout, stderr, rc = await run_bot_async("auto-resolve", uid)
-    if rc != 0:
+    if rc == -2:
+        await msg.edit_text(f"⏳ {stderr}", reply_markup=main_kb(uid))
+    elif rc != 0:
         err = (stderr or stdout or "Unknown error")[-300:].strip()
         await msg.edit_text(
             f"❌ Resolve failed\n```\n{err}\n```", reply_markup=main_kb(uid), parse_mode="Markdown"
@@ -944,7 +958,9 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif data == "scan_confirm":
         await q.edit_message_text("🔍 Scanning Polymarket...")
         stdout, stderr, rc = await run_bot_async("paper", uid)
-        if rc != 0:
+        if rc == -2:
+            await q.edit_message_text(f"⏳ {stderr}", reply_markup=main_kb(uid))
+        elif rc != 0:
             err = (stderr or stdout or "Unknown error")[-300:].strip()
             await q.edit_message_text(
                 f"❌ Scan failed\n```\n{err}\n```", reply_markup=main_kb(uid), parse_mode="Markdown"
@@ -961,7 +977,9 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif data == "resolve_confirm":
         await q.edit_message_text("⏳ Running auto-resolve...")
         stdout, stderr, rc = await run_bot_async("auto-resolve", uid)
-        if rc != 0:
+        if rc == -2:
+            await q.edit_message_text(f"⏳ {stderr}", reply_markup=main_kb(uid))
+        elif rc != 0:
             err = (stderr or stdout or "Unknown error")[-300:].strip()
             await q.edit_message_text(
                 f"❌ Resolve failed\n```\n{err}\n```", reply_markup=main_kb(uid), parse_mode="Markdown"
@@ -1076,6 +1094,7 @@ async def check_alerts(ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _run() -> None:
     _seed_admin()
+    _migrate_global_wallet()
 
     app = Application.builder().token(BOT_TOKEN).build()
 

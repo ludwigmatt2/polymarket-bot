@@ -54,6 +54,7 @@ def run_scan(
     log_dir: Path = Path("logs"),
     monitor: PositionMonitor | None = None,
     live_trader: "LiveTrader | None" = None,
+    all_users: bool = False,
 ) -> list[Signal]:
     """Single scan cycle: find markets → evaluate signals → optionally log or execute."""
     print("  [1/3] Scanning Polymarket for weather markets...", end=" ", flush=True)
@@ -90,7 +91,11 @@ def run_scan(
         print(f"{sum(1 for t in logged if t)} logged")
 
     _print_scan_summary(signals, actionable, rejected)
-    _write_signals_file(actionable, log_dir)
+    funnel = _build_funnel(scanner, signals, actionable, rejected)
+    _write_signals_file(actionable, log_dir, funnel)
+
+    if all_users:
+        fan_out_to_users(actionable, funnel)
 
     if monitor is not None:
         print("  [4/4] Checking open positions (mark-to-model)...", end=" ", flush=True)
@@ -103,11 +108,104 @@ def run_scan(
     return signals
 
 
-def _write_signals_file(actionable: list[Signal], log_dir: Path = Path("logs")) -> None:
+USERS_FILE = Path(__file__).parent / "config" / "users.json"
+
+
+def _load_registered_users() -> dict[int, dict]:
+    """Read config/users.json directly (no telegram import — runs under launchd)."""
+    import json
+    import os
+    if not USERS_FILE.exists():
+        return {}
+    try:
+        users = {int(k): v for k, v in json.loads(USERS_FILE.read_text()).items()}
+    except (ValueError, json.JSONDecodeError):
+        return {}
+    # The admin IS the root log — fan-out only mirrors to everyone else.
+    admin_id = os.environ.get("TELEGRAM_ADMIN_ID", "")
+    return {uid: u for uid, u in users.items() if str(uid) != admin_id}
+
+
+def fan_out_to_users(actionable: list[Signal], funnel: dict | None = None) -> None:
+    """
+    Mirror the already-computed signals to each registered user's log dir.
+
+    One model, separate money: the scan/model ran once at root; this only applies
+    per-user context (their CSV, their signals file). Live execution per user is
+    layered on in the live fan-out path. Never touches calibration.
+    """
+    users = _load_registered_users()
+    if not users:
+        return
+    print(f"  Fan-out: mirroring {len(actionable)} signal(s) to {len(users)} user(s)...")
+    for uid in users:
+        user_dir = Path("logs") / "users" / str(uid)
+        try:
+            user_dir.mkdir(parents=True, exist_ok=True)
+            user_paper = PaperTrader(log_path=user_dir / "paper_trades.csv")
+            for s in actionable:
+                user_paper.log_trade(s)
+            _write_signals_file(actionable, user_dir, funnel)
+        except Exception as e:
+            print(f"    ✗ fan-out failed for user {uid}: {e}", file=sys.stderr)
+
+
+def fan_out_auto_resolve(client: WeatherClient) -> None:
+    """
+    Resolve every registered user's paper trades. model=None is mandatory:
+    outcomes feed calibration_log.csv exactly once, via the root resolve.
+    """
+    users = _load_registered_users()
+    for uid in users:
+        user_dir = Path("logs") / "users" / str(uid)
+        trades_csv = user_dir / "paper_trades.csv"
+        if not trades_csv.exists():
+            continue
+        try:
+            user_paper = PaperTrader(log_path=trades_csv)
+            resolved, skipped = user_paper.auto_resolve(client, model=None)
+            if resolved:
+                _write_resolved_file(user_paper, resolved, user_dir)
+            print(f"  User {uid}: auto-resolved {resolved} trade(s).  {skipped} skipped.")
+        except Exception as e:
+            print(f"    ✗ resolve failed for user {uid}: {e}", file=sys.stderr)
+
+
+def _build_funnel(
+    scanner: WeatherMarketScanner,
+    signals: list[Signal],
+    actionable: list[Signal],
+    rejected: list[Signal],
+) -> dict:
+    """Scan funnel for /scanreport: fetched → parsed → evaluated → gates → actionable."""
+    rejections: dict[str, int] = {}
+    for s in rejected:
+        key = s.rejection_reason.split(":")[0] if s.rejection_reason else "unknown"
+        rejections[key] = rejections.get(key, 0) + 1
+    top_rejected = [
+        {
+            "title": s.market.title,
+            "reason": s.rejection_reason or "unknown",
+            "edge_pp": s.edge_pp,
+        }
+        for s in sorted(rejected, key=lambda x: abs(x.edge_pp), reverse=True)[:10]
+    ]
+    return {
+        **scanner.last_funnel,
+        "evaluated": len(signals),
+        "actionable": len(actionable),
+        "rejections": dict(sorted(rejections.items(), key=lambda x: -x[1])),
+        "top_rejected": top_rejected,
+    }
+
+
+def _write_signals_file(
+    actionable: list[Signal], log_dir: Path = Path("logs"), funnel: dict | None = None,
+) -> None:
     import json
     log_dir.mkdir(parents=True, exist_ok=True)
     out = log_dir / "last_signals.json"
-    out.write_text(json.dumps({
+    payload = {
         "scanned_at": datetime.utcnow().isoformat(),
         "signals": [
             {
@@ -120,7 +218,10 @@ def _write_signals_file(actionable: list[Signal], log_dir: Path = Path("logs")) 
             }
             for s in sorted(actionable, key=lambda x: x.edge_pp, reverse=True)
         ],
-    }))
+    }
+    if funnel:
+        payload["funnel"] = funnel
+    out.write_text(json.dumps(payload))
 
 
 def _write_resolved_file(paper: "PaperTrader", resolved_count: int, log_dir: Path = Path("logs")) -> None:
@@ -502,6 +603,9 @@ def main() -> None:
                         help="Market search source: gamma (REST) or clob (pmxt sidecar) (default: gamma)")
     parser.add_argument("--log-dir", type=Path, default=Path("logs"),
                         help="Directory for trade logs and signal files (default: logs/)")
+    parser.add_argument("--all-users", action="store_true",
+                        help="After the root scan/resolve, mirror results to every "
+                             "registered user's log dir (config/users.json)")
     args = parser.parse_args()
 
     log_dir: Path = args.log_dir
@@ -538,6 +642,9 @@ def main() -> None:
             live_trader = LiveTrader(paper_trader=paper, bankroll_usd=0, log_path=live_log)
             live_resolved, live_skipped = live_trader.auto_resolve(client, model=model)
             print(f"  Live:  auto-resolved {live_resolved} trade(s).  {live_skipped} skipped.")
+
+        if args.all_users:
+            fan_out_auto_resolve(client)
 
         return
 
@@ -619,7 +726,8 @@ def main() -> None:
 
     # paper / live mode — one-shot (interval=0) or continuous
     if args.interval == 0:
-        run_scan(scanner, generator, paper, log_dir, monitor, live_trader=live_trader)
+        run_scan(scanner, generator, paper, log_dir, monitor, live_trader=live_trader,
+                 all_users=args.all_users)
         return
 
     mode_label = "live" if args.mode == "live" else "paper"
@@ -629,7 +737,8 @@ def main() -> None:
         scan_count += 1
         print(f"─── Scan #{scan_count} ────────────────────────────────────────────")
         try:
-            run_scan(scanner, generator, paper, log_dir, monitor, live_trader=live_trader)
+            run_scan(scanner, generator, paper, log_dir, monitor, live_trader=live_trader,
+                     all_users=args.all_users)
         except RuntimeError:
             # Hard halt from live_trader (kill switch or gate failure) — exit cleanly
             sys.exit(1)
