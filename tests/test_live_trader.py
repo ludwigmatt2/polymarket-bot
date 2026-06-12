@@ -272,3 +272,63 @@ class TestIdempotency:
         keys = json.loads(trader._idempotency_path.read_text())
         today = date.today().isoformat()
         assert f"mkt_newkey:YES:{today}" in keys
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — per-user constructor credentials
+# ---------------------------------------------------------------------------
+
+class TestPerUserCredentials:
+    def test_constructor_creds_take_precedence_over_env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("POLYMARKET_PRIVATE_KEY", "0xenvkey")
+        monkeypatch.setenv("POLYMARKET_PROXY_ADDRESS", "0xenvproxy")
+        captured = {}
+
+        class FakePmxt:
+            @staticmethod
+            def Polymarket(**kwargs):
+                captured.update(kwargs)
+                return MagicMock()
+
+        monkeypatch.setitem(__import__("sys").modules, "pmxt", FakePmxt)
+        trader = LiveTrader(
+            paper_trader=MagicMock(), bankroll_usd=100,
+            log_path=tmp_path / "lt.csv", idempotency_path=tmp_path / "id.json",
+            private_key="0xuserkey", proxy_address="0xuserproxy",
+            signature_type="gnosis-safe",
+        )
+        trader._get_poly()
+        assert captured == {
+            "private_key": "0xuserkey",
+            "proxy_address": "0xuserproxy",
+            "signature_type": "gnosis-safe",
+        }
+
+    def test_env_fallback_preserved(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("POLYMARKET_PRIVATE_KEY", "0xenvkey")
+        monkeypatch.delenv("POLYMARKET_PROXY_ADDRESS", raising=False)
+        captured = {}
+
+        class FakePmxt:
+            @staticmethod
+            def Polymarket(**kwargs):
+                captured.update(kwargs)
+                return MagicMock()
+
+        monkeypatch.setitem(__import__("sys").modules, "pmxt", FakePmxt)
+        trader = LiveTrader(
+            paper_trader=MagicMock(), bankroll_usd=100,
+            log_path=tmp_path / "lt.csv", idempotency_path=tmp_path / "id.json",
+        )
+        trader._get_poly()
+        assert captured["private_key"] == "0xenvkey"
+        assert captured["signature_type"] == "eoa"
+
+    def test_no_key_anywhere_raises(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("POLYMARKET_PRIVATE_KEY", raising=False)
+        trader = LiveTrader(
+            paper_trader=MagicMock(), bankroll_usd=100,
+            log_path=tmp_path / "lt.csv", idempotency_path=tmp_path / "id.json",
+        )
+        with pytest.raises(RuntimeError, match="private key"):
+            trader._get_poly()

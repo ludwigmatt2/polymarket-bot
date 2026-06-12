@@ -51,12 +51,19 @@ class LiveTrader:
         fill_poll_delay: float = 2.0,
         log_path: Path = LIVE_TRADES_LOG,
         idempotency_path: Path = _IDEMPOTENCY_FILE,
+        private_key: str | None = None,
+        proxy_address: str | None = None,
+        signature_type: str | None = None,
     ):
         self.paper_trader = paper_trader
         self.bankroll_usd = bankroll_usd
         self._fill_poll_delay = fill_poll_delay  # override to 0 in tests
         self._log_path = log_path
         self._idempotency_path = idempotency_path
+        # Per-user credentials; env vars remain the fallback (owner's flow)
+        self._private_key = private_key
+        self._proxy_address = proxy_address
+        self._signature_type = signature_type
         self._poly: Any = None
 
     def is_unlocked(self) -> bool:
@@ -303,17 +310,17 @@ class LiveTrader:
     def _get_poly(self) -> Any:
         if self._poly is not None:
             return self._poly
-        pk = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
-        proxy = os.environ.get("POLYMARKET_PROXY_ADDRESS", "")
+        pk = self._private_key or os.environ.get("POLYMARKET_PRIVATE_KEY", "")
+        proxy = self._proxy_address or os.environ.get("POLYMARKET_PROXY_ADDRESS", "")
         if not pk or pk in ("0x...", ""):
             raise RuntimeError(
-                "POLYMARKET_PRIVATE_KEY not set — add it to .env before going live"
+                "No private key — pass one to LiveTrader or set POLYMARKET_PRIVATE_KEY in .env"
             )
         import pmxt
         self._poly = pmxt.Polymarket(
             private_key=pk,
             proxy_address=proxy or None,
-            signature_type="gnosis-safe" if proxy else "eoa",
+            signature_type=self._signature_type or ("gnosis-safe" if proxy else "eoa"),
         )
         return self._poly
 

@@ -175,3 +175,88 @@ class TestRegisteredUsers:
         bad.write_text("{not json")
         monkeypatch.setattr(weather_bot, "USERS_FILE", bad)
         assert weather_bot._load_registered_users() == {}
+
+
+class TestLiveFanOut:
+    def _users(self, fanout_env, mode="live", confirmed=True):
+        users_file = fanout_env / "config" / "users.json"
+        users_file.write_text(json.dumps({
+            ADMIN_ID: {"role": "admin", "mode": "paper"},
+            USER_A: {
+                "role": "viewer", "mode": mode,
+                **({"live_confirmed_at": "2026-06-12T00:00:00"} if confirmed else {}),
+            },
+        }))
+
+    def test_live_branch_requires_mode_and_confirmation(self, fanout_env, monkeypatch):
+        executed = []
+        monkeypatch.setattr(
+            weather_bot, "_execute_live_for_user",
+            lambda uid, *a, **k: executed.append(uid),
+        )
+        # paper mode → no live
+        self._users(fanout_env, mode="paper")
+        weather_bot.fan_out_to_users([_make_signal()], funnel=None)
+        assert executed == []
+        # live but unconfirmed → no live
+        self._users(fanout_env, mode="live", confirmed=False)
+        weather_bot.fan_out_to_users([_make_signal("mkt-2")], funnel=None)
+        assert executed == []
+        # live + confirmed → executes
+        self._users(fanout_env, mode="live", confirmed=True)
+        weather_bot.fan_out_to_users([_make_signal("mkt-3")], funnel=None)
+        assert executed == [int(USER_A)]
+
+    def test_missing_key_writes_halt_and_skips(self, fanout_env, monkeypatch):
+        monkeypatch.setattr("weather.secrets.get_user_key", lambda uid: None)
+        user_dir = fanout_env / "logs" / "users" / USER_A
+        user_dir.mkdir(parents=True)
+        weather_bot._execute_live_for_user(
+            int(USER_A), {"mode": "live"}, user_dir, object(), [_make_signal()],
+        )
+        halt = json.loads((user_dir / "live_halt.json").read_text())
+        assert "key unavailable" in halt["reason"]
+
+    def test_kill_switch_halts_user_but_not_loop(self, fanout_env, monkeypatch):
+        from weather.live_trader import LiveTrader
+
+        monkeypatch.setattr("weather.secrets.get_user_key", lambda uid: "0xkey")
+        monkeypatch.setattr(LiveTrader, "fetch_balance", lambda self: 500.0)
+
+        calls = []
+
+        def explode(self, signal):
+            calls.append(signal.market.market_id)
+            raise RuntimeError("Daily loss limit hit")
+
+        monkeypatch.setattr(LiveTrader, "execute_signal", explode)
+        user_dir = fanout_env / "logs" / "users" / USER_A
+        user_dir.mkdir(parents=True)
+        signals = [_make_signal("mkt-1"), _make_signal("mkt-2")]
+        # Must not raise — the halt is contained to this user
+        weather_bot._execute_live_for_user(
+            int(USER_A), {"mode": "live"}, user_dir, object(), signals,
+        )
+        assert calls == ["mkt-1"], "halt must stop after the first RuntimeError"
+        halt = json.loads((user_dir / "live_halt.json").read_text())
+        assert "Daily loss limit" in halt["reason"]
+
+    def test_ledger_caps_bankroll(self, fanout_env, monkeypatch):
+        from weather.live_trader import LiveTrader
+
+        monkeypatch.setattr("weather.secrets.get_user_key", lambda uid: "0xkey")
+        monkeypatch.setattr(LiveTrader, "fetch_balance", lambda self: 500.0)
+        seen = {}
+        monkeypatch.setattr(
+            LiveTrader, "execute_signal",
+            lambda self, s: seen.setdefault("bankroll", self.bankroll_usd),
+        )
+        user_dir = fanout_env / "logs" / "users" / USER_A
+        user_dir.mkdir(parents=True)
+        (user_dir / "wallet.json").write_text(json.dumps({
+            "transactions": [{"type": "deposit", "amount": 200.0}],
+        }))
+        weather_bot._execute_live_for_user(
+            int(USER_A), {"mode": "live"}, user_dir, object(), [_make_signal()],
+        )
+        assert seen["bankroll"] == 200.0, "ledger net deposits must cap the bankroll"

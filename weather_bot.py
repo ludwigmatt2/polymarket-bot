@@ -128,17 +128,19 @@ def _load_registered_users() -> dict[int, dict]:
 
 def fan_out_to_users(actionable: list[Signal], funnel: dict | None = None) -> None:
     """
-    Mirror the already-computed signals to each registered user's log dir.
+    Mirror the already-computed signals to each registered user's log dir, and
+    execute live orders for users in live mode.
 
     One model, separate money: the scan/model ran once at root; this only applies
-    per-user context (their CSV, their signals file). Live execution per user is
-    layered on in the live fan-out path. Never touches calibration.
+    per-user context (their CSV, their signals file, their wallet for live).
+    Never touches calibration. One user's failure never blocks the others.
     """
     users = _load_registered_users()
     if not users:
         return
     print(f"  Fan-out: mirroring {len(actionable)} signal(s) to {len(users)} user(s)...")
-    for uid in users:
+    root_paper = PaperTrader()  # global gate: one model, one track record
+    for uid, user in users.items():
         user_dir = Path("logs") / "users" / str(uid)
         try:
             user_dir.mkdir(parents=True, exist_ok=True)
@@ -148,27 +150,120 @@ def fan_out_to_users(actionable: list[Signal], funnel: dict | None = None) -> No
             _write_signals_file(actionable, user_dir, funnel)
         except Exception as e:
             print(f"    ✗ fan-out failed for user {uid}: {e}", file=sys.stderr)
+            continue
+
+        if user.get("mode") == "live" and user.get("live_confirmed_at") and actionable:
+            _execute_live_for_user(uid, user, user_dir, root_paper, actionable)
+
+
+def _write_live_halt(user_dir: Path, reason: str) -> None:
+    """Persist a per-user live halt for the Telegram bot's check_alerts to surface."""
+    import json
+    (user_dir / "live_halt.json").write_text(json.dumps({
+        "halted_at": datetime.utcnow().isoformat(),
+        "reason": reason,
+    }))
+
+
+def _user_ledger_cap(user_dir: Path) -> float | None:
+    """Net deposits from the user's manual ledger, as a bankroll cap (None = no ledger)."""
+    import json
+    wallet_file = user_dir / "wallet.json"
+    if not wallet_file.exists():
+        return None
+    try:
+        txns = json.loads(wallet_file.read_text()).get("transactions", [])
+    except (json.JSONDecodeError, OSError):
+        return None
+    net = sum(t["amount"] for t in txns if t.get("type") == "deposit") \
+        - sum(t["amount"] for t in txns if t.get("type") == "withdraw")
+    return net if net > 0 else None
+
+
+def _execute_live_for_user(
+    uid: int, user: dict, user_dir: Path, root_paper: PaperTrader, actionable: list[Signal],
+) -> None:
+    """Execute the shared signals with this user's wallet. Failures stay per-user."""
+    from weather.secrets import get_user_key
+
+    pk = get_user_key(uid)
+    if not pk:
+        # Keychain locked (e.g. reboot without login) or key never stored.
+        _write_live_halt(user_dir, "private key unavailable — skipped live execution")
+        print(f"    ⚠ user {uid}: no key available, live skipped", file=sys.stderr)
+        return
+
+    trader = LiveTrader(
+        paper_trader=root_paper,  # global gate; per-user paper already mirrored
+        bankroll_usd=0.0,
+        log_path=user_dir / "live_trades.csv",
+        idempotency_path=user_dir / "live_idempotency.json",
+        private_key=pk,
+        proxy_address=user.get("proxy_address"),
+        signature_type=user.get("signature_type"),
+    )
+    try:
+        balance = trader.fetch_balance()
+    except Exception as e:
+        _write_live_halt(user_dir, f"balance fetch failed: {e}")
+        print(f"    ⚠ user {uid}: balance fetch failed ({e}), live skipped", file=sys.stderr)
+        return
+    if balance < 1.0:
+        print(f"    – user {uid}: balance ${balance:.2f} too small, live skipped")
+        return
+    ledger_cap = _user_ledger_cap(user_dir)
+    trader.bankroll_usd = min(balance, ledger_cap) if ledger_cap else balance
+
+    print(f"    user {uid}: LIVE, bankroll=${trader.bankroll_usd:.2f}, "
+          f"{len(actionable)} signal(s)")
+    for s in actionable:
+        try:
+            result = trader.execute_signal(s)
+            if result:
+                print(f"      ✓ {s.market.title[:50]} | {s.direction} "
+                      f"${result['size_usd']:.2f} order={result['order_id'][:10]}")
+        except RuntimeError as e:
+            # Hard halt (kill switch / gates) — stop THIS user, never the others.
+            _write_live_halt(user_dir, str(e))
+            print(f"    ⛔ user {uid} live halt: {e}", file=sys.stderr)
+            return
+        except Exception as e:
+            print(f"      ✗ user {uid}: order failed: {e}", file=sys.stderr)
 
 
 def fan_out_auto_resolve(client: WeatherClient) -> None:
     """
-    Resolve every registered user's paper trades. model=None is mandatory:
-    outcomes feed calibration_log.csv exactly once, via the root resolve.
+    Resolve every registered user's paper AND live trades. model=None is
+    mandatory: outcomes feed calibration_log.csv exactly once, via the root resolve.
     """
     users = _load_registered_users()
     for uid in users:
         user_dir = Path("logs") / "users" / str(uid)
         trades_csv = user_dir / "paper_trades.csv"
-        if not trades_csv.exists():
-            continue
-        try:
-            user_paper = PaperTrader(log_path=trades_csv)
-            resolved, skipped = user_paper.auto_resolve(client, model=None)
-            if resolved:
-                _write_resolved_file(user_paper, resolved, user_dir)
-            print(f"  User {uid}: auto-resolved {resolved} trade(s).  {skipped} skipped.")
-        except Exception as e:
-            print(f"    ✗ resolve failed for user {uid}: {e}", file=sys.stderr)
+        if trades_csv.exists():
+            try:
+                user_paper = PaperTrader(log_path=trades_csv)
+                resolved, skipped = user_paper.auto_resolve(client, model=None)
+                if resolved:
+                    _write_resolved_file(user_paper, resolved, user_dir)
+                print(f"  User {uid}: auto-resolved {resolved} trade(s).  {skipped} skipped.")
+            except Exception as e:
+                print(f"    ✗ resolve failed for user {uid}: {e}", file=sys.stderr)
+
+        live_csv = user_dir / "live_trades.csv"
+        if live_csv.exists():
+            try:
+                user_live = LiveTrader(
+                    paper_trader=PaperTrader(log_path=trades_csv),
+                    bankroll_usd=0,
+                    log_path=live_csv,
+                    idempotency_path=user_dir / "live_idempotency.json",
+                )
+                live_resolved, live_skipped = user_live.auto_resolve(client, model=None)
+                print(f"  User {uid} live: auto-resolved {live_resolved} trade(s).  "
+                      f"{live_skipped} skipped.")
+            except Exception as e:
+                print(f"    ✗ live resolve failed for user {uid}: {e}", file=sys.stderr)
 
 
 def _build_funnel(

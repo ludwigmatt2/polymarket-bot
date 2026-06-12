@@ -1136,7 +1136,10 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 _seen_signals_mtimes:  dict[int, float] = {}
 _seen_resolved_mtimes: dict[int, float] = {}
+_seen_halt_mtimes:     dict[int, float] = {}
 _seen_alarm_mtime: float = 0.0
+# Halt files older than bot start are history, not news — don't replay on restart.
+_BOT_START_TS = datetime.now().timestamp()
 _SCANNER_ALARM_LOG = Path("logs/scanner_alarm.csv")
 
 async def check_alerts(ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1169,6 +1172,31 @@ async def check_alerts(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     for uid in all_user_ids():
         signals_file  = _signals_path(uid)
         resolved_file = _resolved_path(uid)
+
+        # Live-halt alert: weather_bot writes live_halt.json when a user's live
+        # execution stops (kill switch, missing key, balance failure). Tell the
+        # user AND the admin — silence here means money sits idle unnoticed.
+        halt_file = user_log_dir(uid) / "live_halt.json"
+        if halt_file.exists():
+            mtime = halt_file.stat().st_mtime
+            if mtime > _seen_halt_mtimes.get(uid, 0.0):
+                _seen_halt_mtimes[uid] = mtime
+                if mtime >= _BOT_START_TS:
+                    try:
+                        halt = json.loads(halt_file.read_text())
+                        text = (
+                            f"⛔ *Live trading halted*\n"
+                            f"Reason: {halt.get('reason', '?')}\n"
+                            f"_{halt.get('halted_at', '')[:16]}_"
+                        )
+                        await bot.send_message(uid, text, parse_mode="Markdown")
+                        if uid != ADMIN_ID:
+                            await bot.send_message(
+                                ADMIN_ID, f"⛔ Live halt for user `{uid}`: "
+                                f"{halt.get('reason', '?')}", parse_mode="Markdown",
+                            )
+                    except Exception:
+                        pass
 
         # New signals alert
         if signals_file.exists():
