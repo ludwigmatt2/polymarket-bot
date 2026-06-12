@@ -1258,29 +1258,29 @@ async def check_alerts(ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 _USER_COMMANDS = [
-    ("help",        "All commands & usage"),
-    ("status",      "Portfolio overview: return %, win rate, gates"),
-    ("wallet",      "Balance, deployed capital & PnL breakdown"),
-    ("positions",   "Open trades grouped by date & city"),
-    ("trades",      "Last resolved trades"),
-    ("signals",     "Signals from the last scan"),
-    ("why",         "Full reasoning behind a trade"),
-    ("scanreport",  "Scan funnel: fetched → gates → taken"),
-    ("losses",      "Losing trades with causes"),
-    ("deposit",     "Record a deposit"),
-    ("withdraw",    "Record a withdrawal"),
-    ("scan",        "Trigger a market scan"),
-    ("resolve",     "Auto-resolve pending trades"),
-    ("mymode",      "View or change trading mode (paper/live)"),
-    ("wallet_setup","Create or connect your trading wallet"),
+    ("help",        "❓ All commands & usage"),
+    ("status",      "📊 Portfolio overview: return %, win rate, gates"),
+    ("wallet",      "💼 Balance, deployed capital & PnL breakdown"),
+    ("positions",   "📍 Open trades grouped by date & city"),
+    ("trades",      "📋 Last resolved trades"),
+    ("signals",     "🎯 Signals from the last scan"),
+    ("why",         "💡 Full reasoning behind a trade"),
+    ("scanreport",  "🔬 Scan funnel: fetched → gates → taken"),
+    ("losses",      "❌ Losing trades with causes"),
+    ("deposit",     "💰 Record a deposit"),
+    ("withdraw",    "💸 Record a withdrawal"),
+    ("scan",        "🔍 Trigger a market scan"),
+    ("resolve",     "✅ Auto-resolve pending trades"),
+    ("mymode",      "🔄 View or change trading mode (paper/live)"),
+    ("wallet_setup","🔧 Create or connect your trading wallet"),
 ]
 
 _ADMIN_COMMANDS = _USER_COMMANDS + [
-    ("invite",      "Generate an invite link"),
-    ("adduser",     "Add a user by Telegram ID"),
-    ("removeuser",  "Remove a user"),
-    ("users",       "List all registered users"),
-    ("setup",       "Save credentials (legacy)"),
+    ("invite",      "🎟 Generate an invite link"),
+    ("adduser",     "➕ Add a user by Telegram ID"),
+    ("removeuser",  "➖ Remove a user"),
+    ("users",       "👥 List all registered users"),
+    ("setup",       "⚙️ Save credentials (legacy)"),
 ]
 
 async def _register_commands(app) -> None:
