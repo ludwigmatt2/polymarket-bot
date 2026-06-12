@@ -658,16 +658,6 @@ async def run_bot_async(mode: str, uid: int) -> tuple[str, str, int]:
 # ── Command handlers ───────────────────────────────────────────────────────────
 
 @require_auth()
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid  = update.effective_user.id
-    role = get_role(uid)
-    await update.message.reply_text(
-        f"👋 *Polymarket Bot*\nRole: `{role}`\n\nUse the buttons or type /help.",
-        reply_markup=main_kb(uid),
-        parse_mode="Markdown",
-    )
-
-@require_auth()
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     lines = [
@@ -688,14 +678,16 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/scan — trigger a market scan",
         "/resolve — auto-resolve pending paper trades",
         "/mymode [paper|live] — view or change mode",
-        "/setup <key> [proxy] — save Polymarket credentials",
+        "/wallet\\_setup — create or connect your trading wallet",
     ]
     if is_admin(uid):
         lines += [
             "\n*Admin*",
+            "/invite [admin|viewer] — create an invite link",
             "/adduser <id> [admin|viewer] — add user",
             "/removeuser <id> — remove user",
             "/users — list users",
+            "/setup <key> [proxy] — save credentials (legacy)",
         ]
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -931,7 +923,13 @@ async def cmd_setup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     await update.message.reply_text(reply, parse_mode="Markdown")
 
-@require_auth(admin_only=True)
+def _global_gate_check() -> tuple[bool, list[str]]:
+    """One model, one track record: live unlocks on the ROOT paper log's gates."""
+    from weather.paper_trader import PaperTrader as _PT
+    stats = _PT(log_path=ROOT / "logs" / "paper_trades.csv").compute_stats()
+    return stats.ready_for_live, stats.failure_reasons
+
+@require_auth()
 async def cmd_mymode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not ctx.args:
@@ -942,15 +940,37 @@ async def cmd_mymode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if new_mode not in ("paper", "live"):
         await update.message.reply_text("Usage: `/mymode paper` or `/mymode live`", parse_mode="Markdown")
         return
-    if new_mode == "live" and not (get_user_key(uid) or get_user_private_key(uid)):
+
+    if new_mode == "paper":
+        with _users_transaction() as users:
+            users[uid]["mode"] = "paper"
+        await update.message.reply_text("✅ Mode set to 🟡 PAPER", parse_mode="Markdown")
+        return
+
+    # live: global model gate + own credentials + explicit risk confirmation
+    if not (get_user_key(uid) or get_user_private_key(uid)):
         await update.message.reply_text(
-            "❌ Set your credentials first with `/setup <private_key>`.", parse_mode="Markdown"
+            "❌ No wallet connected yet — run /wallet\\_setup first.", parse_mode="Markdown"
         )
         return
-    with _users_transaction() as users:
-        users[uid]["mode"] = new_mode
-    badge = "🟢 LIVE" if new_mode == "live" else "🟡 PAPER"
-    await update.message.reply_text(f"✅ Mode set to {badge}", parse_mode="Markdown")
+    ready, reasons = _global_gate_check()
+    if not ready:
+        await update.message.reply_text(
+            "🔴 The shared model's go-live gates aren't passed:\n"
+            + "\n".join(f"  · {r}" for r in reasons),
+        )
+        return
+    await update.message.reply_text(
+        "⚠️ *Switching to LIVE trading*\n\n"
+        "The bot will place real orders with *your* USDC on every scheduled scan, "
+        "sized by Kelly fraction against your balance. Losses are real.\n\n"
+        "Confirm?",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Yes, trade my real money", callback_data="liveconfirm"),
+            InlineKeyboardButton("❌ Cancel", callback_data="status"),
+        ]]),
+        parse_mode="Markdown",
+    )
 
 @require_auth(admin_only=True)
 async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1036,6 +1056,23 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(
             fmt_trades(uid), reply_markup=why_kb(uid) or main_kb(uid), parse_mode="Markdown"
         )
+    elif data == "liveconfirm":
+        # Re-check the gate at confirm time — it may have flipped since the prompt.
+        ready, reasons = _global_gate_check()
+        if not (get_user_key(uid) or get_user_private_key(uid)) or not ready:
+            await q.edit_message_text(
+                "🔴 Live no longer available:\n" + "\n".join(f"  · {r}" for r in reasons),
+                reply_markup=main_kb(uid),
+            )
+        else:
+            with _users_transaction() as users:
+                users[uid]["mode"] = "live"
+                users[uid]["live_confirmed_at"] = datetime.utcnow().isoformat()
+            await q.edit_message_text(
+                "🟢 *Mode set to LIVE.* Orders execute on the next scheduled scan.\n"
+                "Switch back any time with `/mymode paper`.",
+                reply_markup=main_kb(uid), parse_mode="Markdown",
+            )
     elif data.startswith("why:"):
         trades_csv = _trades_csv_path(uid)
         rows: list[dict] = []
@@ -1198,8 +1235,14 @@ async def _run() -> None:
 
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # Onboarding conversation owns /start and /wallet_setup. It must be added
+    # BEFORE the generic CallbackQueryHandler so its ob_* buttons are consumed
+    # by the active conversation, not by on_button.
+    import telegram_onboarding
+    app.add_handler(telegram_onboarding.build_conversation_handler())
+    app.add_handler(CommandHandler("invite", telegram_onboarding.cmd_invite))
+
     for cmd, handler in [
-        ("start",       cmd_start),
         ("help",        cmd_help),
         ("status",      cmd_status),
         ("wallet",      cmd_wallet),
