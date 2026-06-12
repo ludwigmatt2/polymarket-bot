@@ -31,6 +31,7 @@ from typing import Optional
 from dotenv import load_dotenv
 from weather._io import atomic_write_text
 from weather.secrets import get_user_key, set_user_key
+import telegram_views
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -562,9 +563,34 @@ def fmt_trades(uid: int, n: int = 10) -> str:
         title     = title[:48]
         direction = r.get("direction", "?")
         edge      = float(r.get("edge_pp", 0))
-        lines.append(f"{e} *${pnl:+.2f}* · {direction} · {edge:.0%} edge")
-        lines.append(f"   _{title}_")
+        brier     = r.get("brier_score", "")
+        brier_str = f" · brier {float(brier):.3f}" if brier else ""
+        lines.append(f"{e} *${pnl:+.2f}* · {direction} · {edge:.0%} edge{brier_str}")
+        lines.append(f"   _{title}_  `/why {r.get('trade_id', '')}`")
+    lines.append("\n_Tap a ❓ button below for the full reasoning._")
     return "\n".join(lines)
+
+
+def why_kb(uid: int, n: int = 10) -> InlineKeyboardMarkup | None:
+    """❓ buttons for the trades shown by fmt_trades (same order, max 8)."""
+    trades_csv = _trades_csv_path(uid)
+    if not trades_csv.exists():
+        return None
+    with trades_csv.open() as f:
+        rows = list(csv.DictReader(f))
+    resolved = sorted(
+        [r for r in rows if r.get("resolved_at")],
+        key=lambda x: x.get("resolved_at", ""), reverse=True
+    )[:min(n, 8)]
+    if not resolved:
+        return None
+    buttons = [
+        InlineKeyboardButton(f"❓ {i + 1}", callback_data=f"why:{r.get('trade_id', '')}")
+        for i, r in enumerate(resolved)
+    ]
+    rows_kb = [buttons[i:i + 4] for i in range(0, len(buttons), 4)]
+    rows_kb.append([InlineKeyboardButton("🔙 Back", callback_data="status")])
+    return InlineKeyboardMarkup(rows_kb)
 
 
 # ── Keyboards ─────────────────────────────────────────────────────────────────
@@ -651,6 +677,10 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/positions — open trades grouped by date & city",
         "/trades [n] — last N resolved trades (default 10)",
         "/signals — signals from the last scan\n",
+        "*Transparency*",
+        "/why <trade_id> — full reasoning behind a trade",
+        "/scanreport — scan funnel: what was fetched, rejected, taken",
+        "/losses [n] — losing trades with causes\n",
         "*Wallet tracking*",
         "/deposit <amount> [note] — record a deposit",
         "/withdraw <amount> [note] — record a withdrawal\n",
@@ -709,7 +739,64 @@ async def cmd_trades(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             pass
     await update.effective_message.reply_text(
-        fmt_trades(uid, n), reply_markup=main_kb(uid), parse_mode="Markdown",
+        fmt_trades(uid, n), reply_markup=why_kb(uid, n) or main_kb(uid), parse_mode="Markdown",
+    )
+
+@require_auth()
+async def cmd_why(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Explain one trade. Usage: /why <trade_id>"""
+    uid = update.effective_user.id
+    if not ctx.args:
+        await update.message.reply_text(
+            "Usage: `/why <trade_id>`\nTrade IDs are shown in /trades and /losses.",
+            parse_mode="Markdown",
+        )
+        return
+    trades_csv = _trades_csv_path(uid)
+    rows: list[dict] = []
+    if trades_csv.exists():
+        with trades_csv.open() as f:
+            rows = list(csv.DictReader(f))
+    row = telegram_views.find_trade(rows, ctx.args[0])
+    if row is None:
+        await update.message.reply_text("❌ Trade not found (or ambiguous prefix).")
+        return
+    await update.message.reply_text(
+        telegram_views.fmt_why(row), reply_markup=back_kb(), parse_mode="Markdown",
+    )
+
+@require_auth()
+async def cmd_scanreport(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show the scan funnel: fetched → parsed → gates → actionable."""
+    uid = update.effective_user.id
+    f = _signals_path(uid)
+    data = {}
+    if f.exists():
+        try:
+            data = json.loads(f.read_text())
+        except json.JSONDecodeError:
+            pass
+    await update.effective_message.reply_text(
+        telegram_views.fmt_scanreport(data), reply_markup=main_kb(uid), parse_mode="Markdown",
+    )
+
+@require_auth()
+async def cmd_losses(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Resolved losing trades with causes. Usage: /losses [n]"""
+    uid = update.effective_user.id
+    n   = 10
+    if ctx.args:
+        try:
+            n = min(int(ctx.args[0]), 30)
+        except ValueError:
+            pass
+    trades_csv = _trades_csv_path(uid)
+    rows: list[dict] = []
+    if trades_csv.exists():
+        with trades_csv.open() as f:
+            rows = list(csv.DictReader(f))
+    await update.effective_message.reply_text(
+        telegram_views.fmt_losses(rows, n), reply_markup=main_kb(uid), parse_mode="Markdown",
     )
 
 @require_auth()
@@ -947,8 +1034,21 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     elif data == "trades":
         await q.edit_message_text(
-            fmt_trades(uid), reply_markup=main_kb(uid), parse_mode="Markdown"
+            fmt_trades(uid), reply_markup=why_kb(uid) or main_kb(uid), parse_mode="Markdown"
         )
+    elif data.startswith("why:"):
+        trades_csv = _trades_csv_path(uid)
+        rows: list[dict] = []
+        if trades_csv.exists():
+            with trades_csv.open() as f:
+                rows = list(csv.DictReader(f))
+        row = telegram_views.find_trade(rows, data[4:])
+        if row is None:
+            await q.edit_message_text("❌ Trade not found.", reply_markup=main_kb(uid))
+        else:
+            await q.edit_message_text(
+                telegram_views.fmt_why(row), reply_markup=back_kb(), parse_mode="Markdown"
+            )
     elif data == "scan" and is_admin(uid):
         await q.edit_message_text(
             "🔍 *Trigger scan?*\nFetches live forecasts and evaluates all markets (~2–3 min).",
@@ -1106,6 +1206,9 @@ async def _run() -> None:
         ("positions",   cmd_positions),
         ("signals",     cmd_signals),
         ("trades",      cmd_trades),
+        ("why",         cmd_why),
+        ("scanreport",  cmd_scanreport),
+        ("losses",      cmd_losses),
         ("scan",        cmd_scan),
         ("resolve",     cmd_resolve),
         ("setup",       cmd_setup),
