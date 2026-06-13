@@ -43,12 +43,15 @@ from telegram.ext import (
 load_dotenv()
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
+# DATA_DIR separates code (ROOT) from mutable data so a persistent volume can be
+# mounted on Railway without touching source files.  Locally defaults to ROOT.
 ROOT          = Path(__file__).parent
-USERS_FILE    = ROOT / "config" / "users.json"
-WALLET_FILE   = ROOT / "logs" / "wallet.json"
+DATA_DIR      = Path(os.environ.get("DATA_DIR", ROOT))
+USERS_FILE    = DATA_DIR / "config" / "users.json"
+WALLET_FILE   = DATA_DIR / "logs" / "wallet.json"
 
 def user_log_dir(uid: int) -> Path:
-    return ROOT / "logs" / "users" / str(uid)
+    return DATA_DIR / "logs" / "users" / str(uid)
 
 def user_trades_csv(uid: int) -> Path:
     return user_log_dir(uid) / "paper_trades.csv"
@@ -63,19 +66,21 @@ def user_resolved_file(uid: int) -> Path:
 # everyone else). Non-admin users never fall back to root — a fresh user must
 # see an empty slate, not the owner's portfolio.
 def _trades_csv_path(uid: int) -> Path:
-    return ROOT / "logs" / "paper_trades.csv" if uid == ADMIN_ID else user_trades_csv(uid)
+    return DATA_DIR / "logs" / "paper_trades.csv" if uid == ADMIN_ID else user_trades_csv(uid)
 
 def _signals_path(uid: int) -> Path:
-    return ROOT / "logs" / "last_signals.json" if uid == ADMIN_ID else user_signals_file(uid)
+    return DATA_DIR / "logs" / "last_signals.json" if uid == ADMIN_ID else user_signals_file(uid)
 
 def _resolved_path(uid: int) -> Path:
-    return ROOT / "logs" / "last_resolved.json" if uid == ADMIN_ID else user_resolved_file(uid)
+    return DATA_DIR / "logs" / "last_resolved.json" if uid == ADMIN_ID else user_resolved_file(uid)
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ["POLYMARKET_BOT_TOKEN"]
 ADMIN_ID  = int(os.environ["TELEGRAM_ADMIN_ID"])
-PYTHON    = str(ROOT / "venv" / "bin" / "python")
+# PYTHON_BIN lets Railway (or Docker) point to the system Python; locally falls
+# back to the venv.
+PYTHON    = os.environ.get("PYTHON_BIN", str(ROOT / "venv" / "bin" / "python"))
 
 
 # ── User registry ─────────────────────────────────────────────────────────────
@@ -632,6 +637,16 @@ def confirm_kb(action: str, label: str) -> InlineKeyboardMarkup:
 # the forecast APIs and race on the CSVs.
 _bot_run_lock = asyncio.Lock()
 
+# Per-user scan cooldown: prevents a non-admin from re-triggering a scan the
+# moment the lock releases.  Admins are exempt (they run scheduled scans anyway).
+import time as _time
+_scan_last: dict[int, float] = {}
+SCAN_COOLDOWN_SECS = 60
+
+def _scan_cooldown_remaining(uid: int) -> float:
+    elapsed = _time.monotonic() - _scan_last.get(uid, 0.0)
+    return max(0.0, SCAN_COOLDOWN_SECS - elapsed)
+
 async def run_bot_async(mode: str, uid: int) -> tuple[str, str, int]:
     """Run weather_bot.py globally: root scan/resolve + fan-out to all users."""
     if _bot_run_lock.locked():
@@ -848,6 +863,14 @@ async def cmd_withdraw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 @require_auth()
 async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if not is_admin(uid):
+        wait = _scan_cooldown_remaining(uid)
+        if wait > 0:
+            await update.effective_message.reply_text(
+                f"⏳ Please wait {wait:.0f}s before scanning again."
+            )
+            return
+    _scan_last[uid] = _time.monotonic()
     msg = await update.effective_message.reply_text("🔍 Scanning Polymarket...")
     stdout, stderr, rc = await run_bot_async("paper", uid)
     if rc == -2:
@@ -923,10 +946,23 @@ async def cmd_setup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     await update.message.reply_text(reply, parse_mode="Markdown")
 
+def _log_startup() -> None:
+    from weather import secrets as _sec
+    if _sec._get_keyring() is not None:
+        backend = "OS keychain"
+    elif _sec._get_fernet() is not None:
+        backend = "Fernet (AES-128, key from POLYMARKET_SECRETS_KEY)"
+    else:
+        backend = "NONE — key storage unavailable, /setup will fail"
+    print(f"[startup] key backend : {backend}", flush=True)
+    print(f"[startup] DATA_DIR    : {DATA_DIR}", flush=True)
+    print(f"[startup] PYTHON_BIN  : {PYTHON}", flush=True)
+
+
 def _global_gate_check() -> tuple[bool, list[str]]:
     """One model, one track record: live unlocks on the ROOT paper log's gates."""
     from weather.paper_trader import PaperTrader as _PT
-    stats = _PT(log_path=ROOT / "logs" / "paper_trades.csv").compute_stats()
+    stats = _PT(log_path=DATA_DIR / "logs" / "paper_trades.csv").compute_stats()
     return stats.ready_for_live, stats.failure_reasons
 
 @require_auth()
@@ -1140,7 +1176,7 @@ _seen_halt_mtimes:     dict[int, float] = {}
 _seen_alarm_mtime: float = 0.0
 # Halt files older than bot start are history, not news — don't replay on restart.
 _BOT_START_TS = datetime.now().timestamp()
-_SCANNER_ALARM_LOG = Path("logs/scanner_alarm.csv")
+_SCANNER_ALARM_LOG = DATA_DIR / "logs" / "scanner_alarm.csv"
 
 async def check_alerts(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     bot = ctx.bot
@@ -1297,6 +1333,7 @@ async def _register_commands(app) -> None:
 async def _run() -> None:
     _seed_admin()
     _migrate_global_wallet()
+    _log_startup()
 
     app = Application.builder().token(BOT_TOKEN).build()
 

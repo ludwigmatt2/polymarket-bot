@@ -20,7 +20,10 @@ from pathlib import Path
 from ._io import atomic_write_json
 
 _SERVICE_NAME = "polymarket-bot"
-_ENC_KEYS_FILE = Path("config/user_keys.enc.json")
+# DATA_DIR lets Railway (or any deployment) point to a persistent volume.
+# Defaults to the project root so local behaviour is unchanged.
+_DATA_DIR = Path(os.environ.get("DATA_DIR", Path(__file__).parent.parent))
+_ENC_KEYS_FILE = _DATA_DIR / "config" / "user_keys.enc.json"
 
 
 @functools.lru_cache(maxsize=1)

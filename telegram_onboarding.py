@@ -33,12 +33,15 @@ from telegram.ext import (
     filters,
 )
 
+import os
+
 from weather._io import atomic_write_text
 from weather.config import MIN_PROFIT_FACTOR, MIN_RESOLVED_TRADES
 from weather.secrets import get_user_key, set_user_key
 
 ROOT = Path(__file__).parent
-INVITES_FILE = ROOT / "config" / "invites.json"
+DATA_DIR = Path(os.environ.get("DATA_DIR", ROOT))
+INVITES_FILE = DATA_DIR / "config" / "invites.json"
 INVITE_TTL_DAYS = 7
 
 # Conversation states
