@@ -24,8 +24,10 @@ from .config import (
 from .models import Location, Signal
 from .paper_trader import PaperTrader, _brier, _evaluate_outcome
 
-LIVE_TRADES_LOG = Path("logs/live_trades.csv")
-_IDEMPOTENCY_FILE = Path("logs/live_idempotency.json")
+_DATA_DIR = Path(os.environ.get("DATA_DIR", "."))
+LIVE_TRADES_LOG = _DATA_DIR / "logs" / "live_trades.csv"
+_IDEMPOTENCY_FILE = _DATA_DIR / "logs" / "live_idempotency.json"
+_RUNTIME_CONFIG = _DATA_DIR / "logs" / "runtime_config.json"
 
 _CSV_HEADERS = [
     "trade_id", "market_id", "market_title", "order_id",
@@ -40,7 +42,52 @@ _CSV_HEADERS = [
     "weather_direction", "lat", "lon", "location_tz",
     # Resolution results
     "actual_outcome", "resolved_at", "pnl_usd", "brier_score",
+    # Tax fields — EUR equivalent at resolve date (ECB reference rate)
+    "eur_rate", "pnl_eur",
 ]
+
+
+def _fetch_ecb_rate(dt: "date") -> "float | None":
+    """ECB reference rate: USD → EUR for given date. Tries up to 4 days back for weekends/holidays."""
+    import urllib.request
+    from datetime import timedelta
+    for offset in range(4):
+        d = (dt - timedelta(days=offset)).isoformat()
+        url = (
+            "https://data-api.ecb.europa.eu/service/data/EXR/D.USD.EUR.SP00.A"
+            f"?format=csvdata&startPeriod={d}&endPeriod={d}"
+        )
+        try:
+            with urllib.request.urlopen(url, timeout=8) as resp:
+                lines = resp.read().decode().splitlines()
+            if len(lines) < 2:
+                continue
+            headers = [h.strip() for h in lines[0].split(",")]
+            if "OBS_VALUE" not in headers:
+                continue
+            idx = headers.index("OBS_VALUE")
+            for line in lines[1:]:
+                parts = line.split(",")
+                if len(parts) > idx and parts[idx].strip():
+                    try:
+                        return float(parts[idx])
+                    except ValueError:
+                        continue
+        except Exception:
+            continue
+    return None
+
+
+def _get_max_trade_usd() -> float:
+    """Live cap per trade — reads runtime override first, falls back to config."""
+    try:
+        if _RUNTIME_CONFIG.exists():
+            cfg = json.loads(_RUNTIME_CONFIG.read_text())
+            if "max_trade_usd" in cfg:
+                return float(cfg["max_trade_usd"])
+    except Exception:
+        pass
+    return MAX_LIVE_TRADE_USD
 
 
 class LiveTrader:
@@ -94,7 +141,7 @@ class LiveTrader:
         full_kelly = (b * p - (1.0 - p)) / b
         if full_kelly <= 0:
             return 0.0
-        return min(self.bankroll_usd * KELLY_FRACTION * full_kelly, MAX_LIVE_TRADE_USD)
+        return min(self.bankroll_usd * KELLY_FRACTION * full_kelly, _get_max_trade_usd())
 
     def execute_signal(self, signal: Signal) -> dict | None:
         """
@@ -115,7 +162,7 @@ class LiveTrader:
             return None
 
         size_usd = self.kelly_size_usd(signal)
-        assert size_usd <= MAX_LIVE_TRADE_USD, f"kelly_size_usd exceeded cap: {size_usd}"
+        assert size_usd <= _get_max_trade_usd(), f"kelly_size_usd exceeded cap: {size_usd}"
         if size_usd < 1.0:
             return None
 
@@ -231,6 +278,10 @@ class LiveTrader:
             t["resolved_at"] = now.isoformat()
             t["pnl_usd"] = round(pnl, 4)
             t["brier_score"] = round(_brier(model_p, outcome), 4)
+            eur_rate = _fetch_ecb_rate(res_dt.date())
+            if eur_rate is not None:
+                t["eur_rate"] = eur_rate
+                t["pnl_eur"] = round(pnl * eur_rate, 4)
             resolved += 1
 
             if model is not None:
@@ -369,4 +420,6 @@ class LiveTrader:
                 "resolved_at":       "",
                 "pnl_usd":           "",
                 "brier_score":       "",
+                "eur_rate":          "",
+                "pnl_eur":           "",
             })

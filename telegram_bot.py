@@ -860,6 +860,49 @@ async def cmd_withdraw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
 
+@require_auth(admin_only=True)
+async def cmd_setmaxbet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    from weather.config import MAX_LIVE_TRADE_USD
+    from weather.live_trader import _RUNTIME_CONFIG
+    runtime_cfg = DATA_DIR / "logs" / "runtime_config.json"
+
+    if not ctx.args:
+        current = MAX_LIVE_TRADE_USD
+        try:
+            if runtime_cfg.exists():
+                cfg = json.loads(runtime_cfg.read_text())
+                current = float(cfg.get("max_trade_usd", current))
+        except Exception:
+            pass
+        await update.effective_message.reply_text(
+            f"💰 Current max bet: *${current:.0f}/trade*\n\nChange with: /setmaxbet 50",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        val = float(ctx.args[0])
+        if not (1 <= val <= 500):
+            await update.effective_message.reply_text("❌ Must be between $1 and $500.")
+            return
+    except ValueError:
+        await update.effective_message.reply_text("❌ Enter a number, e.g. /setmaxbet 50")
+        return
+
+    try:
+        cfg = json.loads(runtime_cfg.read_text()) if runtime_cfg.exists() else {}
+    except Exception:
+        cfg = {}
+    old = cfg.get("max_trade_usd", MAX_LIVE_TRADE_USD)
+    cfg["max_trade_usd"] = val
+    runtime_cfg.parent.mkdir(parents=True, exist_ok=True)
+    runtime_cfg.write_text(json.dumps(cfg, indent=2))
+    await update.effective_message.reply_text(
+        f"✅ Max bet: *${old:.0f} → ${val:.0f}/trade*\nActive on next trade — no restart needed.",
+        parse_mode="Markdown",
+    )
+
+
 @require_auth()
 async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -1317,6 +1360,7 @@ _ADMIN_COMMANDS = _USER_COMMANDS + [
     ("removeuser",  "➖ Remove a user"),
     ("users",       "👥 List all registered users"),
     ("setup",       "⚙️ Save credentials (legacy)"),
+    ("setmaxbet",   "💰 Set max bet size per trade (e.g. /setmaxbet 50)"),
 ]
 
 async def _register_commands(app) -> None:
@@ -1363,6 +1407,7 @@ async def _run() -> None:
         ("users",       cmd_users),
         ("adduser",     cmd_adduser),
         ("removeuser",  cmd_removeuser),
+        ("setmaxbet",   cmd_setmaxbet),
     ]:
         app.add_handler(CommandHandler(cmd, handler))
 

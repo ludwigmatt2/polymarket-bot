@@ -3,6 +3,8 @@ Central configuration for the weather arbitrage bot.
 All thresholds and constants live here — no magic numbers in other modules.
 """
 
+import os
+
 # ── Signal quality thresholds ──────────────────────────────────────────────────
 MIN_NET_EV_PP = 0.04            # Gate 4: minimum edge after subtracting round-trip fees
 MAX_DAYS_TO_RESOLUTION = 31     # Include monthly (May) markets
@@ -67,7 +69,7 @@ PAPER_TRADE_SIZE_USD = 25.0
 
 # ── Live trading (Kelly sizing) ────────────────────────────────────────────────
 KELLY_FRACTION = 0.25           # Quarter Kelly — conservative for uncertain edge
-MAX_LIVE_TRADE_USD = 25.0       # Hard cap per trade during validation period
+MAX_LIVE_TRADE_USD = float(os.environ.get("MAX_LIVE_TRADE_USD", "25.0"))  # overrideable via env or /setmaxbet
 DAILY_LOSS_LIMIT_PCT = 0.05     # Kill switch at -5% of total capital
 
 # ── Go-live gates (all must pass before real money) ────────────────────────────
