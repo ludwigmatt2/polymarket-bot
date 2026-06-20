@@ -1,4 +1,4 @@
-pmxt==2.35.25
+py-clob-client-v2>=1.0.1
 python-telegram-bot[job-queue]==21.9
 requests>=2.33.0
 python-dotenv>=1.0.0

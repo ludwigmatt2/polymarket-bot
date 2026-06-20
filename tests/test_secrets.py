@@ -11,6 +11,8 @@ class TestSecretsKeyring:
 
     def test_set_get_roundtrip_keyring(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
+        # Clear Fernet env var so _get_keyring() doesn't skip keyring
+        monkeypatch.delenv("POLYMARKET_SECRETS_KEY", raising=False)
         # Patch keyring module to avoid touching the real OS keychain
         mock_kr = MagicMock()
         # get_password returns None on first read (no existing creds), then the stored JSON

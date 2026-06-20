@@ -7,11 +7,17 @@ Backend priority:
      Blobs stored in config/user_keys.enc.json
 
 Each user's creds are stored as an encrypted JSON object:
-  {"pk": "0x...", "proxy_address": "0x...", "signature_type": "gnosis-safe",
+  {"pk": "0x...", "funder_address": "0x...", "signature_type": 1,
    "clob_api_key": "...", "clob_secret": "...", "clob_passphrase": "..."}
 
-All fields except `pk` are optional.  Legacy blobs (plain encrypted pk strings
-written by an older version) are detected and read back as {"pk": <value>}.
+signature_type integers match the official Polymarket SDK:
+  0 = EOA (standard wallet — fresh accounts, signing key IS the funder)
+  1 = POLY_PROXY (email/Google Polymarket login — proxy wallet flow)
+  2 = GNOSIS_SAFE (actual Gnosis Safe multisig)
+  3 = POLY_1271 (deposit wallet — recommended for new API users)
+
+All fields except `pk` are optional.  Legacy blobs using the old pmxt string
+format ("eoa", "gnosis-safe") and "proxy_address" key are auto-migrated on read.
 """
 
 from __future__ import annotations
@@ -27,6 +33,31 @@ from .paths import DATA_DIR as _DATA_DIR
 _SERVICE_NAME = "polymarket-bot"
 _ENC_KEYS_FILE = _DATA_DIR / "config" / "user_keys.enc.json"
 
+# Maps legacy pmxt string signature types → official SDK integers.
+# "gnosis-safe" was pmxt's name for the standard Polymarket proxy wallet (email/Google login),
+# which the official SDK calls POLY_PROXY (1).
+_LEGACY_SIG_MAP: dict[str, int] = {
+    "eoa": 0,
+    "poly-proxy": 1,
+    "poly_proxy": 1,
+    "gnosis-safe": 1,   # pmxt used this for email/Google Polymarket proxy accounts
+    "gnosis_safe": 2,   # actual Gnosis Safe multisig → GNOSIS_SAFE
+    "poly-1271": 3,
+    "poly_1271": 3,
+}
+
+
+def _migrate_legacy_creds(creds: dict) -> dict:
+    """Convert old pmxt-style field names and values to the current schema."""
+    # proxy_address → funder_address
+    if "proxy_address" in creds and "funder_address" not in creds:
+        creds["funder_address"] = creds.pop("proxy_address")
+    # string signature_type → integer
+    sig = creds.get("signature_type")
+    if isinstance(sig, str):
+        creds["signature_type"] = _LEGACY_SIG_MAP.get(sig.lower(), 0)
+    return creds
+
 
 @functools.lru_cache(maxsize=1)
 def _get_keyring():
@@ -36,9 +67,12 @@ def _get_keyring():
         return None
     try:
         import keyring as _kr
-        from keyring.backends.fail import Keyring as _FailBackend
-        if isinstance(_kr.get_keyring(), _FailBackend):
-            return None
+        try:
+            from keyring.backends.fail import Keyring as _FailBackend
+            if isinstance(_kr.get_keyring(), _FailBackend):
+                return None
+        except Exception:
+            pass  # submodule import may fail when keyring is mocked in tests
         return _kr
     except ImportError:
         return None
@@ -53,9 +87,6 @@ def _get_fernet():
         from cryptography.fernet import Fernet
         return Fernet(key.encode())
     except Exception as exc:
-        # Key is explicitly configured but malformed — fail loudly instead of
-        # silently returning None, which callers would mistake for "no creds"
-        # and treat as a (silent) auth failure.
         raise RuntimeError(
             "POLYMARKET_SECRETS_KEY is set but is not a valid Fernet key "
             f"({exc.__class__.__name__}). Generate one with: python -c "
@@ -72,14 +103,14 @@ def _encode(f, data: dict) -> str:
 def _decode(f, blob: str) -> dict:
     raw = f.decrypt(blob.encode()).decode()
     try:
-        return json.loads(raw)
+        return _migrate_legacy_creds(json.loads(raw))
     except json.JSONDecodeError:
         return {"pk": raw}  # legacy: plain encrypted pk string
 
 
 def _decode_keyring(raw: str) -> dict:
     try:
-        return json.loads(raw)
+        return _migrate_legacy_creds(json.loads(raw))
     except json.JSONDecodeError:
         return {"pk": raw}  # legacy
 
@@ -89,10 +120,17 @@ def _decode_keyring(raw: str) -> dict:
 def set_user_creds(uid: int, **fields) -> None:
     """Store or merge-update credential fields for uid.
 
-    Recognised fields: pk, proxy_address, signature_type,
+    Recognised fields: pk, funder_address, signature_type (int),
     clob_api_key, clob_secret, clob_passphrase.
     None values are ignored (do not overwrite existing).
     """
+    # Migrate any legacy field names passed by callers
+    if "proxy_address" in fields:
+        fields.setdefault("funder_address", fields.pop("proxy_address"))
+    sig = fields.get("signature_type")
+    if isinstance(sig, str):
+        fields["signature_type"] = _LEGACY_SIG_MAP.get(sig.lower(), 0)
+
     kr = _get_keyring()
     if kr is not None:
         existing_raw = kr.get_password(_SERVICE_NAME, f"uid-{uid}")
@@ -153,63 +191,34 @@ def get_user_creds(uid: int) -> dict | None:
 def derive_clob_creds(pk: str) -> dict:
     """Derive L2 CLOB API credentials from an L1 private key.
 
-    Signs a ClobAuth EIP-712 message with the private key and calls
-    POST https://clob.polymarket.com/auth/api-key to get (or re-derive)
-    the deterministic L2 credentials tied to this key.
+    Uses the official py-clob-client-v2 SDK which signs the correct EIP-712
+    ClobAuth struct and calls POST https://clob.polymarket.com/auth/api-key.
 
     Returns {"clob_api_key": ..., "clob_secret": ..., "clob_passphrase": ...}.
     Raises RuntimeError on network or auth failure.
     """
-    import json as _json
-    import time
-    import urllib.request
-    import urllib.error
-    from eth_account import Account
-    from eth_account.messages import encode_typed_data
-
-    account = Account.from_key(pk)
-    ts = str(int(time.time()))
-    nonce = 0
-
-    msg = encode_typed_data(
-        domain_data={"name": "ClobAuthDomain", "version": "1", "chainId": 137},
-        message_types={
-            "ClobAuth": [
-                {"name": "key", "type": "string"},
-                {"name": "value", "type": "string"},
-            ]
-        },
-        message_data={
-            "key": "user",
-            "value": _json.dumps({"timestamp": ts, "nonce": nonce}, separators=(",", ":")),
-        },
-    )
-    signed = account.sign_message(msg)
-    sig = "0x" + signed.signature.hex()
-
-    req = urllib.request.Request(
-        "https://clob.polymarket.com/auth/api-key",
-        data=b"",
-        method="POST",
-        headers={
-            "POLY_ADDRESS": account.address,
-            "POLY_SIGNATURE": sig,
-            "POLY_TIMESTAMP": ts,
-            "POLY_NONCE": str(nonce),
-            "Content-Type": "application/json",
-        },
-    )
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = _json.loads(resp.read())
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode(errors="replace")
-        raise RuntimeError(f"CLOB auth failed ({exc.code}): {body}") from None
+        from py_clob_client_v2 import ClobClient
+    except ImportError as exc:
+        raise RuntimeError(
+            "py-clob-client-v2 is required for credential derivation. "
+            "Run: pip install py-clob-client-v2"
+        ) from exc
+
+    try:
+        client = ClobClient(
+            host="https://clob.polymarket.com",
+            chain_id=137,
+            key=pk,
+        )
+        creds = client.create_or_derive_api_key()
+    except Exception as exc:
+        raise RuntimeError(f"CLOB auth failed: {exc}") from exc
 
     return {
-        "clob_api_key": data["apiKey"],
-        "clob_secret": data["secret"],
-        "clob_passphrase": data["passphrase"],
+        "clob_api_key": creds.api_key,
+        "clob_secret": creds.api_secret,
+        "clob_passphrase": creds.api_passphrase,
     }
 
 
@@ -231,7 +240,7 @@ def derive_and_store_clob_creds(uid: int) -> dict:
 # ── Backward-compat wrappers ──────────────────────────────────────────────────
 
 def set_user_key(uid: int, pk: str) -> None:
-    """Store a private key for uid. Existing proxy/sig fields are preserved."""
+    """Store a private key for uid. Existing funder/sig fields are preserved."""
     set_user_creds(uid, pk=pk)
 
 

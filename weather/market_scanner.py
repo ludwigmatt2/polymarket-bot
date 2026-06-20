@@ -19,8 +19,6 @@ import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-import pmxt
-
 _log = logging.getLogger(__name__)
 
 from .config import (
@@ -126,8 +124,11 @@ class _YesSide:
         self.price = price
 
 
+_TICK_MAP = {0.1: "0.1", 0.01: "0.01", 0.001: "0.001", 0.0001: "0.0001"}
+
+
 class _GammaMarket:
-    """Adapter wrapping a Gamma API market dict to match the pmxt.UnifiedMarket interface."""
+    """Wraps a Gamma API market dict into a structured object for parsing."""
 
     def __init__(self, market: dict, event: dict):
         self.market_id: str = market.get("conditionId", "")
@@ -146,6 +147,15 @@ class _GammaMarket:
             self.resolution_date = None
         slug = event.get("slug", "")
         self.url: str = f"https://polymarket.com/event/{slug}" if slug else ""
+        # CLOB outcome token IDs — used for order placement and book depth queries.
+        # Gamma API returns these as a JSON string: ["<yes_token_id>", "<no_token_id>"]
+        token_ids_raw = market.get("clobTokenIds", "[]")
+        token_ids = json.loads(token_ids_raw) if isinstance(token_ids_raw, str) else (token_ids_raw or [])
+        self.yes_token_id: str = token_ids[0] if token_ids else ""
+        self.no_token_id: str = token_ids[1] if len(token_ids) > 1 else ""
+        # Minimum tick size required by PartialCreateOrderOptions (must be a string literal)
+        tick_raw = float(market.get("orderPriceMinTickSize", 0.01) or 0.01)
+        self.tick_size: str = _TICK_MAP.get(tick_raw, "0.01")
 
 
 _GAMMA_SEARCH_URL = "https://gamma-api.polymarket.com/public-search"
@@ -154,39 +164,14 @@ _GAMMA_SEARCH_URL = "https://gamma-api.polymarket.com/public-search"
 class WeatherMarketScanner:
     def __init__(
         self,
-        source: str = "gamma",
-        poly: object | None = None,
         weather_client: WeatherClient | None = None,
+        _clob_client=None,  # injectable ClobClient for testing book depth
     ):
-        """
-        source: "gamma" (default) uses the Gamma REST API;
-                "clob" uses the pmxt CLOB sidecar fetch_events.
-        poly / weather_client: optional injectable dependencies for testing.
-        """
-        self._source = source
-        self._poly = poly if poly is not None else self._make_default_poly()
         self._weather_client = weather_client or WeatherClient()
+        self._clob_client = _clob_client  # None → created on demand in _fetch_book_depth_usd
         self._geocache: dict[str, Location | None] = {}
         # Funnel counts from the most recent scan() — consumed by /scanreport.
         self.last_funnel: dict[str, int] = {}
-
-    @staticmethod
-    def _make_default_poly():
-        # Weather scanning only needs public market data via the local CLOB sidecar,
-        # which supports keyword search. The hosted PMXT API (PMXT_API_KEY) rejects
-        # the `query`/`status` params, so we create the client in local mode.
-        # Strip credentials that aren't needed for public market search and that
-        # newer pmxt versions now validate strictly (rejecting placeholder values).
-        import os
-        _pmxt_key   = os.environ.pop("PMXT_API_KEY", None)
-        _poly_pk    = os.environ.pop("POLYMARKET_PRIVATE_KEY", None)
-        _poly_proxy = os.environ.pop("POLYMARKET_PROXY_ADDRESS", None)
-        try:
-            return pmxt.Polymarket()
-        finally:
-            if _pmxt_key:   os.environ["PMXT_API_KEY"] = _pmxt_key
-            if _poly_pk:    os.environ["POLYMARKET_PRIVATE_KEY"] = _poly_pk
-            if _poly_proxy: os.environ["POLYMARKET_PROXY_ADDRESS"] = _poly_proxy
 
     def scan(self) -> list[WeatherMarket]:
         """
@@ -231,16 +216,15 @@ class WeatherMarketScanner:
                 )
                 _append_csv_log(SCANNER_ALARM_LOG, [{
                     "timestamp": datetime.utcnow().isoformat(),
-                    "source": self._source,
+                    "source": "gamma",
                     "search_terms": ",".join(WEATHER_SEARCH_TERMS[:5]),
                     "reason": f"low_parse_rate:{len(parsed)}/{len(raw_markets)}",
                 }], _ALARM_FIELDS)
 
         tradeable = self._filter_tradeable(parsed)
         # Fetch live CLOB order-book depth only for markets that survived all other filters.
-        # This avoids 2 sidecar API calls per scanned market on every scan cycle.
         for wm in tradeable:
-            wm.book_depth_usd = self._fetch_book_depth_usd(wm.market_id, wm.yes_price)
+            wm.book_depth_usd = self._fetch_book_depth_usd(wm.yes_token_id)
         print(f"    tradeable after filters: {len(tradeable)} / {len(parsed)}")
         self.last_funnel = {
             "fetched": len(raw_markets),
@@ -251,27 +235,18 @@ class WeatherMarketScanner:
         return tradeable
 
     def _search_keywords(self) -> list[_GammaMarket]:
-        """Query Polymarket for each weather keyword, deduplicate by condition_id.
-
-        Uses the configured source (gamma or clob). On zero results logs a
-        WARNING and writes a row to logs/scanner_alarm.csv so the Telegram
-        bot can surface it.
-        """
-        if self._source == "clob":
-            markets = self._clob_search_keywords()
-        else:
-            markets = self._gamma_search_keywords()
+        """Query Polymarket for each weather keyword, deduplicate by condition_id."""
+        markets = self._gamma_search_keywords()
 
         if len(markets) == 0:
             _log.warning(
-                "Zero markets returned from %s search (terms: %s). "
+                "Zero markets returned from gamma search (terms: %s). "
                 "Check logs/scanner_alarm.csv.",
-                self._source,
                 WEATHER_SEARCH_TERMS[:3],
             )
             _append_csv_log(SCANNER_ALARM_LOG, [{
                 "timestamp": datetime.utcnow().isoformat(),
-                "source": self._source,
+                "source": "gamma",
                 "search_terms": ",".join(WEATHER_SEARCH_TERMS[:5]),
                 "reason": "zero_markets_returned",
             }], _ALARM_FIELDS)
@@ -297,43 +272,6 @@ class WeatherMarketScanner:
                             markets.append(_GammaMarket(m, event))
             except Exception as e:
                 print(f"    warning: search failed for {term!r}: {e}", flush=True)
-
-        return markets
-
-    def _clob_search_keywords(self) -> list[_GammaMarket]:
-        """CLOB sidecar keyword search via pmxt fetch_events."""
-        seen_ids: set[str] = set()
-        markets: list[_GammaMarket] = []
-
-        for term in WEATHER_SEARCH_TERMS:
-            try:
-                events = self._poly.fetch_events({"query": term, "active": True, "limit": 50})
-                for event in events:
-                    event_dict = {
-                        "title": getattr(event, "title", ""),
-                        "description": getattr(event, "description", ""),
-                        "slug": getattr(event, "slug", ""),
-                    }
-                    for mkt in getattr(event, "markets", []):
-                        cid = getattr(mkt, "condition_id", "") or getattr(mkt, "id", "")
-                        if not cid or cid in seen_ids:
-                            continue
-                        seen_ids.add(cid)
-                        yes_price = 0.5
-                        if hasattr(mkt, "yes") and mkt.yes is not None:
-                            yes_price = float(getattr(mkt.yes, "price", 0.5))
-                        mkt_dict = {
-                            "conditionId": cid,
-                            "outcomePrices": json.dumps([yes_price, 1 - yes_price]),
-                            "volumeClob": str(getattr(mkt, "volume", 0)),
-                            "question": getattr(mkt, "question", ""),
-                            "description": getattr(mkt, "description", event_dict.get("description", "")),
-                            "endDate": (getattr(mkt, "end_date_iso", "") or
-                                        getattr(mkt, "end_date", "") or ""),
-                        }
-                        markets.append(_GammaMarket(mkt_dict, event_dict))
-            except Exception as e:
-                print(f"    warning: CLOB search failed for {term!r}: {e}", flush=True)
 
         return markets
 
@@ -456,6 +394,9 @@ class WeatherMarketScanner:
             url=m.url or "",
             raw_title=title,
             forecast_start_date=forecast_start_date,
+            yes_token_id=m.yes_token_id,
+            no_token_id=m.no_token_id,
+            tick_size=m.tick_size,
         )
 
     def _description_agrees(
@@ -525,25 +466,22 @@ class WeatherMarketScanner:
 
         return True
 
-    def _fetch_book_depth_usd(self, market_id: str, yes_price: float) -> float:
+    def _fetch_book_depth_usd(self, yes_token_id: str) -> float:
+        """B4: Fetch live CLOB order-book depth (ask side in USD) for the YES outcome.
+
+        Uses the official py-clob-client-v2 SDK with no authentication required
+        (order book is a public endpoint). Returns 0.0 on any error or missing token ID.
         """
-        B4: Fetch live CLOB order-book depth for the YES side.
-        Returns 0.0 when the pmxt sidecar is unavailable (paper mode).
-        """
+        if not yes_token_id:
+            return 0.0
         try:
-            market = self._poly.fetch_market(id=market_id)
-            yes_outcome = market.yes
-            if yes_outcome is None:
-                # fall back to first outcome labelled Yes/YES
-                for o in market.outcomes:
-                    if o.label.upper() == "YES":
-                        yes_outcome = o
-                        break
-            if yes_outcome is None:
-                return 0.0
-            ob = self._poly.fetch_order_book(yes_outcome.outcome_id)
-            # Depth = USD value of asks on the YES side (what we can buy)
-            return sum(ask.price * ask.size for ask in ob.asks) if ob.asks else 0.0
+            client = self._clob_client
+            if client is None:
+                from py_clob_client_v2 import ClobClient
+                client = ClobClient(host="https://clob.polymarket.com", chain_id=137)
+            ob = client.get_order_book(yes_token_id)
+            asks = ob.get("asks", [])
+            return sum(float(a["price"]) * float(a["size"]) for a in asks) if asks else 0.0
         except Exception:
             return 0.0
 
@@ -581,14 +519,18 @@ class WeatherMarketScanner:
             if m.liquidity_usd < MIN_MARKET_LIQUIDITY_USD:
                 reasons["low_liquidity"] = reasons.get("low_liquidity", 0) + 1
                 continue
+            if m.resolution_date is None:
+                reasons["no_resolution_date"] = reasons.get("no_resolution_date", 0) + 1
+                continue
             res_date = m.resolution_date if m.resolution_date.tzinfo else m.resolution_date.replace(tzinfo=timezone.utc)
             delta: timedelta = res_date - now
             hours_out = delta.total_seconds() / 3600
-            days_out = delta.days
             if hours_out < 0:
                 reasons["already_resolved"] = reasons.get("already_resolved", 0) + 1
                 continue
-            if days_out > MAX_DAYS_TO_RESOLUTION:
+            # Compare on exact hours, not timedelta.days (which floors toward zero
+            # and would keep markets up to ~1 day past the cutoff).
+            if hours_out / 24 > MAX_DAYS_TO_RESOLUTION:
                 reasons["too_far_out"] = reasons.get("too_far_out", 0) + 1
                 continue
             result.append(m)

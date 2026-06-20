@@ -1,17 +1,61 @@
 """
 Tests for LiveTrader — kill switch, fill reconciliation, sizing, idempotency.
-All pmxt interactions are mocked; no network required.
+All ClobClient interactions are mocked; no network required.
 """
 
 from __future__ import annotations
 
 import csv
 import json
+import sys
+import types as _t
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+
+# ---------------------------------------------------------------------------
+# Stub py_clob_client_v2 if not installed — keeps tests runnable in envs
+# without the real SDK while still allowing call_args inspection.
+# ---------------------------------------------------------------------------
+if "py_clob_client_v2" not in sys.modules:
+    class _OrderArgsV2:
+        def __init__(self, token_id="", price=0.0, size=0.0, side=None):
+            self.token_id = token_id; self.price = price
+            self.size = size; self.side = side
+
+    class _PartialCreateOrderOptions:
+        def __init__(self, tick_size="0.01", neg_risk=False): pass
+
+    class _BalanceAllowanceParams:
+        def __init__(self, asset_type=None): pass
+
+    class _AssetType:
+        COLLATERAL = "COLLATERAL"
+
+    class _ApiCreds:
+        def __init__(self, api_key="", api_secret="", api_passphrase=""): pass
+
+    _ct = _t.ModuleType("py_clob_client_v2.clob_types")
+    _ct.OrderArgsV2 = _OrderArgsV2
+    _ct.PartialCreateOrderOptions = _PartialCreateOrderOptions
+    _ct.BalanceAllowanceParams = _BalanceAllowanceParams
+    _ct.AssetType = _AssetType
+    _ct.ApiCreds = _ApiCreds
+
+    _ob_const = _t.ModuleType("py_clob_client_v2.order_builder.constants")
+    _ob_const.BUY = "BUY"
+    _ob = _t.ModuleType("py_clob_client_v2.order_builder")
+
+    _root = _t.ModuleType("py_clob_client_v2")
+    _root.ClobClient = MagicMock
+    _root.clob_types = _ct
+
+    sys.modules["py_clob_client_v2"] = _root
+    sys.modules["py_clob_client_v2.clob_types"] = _ct
+    sys.modules["py_clob_client_v2.order_builder"] = _ob
+    sys.modules["py_clob_client_v2.order_builder.constants"] = _ob_const
 
 from weather.config import DAILY_LOSS_LIMIT_PCT, KELLY_FRACTION, MAX_LIVE_TRADE_USD
 from weather.live_trader import LiveTrader, _CSV_HEADERS
@@ -40,6 +84,9 @@ def _make_signal(
         threshold=25.0,
         direction="above",
         url="https://polymarket.com/test",
+        yes_token_id="yes_token_id",
+        no_token_id="no_token_id",
+        tick_size="0.01",
     )
     return Signal(
         market=market,
@@ -71,19 +118,11 @@ def _make_trader(tmp_path: Path, bankroll: float = 500.0) -> LiveTrader:
     )
 
 
-def _make_mock_poly(filled: float, price: float = 0.35, status: str = "filled") -> MagicMock:
-    """Minimal pmxt.Polymarket mock for execute_signal tests."""
+def _make_mock_client(filled: float, price: float = 0.35, status: str = "filled") -> MagicMock:
+    """Minimal ClobClient mock for execute_signal tests."""
     mock = MagicMock()
-    order = MagicMock()
-    order.id = "ord_mock"
-    order_obj = MagicMock()
-    order_obj.filled = filled
-    order_obj.price = price
-    order_obj.status = status
-    mock.submit_order.return_value = order
-    mock.fetch_order.return_value = order_obj
-    mock.fetch_market.return_value = MagicMock(yes=MagicMock(market_id="yes_id"))
-    mock.build_order.return_value = MagicMock()
+    mock.create_and_post_order.return_value = {"orderID": "ord_mock"}
+    mock.get_order.return_value = {"size_matched": filled, "price": price, "status": status}
     return mock
 
 
@@ -151,7 +190,7 @@ class TestKillSwitch:
             {"submitted_at": f"{today}T10:00:00+00:00", "pnl_usd": "-10.00",
              "actual_outcome": "0", "resolved_at": f"{today}T14:00:00+00:00"},
         ])
-        trader._poly = _make_mock_poly(filled=10.0, price=0.35, status="filled")
+        trader._client = _make_mock_client(filled=10.0, price=0.35, status="filled")
         result = trader.execute_signal(_make_signal())
         assert result is not None
         assert result["status"] == "filled"
@@ -161,7 +200,7 @@ class TestFillReconciliation:
     def test_no_log_on_unfilled_order(self, tmp_path):
         """If the order never fills, nothing should be written to live_trades.csv."""
         trader = _make_trader(tmp_path)
-        trader._poly = _make_mock_poly(filled=0.0, status="open")
+        trader._client = _make_mock_client(filled=0.0, status="open")
 
         result = trader.execute_signal(_make_signal())
 
@@ -174,7 +213,7 @@ class TestFillReconciliation:
     def test_partial_fill_logs_actual_size(self, tmp_path):
         """A partial fill should record the actual filled_size, not the requested size."""
         trader = _make_trader(tmp_path, bankroll=500.0)
-        trader._poly = _make_mock_poly(filled=5.5, price=0.36, status="partial")
+        trader._client = _make_mock_client(filled=5.5, price=0.36, status="partial")
 
         trader.execute_signal(_make_signal(market_p=0.35))
 
@@ -188,7 +227,7 @@ class TestFillReconciliation:
     def test_full_fill_mirrors_to_paper(self, tmp_path):
         """A fully-filled order should call paper_trader.log_trade exactly once."""
         trader = _make_trader(tmp_path)
-        trader._poly = _make_mock_poly(filled=20.0)
+        trader._client = _make_mock_client(filled=20.0)
         trader.execute_signal(_make_signal())
         trader.paper_trader.log_trade.assert_called_once()
 
@@ -213,21 +252,22 @@ class TestKellySizeUsd:
 
 
 class TestContractConversion:
-    def test_execute_signal_passes_contracts_to_build_order(self, tmp_path):
-        """build_order must receive n_contracts = size_usd / entry_price, not raw USD."""
+    def test_execute_signal_posts_contracts_not_usd(self, tmp_path):
+        """create_and_post_order must receive n_contracts = size_usd / entry_price, not raw USD."""
         trader = _make_trader(tmp_path, bankroll=500.0)
-        trader._poly = _make_mock_poly(filled=15.0)
+        trader._client = _make_mock_client(filled=15.0)
 
         signal = _make_signal(market_p=0.35, model_p=0.65)
         trader.execute_signal(signal)
 
-        call_kwargs = trader._poly.build_order.call_args
-        amount_passed = call_kwargs[1].get("amount") or call_kwargs[0][4]
+        assert trader._client.create_and_post_order.called
+        # First positional arg is the OrderArgsV2 instance
+        order_args = trader._client.create_and_post_order.call_args.args[0]
         rows = list(csv.DictReader(open(trader._log_path)))
         size_usd = float(rows[0]["size_usd"])
         entry_price = float(rows[0]["entry_price"])
         expected_contracts = round(size_usd / entry_price, 2)
-        assert amount_passed == pytest.approx(expected_contracts, abs=0.01)
+        assert order_args.size == pytest.approx(expected_contracts, abs=0.01)
 
 
 class TestIdempotency:
@@ -263,7 +303,7 @@ class TestIdempotency:
     def test_idempotency_key_persisted_after_submit(self, tmp_path):
         """After a successful fill, the idempotency key must be written to the JSON file."""
         trader = _make_trader(tmp_path)
-        trader._poly = _make_mock_poly(filled=10.0)
+        trader._client = _make_mock_client(filled=10.0)
 
         signal = _make_signal(market_id="mkt_newkey", direction="YES")
         trader.execute_signal(signal)
@@ -279,51 +319,53 @@ class TestIdempotency:
 # ---------------------------------------------------------------------------
 
 class TestPerUserCredentials:
-    def test_constructor_creds_take_precedence_over_env(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("POLYMARKET_PRIVATE_KEY", "0xenvkey")
-        monkeypatch.setenv("POLYMARKET_PROXY_ADDRESS", "0xenvproxy")
+    def _patch_clob(self, monkeypatch) -> dict:
+        """Patch ClobClient to capture constructor kwargs; return the capture dict."""
         captured = {}
 
-        class FakePmxt:
-            @staticmethod
-            def Polymarket(**kwargs):
+        class FakeClobClient:
+            def __init__(self, **kwargs):
                 captured.update(kwargs)
-                return MagicMock()
 
-        monkeypatch.setitem(__import__("sys").modules, "pmxt", FakePmxt)
+        class FakeApiCreds:
+            def __init__(self, **kwargs): pass
+
+        import types as _types
+        fake_root = _types.ModuleType("py_clob_client_v2")
+        fake_root.ClobClient = FakeClobClient
+        fake_clob_types = sys.modules.get("py_clob_client_v2.clob_types")
+        if fake_clob_types is not None:
+            fake_clob_types.ApiCreds = FakeApiCreds
+
+        monkeypatch.setitem(sys.modules, "py_clob_client_v2", fake_root)
+        return captured
+
+    def test_constructor_creds_passed_to_clob_client(self, tmp_path, monkeypatch):
+        """ClobClient must receive key, funder, and integer signature_type from constructor."""
+        captured = self._patch_clob(monkeypatch)
         trader = LiveTrader(
             paper_trader=MagicMock(), bankroll_usd=100,
             log_path=tmp_path / "lt.csv", idempotency_path=tmp_path / "id.json",
-            private_key="0xuserkey", proxy_address="0xuserproxy",
-            signature_type="gnosis-safe",
+            private_key="0xuserkey", funder_address="0xuserproxy",
+            signature_type="gnosis-safe",  # legacy string → 1 (POLY_PROXY)
         )
-        trader._get_poly()
-        assert captured == {
-            "private_key": "0xuserkey",
-            "proxy_address": "0xuserproxy",
-            "signature_type": "gnosis-safe",
-        }
+        trader._get_client()
+        assert captured["key"] == "0xuserkey"
+        assert captured["funder"] == "0xuserproxy"
+        assert captured["signature_type"] == 1  # "gnosis-safe" → POLY_PROXY → 1
 
     def test_constructor_creds_used(self, tmp_path, monkeypatch):
         """Credentials must come from the constructor, not env vars."""
         monkeypatch.setenv("POLYMARKET_PRIVATE_KEY", "0xenvkey")  # must be ignored
-        captured = {}
-
-        class FakePmxt:
-            @staticmethod
-            def Polymarket(**kwargs):
-                captured.update(kwargs)
-                return MagicMock()
-
-        monkeypatch.setitem(__import__("sys").modules, "pmxt", FakePmxt)
+        captured = self._patch_clob(monkeypatch)
         trader = LiveTrader(
             paper_trader=MagicMock(), bankroll_usd=100,
             log_path=tmp_path / "lt.csv", idempotency_path=tmp_path / "id.json",
             private_key="0xconstructorkey",
         )
-        trader._get_poly()
-        assert captured["private_key"] == "0xconstructorkey"
-        assert captured["signature_type"] == "eoa"
+        trader._get_client()
+        assert captured["key"] == "0xconstructorkey"
+        assert captured["signature_type"] == 0  # no funder → EOA → 0
 
     def test_no_key_anywhere_raises(self, tmp_path, monkeypatch):
         monkeypatch.delenv("POLYMARKET_PRIVATE_KEY", raising=False)
@@ -332,4 +374,4 @@ class TestPerUserCredentials:
             log_path=tmp_path / "lt.csv", idempotency_path=tmp_path / "id.json",
         )
         with pytest.raises(RuntimeError, match="private key"):
-            trader._get_poly()
+            trader._get_client()

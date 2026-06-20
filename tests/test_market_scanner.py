@@ -25,6 +25,8 @@ def _make_gamma_market(
         "question": "Will the high be above 20°C on June 1?",
         "description": description,
         "endDate": end_date,
+        "clobTokenIds": '["yes-token-123", "no-token-456"]',
+        "orderPriceMinTickSize": 0.01,
     }
     event = {
         "title": "Temperature in London on June 1?",
@@ -35,64 +37,62 @@ def _make_gamma_market(
 
 
 def _make_scanner_with_geocode(lat=51.5, lon=-0.12, tz="Europe/London") -> WeatherMarketScanner:
-    """Return a scanner whose pmxt and geocode calls are mocked."""
+    """Return a scanner whose geocode calls are mocked."""
     loc = MagicMock()
     loc.city = "London"
     loc.lat = lat
     loc.lon = lon
     loc.timezone = tz
-    mock_poly = MagicMock()
-    mock_poly.fetch_market.side_effect = Exception("sidecar not running")
     mock_wc = MagicMock()
     mock_wc.geocode.return_value = loc
-    scanner = WeatherMarketScanner(poly=mock_poly, weather_client=mock_wc)
+    scanner = WeatherMarketScanner(weather_client=mock_wc)
     return scanner
 
 
 class TestBookDepthAttached:
-    def test_book_depth_zero_when_sidecar_unavailable(self):
+    def test_parse_market_book_depth_defaults_to_zero(self):
         """_parse_market leaves book_depth_usd=0.0; scan() populates it post-filter."""
         scanner = _make_scanner_with_geocode()
-        scanner._poly.fetch_market.side_effect = Exception("sidecar not running")
         gm = _make_gamma_market()
-        # _parse_market itself no longer calls _fetch_book_depth_usd
         wm = scanner._parse_market(gm)
         assert wm is not None
-        assert wm.book_depth_usd == 0.0  # default; scan() would try to set it
+        assert wm.book_depth_usd == 0.0  # default; scan() sets it via _fetch_book_depth_usd
 
-    def test_fetch_book_depth_returns_zero_when_sidecar_unavailable(self):
+    def test_fetch_book_depth_returns_zero_for_empty_token_id(self):
         scanner = _make_scanner_with_geocode()
-        scanner._poly.fetch_market.side_effect = Exception("sidecar not running")
-        depth = scanner._fetch_book_depth_usd("abc123", 0.55)
+        depth = scanner._fetch_book_depth_usd("")
+        assert depth == 0.0
+
+    def test_fetch_book_depth_returns_zero_on_clob_error(self):
+        scanner = _make_scanner_with_geocode()
+        mock_client = MagicMock()
+        mock_client.get_order_book.side_effect = Exception("network error")
+        scanner._clob_client = mock_client
+        depth = scanner._fetch_book_depth_usd("yes-token-123")
         assert depth == 0.0
 
     def test_fetch_book_depth_computes_ask_side_usd(self):
         scanner = _make_scanner_with_geocode()
-        mock_market = MagicMock()
-        mock_yes = MagicMock()
-        mock_yes.outcome_id = "yes-token-123"
-        mock_market.yes = mock_yes
-        scanner._poly.fetch_market.return_value = mock_market
-        scanner._poly.fetch_market.side_effect = None
-
-        mock_ob = MagicMock()
-        mock_ob.asks = [MagicMock(price=0.55, size=100), MagicMock(price=0.57, size=50)]
-        scanner._poly.fetch_order_book.return_value = mock_ob
-        scanner._poly.fetch_order_book.side_effect = None
-
-        depth = scanner._fetch_book_depth_usd("abc123", 0.55)
-        # depth = 0.55*100 + 0.57*50 = 55 + 28.5 = 83.5
+        mock_client = MagicMock()
+        mock_client.get_order_book.return_value = {
+            "asks": [
+                {"price": "0.55", "size": "100"},
+                {"price": "0.57", "size": "50"},
+            ]
+        }
+        scanner._clob_client = mock_client
+        depth = scanner._fetch_book_depth_usd("yes-token-123")
+        # 0.55*100 + 0.57*50 = 55 + 28.5 = 83.5
         assert abs(depth - 83.5) < 0.01
 
-    def test_fetch_book_depth_zero_when_no_yes_outcome(self):
+    def test_parse_market_populates_token_ids(self):
+        """clobTokenIds from Gamma API must be stored on the WeatherMarket."""
         scanner = _make_scanner_with_geocode()
-        mock_market = MagicMock()
-        mock_market.yes = None
-        mock_market.outcomes = []
-        scanner._poly.fetch_market.return_value = mock_market
-        scanner._poly.fetch_market.side_effect = None
-        depth = scanner._fetch_book_depth_usd("abc123", 0.55)
-        assert depth == 0.0
+        gm = _make_gamma_market()
+        wm = scanner._parse_market(gm)
+        assert wm is not None
+        assert wm.yes_token_id == "yes-token-123"
+        assert wm.no_token_id == "no-token-456"
 
 
 class TestDescriptionCrossCheck:

@@ -5,7 +5,7 @@ Weather Bot — Ensemble forecast vs. Polymarket weather market arbitrage.
 Modes:
   scan     One-shot: scan markets, evaluate signals, print summary (no logging)
   paper    Continuous paper trading — scan + log signals (default)
-  live     Live trading — Kelly-sized orders via pmxt (requires .env credentials)
+  live     Live trading — Kelly-sized orders via the official CLOB SDK (requires .env credentials)
   stats    Print paper trading dashboard and go-live gate status
   resolve  Interactively resolve outstanding paper trades with actual outcomes
   debug    Print full model internals: 7-day ensemble, scaling ratio, projected totals
@@ -199,8 +199,8 @@ def _execute_live_for_user(
         log_path=user_dir / "live_trades.csv",
         idempotency_path=user_dir / "live_idempotency.json",
         private_key=creds["pk"],
-        proxy_address=creds.get("proxy_address") or user.get("proxy_address"),
-        signature_type=creds.get("signature_type") or user.get("signature_type"),
+        funder_address=creds.get("funder_address"),
+        signature_type=creds.get("signature_type"),
         clob_api_key=creds.get("clob_api_key"),
         clob_secret=creds.get("clob_secret"),
         clob_passphrase=creds.get("clob_passphrase"),
@@ -424,27 +424,13 @@ def mode_debug(scanner: WeatherMarketScanner, generator: SignalGenerator, city_f
         print()
 
 
-def mode_arb(min_spread: float | None, limit: int) -> None:
-    """
-    Surface cross-venue arbitrage opportunities via the hosted pmxt Router.
-    Requires PMXT_API_KEY in .env. Identity-matched markets only — same
-    question, different venues. Net-profitable threshold is roughly 4%
-    once round-trip fees are included.
-    """
-    import pmxt
-    r = pmxt.Router()
-    arbs = r.fetch_arbitrage(min_spread=min_spread, limit=limit, relations=["identity"])
-    if not arbs:
-        print(f"  No identity-matched arb opportunities found (min_spread={min_spread}).")
-        return
-
-    print(f"  {len(arbs)} cross-venue arb opportunities (identity match):\n")
-    print(f"  {'spread':>7}  {'buy':>10}  {'@':>5}  {'sell':>10}  {'@':>5}  {'conf':>5}  Question")
-    print(f"  {'-'*7}  {'-'*10}  {'-'*5}  {'-'*10}  {'-'*5}  {'-'*5}  {'-'*60}")
-    for a in arbs:
-        print(f"  {a.spread:>6.1%}  {a.buy_venue:>10}  {a.buy_price:>5.3f}  "
-              f"{a.sell_venue:>10}  {a.sell_price:>5.3f}  {a.confidence:>5.2f}  "
-              f"{a.market_a.title[:60]}")
+def mode_arb(*_args, **_kwargs) -> None:
+    """Arb mode was removed — the pmxt.Router() dependency has been retired."""
+    print(
+        "  ❌ Arb mode is no longer supported.\n"
+        "  The pmxt library has been replaced by the official py-clob-client-v2 SDK,\n"
+        "  which does not include cross-venue arbitrage scanning."
+    )
 
 
 def mode_backtest(client: WeatherClient) -> None:
@@ -693,12 +679,6 @@ def main() -> None:
                         help="Live trading bankroll in USD for Kelly sizing (default: 500)")
     parser.add_argument("--city", type=str, default=None,
                         help="Filter markets by city name (debug mode only)")
-    parser.add_argument("--min-spread", type=float, default=None,
-                        help="Minimum cross-venue spread filter for arb mode (e.g. 0.04 for 4%%)")
-    parser.add_argument("--limit", type=int, default=20,
-                        help="Max results for arb mode (default: 20)")
-    parser.add_argument("--source", choices=["gamma", "clob"], default="gamma",
-                        help="Market search source: gamma (REST) or clob (pmxt sidecar) (default: gamma)")
     parser.add_argument("--log-dir", type=Path, default=Path("logs"),
                         help="Directory for trade logs and signal files (default: logs/)")
     parser.add_argument("--all-users", action="store_true",
@@ -790,7 +770,7 @@ def main() -> None:
     client        = WeatherClient()
     model         = ProbabilityModel(calibration_log_path=log_dir / "calibration_log.csv")
     bias          = CityBiasCorrector()
-    scanner       = WeatherMarketScanner(source=args.source)
+    scanner       = WeatherMarketScanner()
     price_tracker = PriceTracker()
     generator     = SignalGenerator(model=model, client=client, price_tracker=price_tracker, bias_corrector=bias)
     paper         = PaperTrader(log_path=log_dir / "paper_trades.csv") if args.mode in ("paper", "live") else None
@@ -823,14 +803,14 @@ def main() -> None:
         if not _creds or not _creds.get("pk"):
             # One-time migration: seed from env vars if still present
             pk_env = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
-            proxy_env = os.environ.get("POLYMARKET_PROXY_ADDRESS", "")
+            funder_env = os.environ.get("POLYMARKET_PROXY_ADDRESS", "") or os.environ.get("POLYMARKET_FUNDER_ADDRESS", "")
             if pk_env and admin_uid:
-                sig = "gnosis-safe" if proxy_env else "eoa"
+                sig = 1 if funder_env else 0  # POLY_PROXY vs EOA
                 set_user_creds(
                     admin_uid, pk=pk_env,
-                    proxy_address=proxy_env or None, signature_type=sig,
+                    funder_address=funder_env or None, signature_type=sig,
                 )
-                _creds = {"pk": pk_env, "proxy_address": proxy_env or None, "signature_type": sig}
+                _creds = {"pk": pk_env, "funder_address": funder_env or None, "signature_type": sig}
                 print(
                     "  ℹ️  Migrated admin credentials from env to encrypted store.\n"
                     "  You can now remove POLYMARKET_PRIVATE_KEY and POLYMARKET_PROXY_ADDRESS from .env."
@@ -856,7 +836,7 @@ def main() -> None:
             log_path=log_dir / "live_trades.csv",
             idempotency_path=log_dir / "live_idempotency.json",
             private_key=_creds["pk"],
-            proxy_address=_creds.get("proxy_address"),
+            funder_address=_creds.get("funder_address"),
             signature_type=_creds.get("signature_type"),
             clob_api_key=_creds.get("clob_api_key"),
             clob_secret=_creds.get("clob_secret"),

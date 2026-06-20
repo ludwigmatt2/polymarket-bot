@@ -1,5 +1,5 @@
 """
-Live trader — Kelly-sized order execution via pmxt.
+Live trader — Kelly-sized order execution via the official Polymarket py-clob-client-v2 SDK.
 
 Activated only when paper_trader.compute_stats().ready_for_live == True.
 Credentials are passed via the LiveTrader constructor (from the per-user
@@ -90,46 +90,16 @@ def _get_max_trade_usd() -> float:
     return MAX_LIVE_TRADE_USD
 
 
-def _fetch_clob_balance_direct(
-    address: str, api_key: str, secret: str, passphrase: str
-) -> float:
-    """Query CLOB /balance directly with L2 HMAC auth, bypassing pmxt sidecar.
-
-    Used as a fallback for gnosis-safe accounts where pmxt's hosted sidecar
-    returns 0 despite the account having funds.
-    """
-    import base64
-    import hashlib
-    import hmac as _hmac
-    import json as _json
-    import time
-    import urllib.request
-
-    ts = str(int(time.time()))
-    msg = ts + "GET" + "/balance" + ""
-    try:
-        key_bytes = base64.b64decode(secret)
-    except Exception:
-        key_bytes = secret.encode()
-    sig = base64.b64encode(
-        _hmac.new(key_bytes, msg.encode(), hashlib.sha256).digest()
-    ).decode()
-
-    req = urllib.request.Request(
-        "https://clob.polymarket.com/balance",
-        headers={
-            "POLY_ADDRESS": address,
-            "POLY_SIGNATURE": sig,
-            "POLY_TIMESTAMP": ts,
-            "POLY_NONCE": "0",
-            "POLY_API_KEY": api_key,
-            "POLY_PASSPHRASE": passphrase,
-            "Accept": "application/json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        data = _json.loads(resp.read())
-    return float(data.get("balance", 0) or data.get("free", 0))
+# Maps legacy pmxt string signature types → official SDK integers (mirrors secrets.py).
+_LEGACY_SIG_MAP: dict[str, int] = {
+    "eoa": 0,
+    "poly-proxy": 1,
+    "poly_proxy": 1,
+    "gnosis-safe": 1,   # pmxt used this for email/Google proxy accounts (POLY_PROXY)
+    "gnosis_safe": 2,
+    "poly-1271": 3,
+    "poly_1271": 3,
+}
 
 
 class LiveTrader:
@@ -141,11 +111,13 @@ class LiveTrader:
         log_path: Path = LIVE_TRADES_LOG,
         idempotency_path: Path = _IDEMPOTENCY_FILE,
         private_key: str | None = None,
-        proxy_address: str | None = None,
-        signature_type: str | None = None,
+        funder_address: str | None = None,
+        signature_type: int | str | None = None,
         clob_api_key: str | None = None,
         clob_secret: str | None = None,
         clob_passphrase: str | None = None,
+        # Backward-compat alias — callers using the old field name still work
+        proxy_address: str | None = None,
     ):
         self.paper_trader = paper_trader
         self.bankroll_usd = bankroll_usd
@@ -153,12 +125,16 @@ class LiveTrader:
         self._log_path = log_path
         self._idempotency_path = idempotency_path
         self._private_key = private_key
-        self._proxy_address = proxy_address
-        self._signature_type = signature_type
+        self._funder_address = funder_address or proxy_address  # accept legacy name
+        # Normalise signature_type to int
+        if isinstance(signature_type, str):
+            self._signature_type: int | None = _LEGACY_SIG_MAP.get(signature_type.lower(), 0)
+        else:
+            self._signature_type = signature_type
         self._clob_api_key = clob_api_key
         self._clob_secret = clob_secret
         self._clob_passphrase = clob_passphrase
-        self._poly: Any = None
+        self._client: Any = None
 
     def is_unlocked(self) -> bool:
         return self.paper_trader.compute_stats().ready_for_live
@@ -226,32 +202,57 @@ class LiveTrader:
         if size_usd < 1.0:
             return None
 
-        poly = self._get_poly()
+        from py_clob_client_v2.clob_types import OrderArgsV2, PartialCreateOrderOptions
+        from py_clob_client_v2.order_builder.constants import BUY
+
+        client = self._get_client()
         ep = signal.entry_price
         n_contracts = round(size_usd / ep, 2)
 
-        mkt = poly.fetch_market(id=signal.market.market_id)
-        outcome = mkt.yes if signal.direction == "YES" else mkt.no
-
-        built = poly.build_order(
-            market_id=signal.market.market_id,
-            outcome_id=outcome.market_id,
-            side="buy",
-            type="limit",
-            amount=n_contracts,
-            price=round(ep, 4),
+        # Resolve the CLOB token ID for the direction we're trading
+        token_id = (
+            signal.market.yes_token_id
+            if signal.direction == "YES"
+            else signal.market.no_token_id
         )
-        order = poly.submit_order(built)
-        order_id = str(getattr(order, "id", order))
+        if not token_id:
+            # Fallback: look up from CLOB API (market wasn't scanned with token IDs)
+            market_data = client.get_market(signal.market.market_id)
+            tokens = market_data.get("tokens", [])
+            for t in tokens:
+                if t.get("outcome", "").upper() == signal.direction:
+                    token_id = t.get("token_id", "")
+                    break
+        if not token_id:
+            raise RuntimeError(
+                f"No CLOB token_id for {signal.direction} on {signal.market.market_id}. "
+                "Re-scan to pick up clobTokenIds from Gamma API."
+            )
+
+        tick_size = signal.market.tick_size or "0.01"
+
+        # Reserve the idempotency key BEFORE submitting: if the process dies
+        # between submit and the post-write, the reservation still blocks a
+        # duplicate order on the next run. Roll back if submit itself fails.
+        self._write_idempotency_key(signal, "pending")
+        try:
+            result = client.create_and_post_order(
+                OrderArgsV2(token_id=token_id, price=ep, size=n_contracts, side=BUY),
+                options=PartialCreateOrderOptions(tick_size=tick_size, neg_risk=False),
+            )
+        except Exception:
+            self._remove_idempotency_key(signal)
+            raise
+        order_id = result.get("orderID") or result.get("id") or str(result)
 
         self._write_idempotency_key(signal, order_id)
 
         if self._fill_poll_delay > 0:
             time.sleep(self._fill_poll_delay)
-        order_obj = poly.fetch_order(order_id)
-        filled = float(getattr(order_obj, "filled", 0) or 0)
-        filled_price = float(getattr(order_obj, "price", None) or ep)
-        order_status = str(getattr(order_obj, "status", "unknown"))
+        order_obj = client.get_order(order_id)
+        filled = float(order_obj.get("size_matched", order_obj.get("filled", 0)) or 0)
+        filled_price = float(order_obj.get("price", ep) or ep)
+        order_status = str(order_obj.get("status", "unknown"))
 
         if filled <= 0:
             return {"order_id": order_id, "status": "unfilled", "filled": 0.0}
@@ -265,6 +266,7 @@ class LiveTrader:
             "n_contracts": n_contracts,
             "filled": filled,
             "filled_price": filled_price,
+            "price": filled_price,  # alias used by weather_bot.py display
             "status": order_status,
         }
 
@@ -353,37 +355,14 @@ class LiveTrader:
         return resolved, skipped
 
     def fetch_balance(self) -> float:
-        """Return available USDC balance.
-
-        Tries pmxt first.  If pmxt returns 0 and L2 CLOB credentials are stored
-        (clob_api_key / clob_secret), falls back to a direct CLOB /balance call —
-        needed for gnosis-safe accounts where pmxt's hosted sidecar returns 0.
-        """
-        poly = self._get_poly()
-        balances = poly.fetch_balance()
-        for b in balances:
-            if getattr(b, "currency", "") in ("USDC", "USDC.e"):
-                try:
-                    val = float(getattr(b, "free", 0) or getattr(b, "total", 0))
-                    if val > 0:
-                        return val
-                except (TypeError, ValueError):
-                    pass
-        # pmxt returned 0 — try direct CLOB query if L2 creds are available
-        if self._clob_api_key and self._clob_secret:
-            address = self._proxy_address
-            if not address and self._private_key:
-                from eth_account import Account
-                address = Account.from_key(self._private_key).address
-            if address:
-                try:
-                    return _fetch_clob_balance_direct(
-                        address, self._clob_api_key,
-                        self._clob_secret, self._clob_passphrase or "",
-                    )
-                except Exception:
-                    pass
-        return 0.0
+        """Return available USDC balance via the official CLOB SDK."""
+        from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
+        client = self._get_client()
+        result = client.get_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        )
+        raw = result.get("balance", result.get("allowance", "0")) or "0"
+        return float(raw)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -415,18 +394,6 @@ class LiveTrader:
                     ):
                         return True
 
-        if self._poly is not None:
-            try:
-                positions = self._poly.fetch_positions()
-                for pos in positions:
-                    if (
-                        getattr(pos, "market_id", None) == signal.market.market_id
-                        and float(getattr(pos, "size", 0)) > 0
-                    ):
-                        return True
-            except Exception:
-                pass
-
         return False
 
     def _write_idempotency_key(self, signal: Signal, order_id: str) -> None:
@@ -439,22 +406,51 @@ class LiveTrader:
         except (OSError, json.JSONDecodeError):
             pass
 
-    def _get_poly(self) -> Any:
-        if self._poly is not None:
-            return self._poly
+    def _remove_idempotency_key(self, signal: Signal) -> None:
+        """Roll back a reserved idempotency key (best-effort) when submit fails."""
+        key = self._idempotency_key(signal)
+        try:
+            if not self._idempotency_path.exists():
+                return
+            keys = json.loads(self._idempotency_path.read_text())
+            if keys.pop(key, None) is not None:
+                atomic_write_json(self._idempotency_path, keys)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    def _get_client(self) -> Any:
+        if self._client is not None:
+            return self._client
         pk = self._private_key
         if not pk or pk in ("0x...", ""):
             raise RuntimeError(
                 "No private key — pass credentials via LiveTrader constructor"
             )
-        import pmxt
-        proxy = self._proxy_address
-        self._poly = pmxt.Polymarket(
-            private_key=pk,
-            proxy_address=proxy or None,
-            signature_type=self._signature_type or ("gnosis-safe" if proxy else "eoa"),
+        from py_clob_client_v2 import ClobClient
+        from py_clob_client_v2.clob_types import ApiCreds
+
+        creds = None
+        if self._clob_api_key:
+            creds = ApiCreds(
+                api_key=self._clob_api_key,
+                api_secret=self._clob_secret or "",
+                api_passphrase=self._clob_passphrase or "",
+            )
+
+        sig_type = self._signature_type
+        if sig_type is None:
+            # Default: EOA when no funder set, POLY_PROXY (1) when funder is set
+            sig_type = 0 if not self._funder_address else 1
+
+        self._client = ClobClient(
+            host="https://clob.polymarket.com",
+            chain_id=137,
+            key=pk,
+            creds=creds,
+            signature_type=sig_type,
+            funder=self._funder_address,
         )
-        return self._poly
+        return self._client
 
     def _log_trade(
         self,

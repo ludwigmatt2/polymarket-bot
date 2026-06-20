@@ -36,8 +36,13 @@ class WeatherMarket:
     raw_title: str = ""     # Original title before parsing
     # For monthly aggregate markets (>7d horizon), forecast is summed over a date window
     forecast_start_date: "date | None" = None  # set for monthly markets
-    # Current CLOB order-book depth; 0.0 = not fetched (sidecar unavailable)
+    # Current CLOB order-book depth; 0.0 = not fetched
     book_depth_usd: float = 0.0
+    # CLOB outcome token IDs — captured from Gamma API clobTokenIds field
+    yes_token_id: str = ""
+    no_token_id: str = ""
+    # Minimum tick size as string literal required by PartialCreateOrderOptions
+    tick_size: str = "0.01"
 
 
 @dataclass
