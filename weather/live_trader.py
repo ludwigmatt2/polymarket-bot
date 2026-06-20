@@ -209,6 +209,19 @@ class LiveTrader:
             return None
 
         size_usd = self.kelly_size_usd(signal)
+
+        # Pre-trade balance guard — never size above currently-available USDC.
+        # Re-fetches per trade so cumulative sizing across multiple signals in
+        # one run can't exceed real funds. Skipped when no private key is set
+        # (unit tests inject a mock _poly directly, without credentials).
+        if self._private_key:
+            try:
+                available = self.fetch_balance()
+            except Exception:
+                available = None
+            if available is not None:
+                size_usd = min(size_usd, available)
+
         assert size_usd <= _get_max_trade_usd(), f"kelly_size_usd exceeded cap: {size_usd}"
         if size_usd < 1.0:
             return None

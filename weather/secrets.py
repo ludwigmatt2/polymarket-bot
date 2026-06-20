@@ -52,8 +52,15 @@ def _get_fernet():
     try:
         from cryptography.fernet import Fernet
         return Fernet(key.encode())
-    except Exception:
-        return None
+    except Exception as exc:
+        # Key is explicitly configured but malformed — fail loudly instead of
+        # silently returning None, which callers would mistake for "no creds"
+        # and treat as a (silent) auth failure.
+        raise RuntimeError(
+            "POLYMARKET_SECRETS_KEY is set but is not a valid Fernet key "
+            f"({exc.__class__.__name__}). Generate one with: python -c "
+            "\"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+        ) from exc
 
 
 # ── Encoding helpers ──────────────────────────────────────────────────────────
@@ -101,7 +108,7 @@ def set_user_creds(uid: int, **fields) -> None:
             "No encrypted key storage available. "
             "Install 'keyring' or set POLYMARKET_SECRETS_KEY in .env."
         )
-    _ENC_KEYS_FILE.parent.mkdir(exist_ok=True)
+    _ENC_KEYS_FILE.parent.mkdir(parents=True, exist_ok=True)
     store: dict = {}
     if _ENC_KEYS_FILE.exists():
         try:
