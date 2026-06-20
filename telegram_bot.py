@@ -30,7 +30,7 @@ from typing import Optional
 
 from dotenv import load_dotenv
 from weather._io import atomic_write_text
-from weather.secrets import get_user_key, set_user_key
+from weather.secrets import get_user_key, set_user_creds, set_user_key
 import telegram_views
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -969,8 +969,11 @@ async def cmd_setup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if len(ctx.args) > 1:
+        proxy = ctx.args[1]
+        set_user_creds(uid, proxy_address=proxy, signature_type="gnosis-safe")
         with _users_transaction() as users:
-            users[uid]["proxy_address"] = ctx.args[1]
+            users[uid]["proxy_address"] = proxy
+            users[uid]["signature_type"] = "gnosis-safe"
 
     # Best-effort: delete the user's message to remove the key from chat history
     try:
@@ -1363,6 +1366,34 @@ _ADMIN_COMMANDS = _USER_COMMANDS + [
     ("setmaxbet",   "💰 Set max bet size per trade (e.g. /setmaxbet 50)"),
 ]
 
+async def _auto_scan(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Scheduled job: paper scan + fan-out to all users. Runs every AUTO_SCAN_INTERVAL seconds."""
+    stdout, stderr, rc = await run_bot_async("paper", ADMIN_ID)
+    if rc not in (0, -2):
+        try:
+            await ctx.bot.send_message(
+                ADMIN_ID,
+                f"⚠️ Auto-scan failed\n```\n{(stderr or stdout)[-300:].strip()}\n```",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+
+
+async def _auto_resolve(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Scheduled job: auto-resolve pending trades. Runs every AUTO_RESOLVE_INTERVAL seconds."""
+    stdout, stderr, rc = await run_bot_async("auto-resolve", ADMIN_ID)
+    if rc not in (0, -2):
+        try:
+            await ctx.bot.send_message(
+                ADMIN_ID,
+                f"⚠️ Auto-resolve failed\n```\n{(stderr or stdout)[-300:].strip()}\n```",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+
+
 async def _register_commands(app) -> None:
     from telegram import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeChat
     user_cmds  = [BotCommand(c, d) for c, d in _USER_COMMANDS]
@@ -1417,6 +1448,16 @@ async def _run() -> None:
         await app.start()
         await _register_commands(app)
         app.job_queue.run_repeating(check_alerts, interval=120, first=10)
+
+        # Automatic scan + resolve — replace launchd on Railway.
+        # Override intervals via env vars; set to 0 to disable.
+        scan_interval    = int(os.environ.get("AUTO_SCAN_INTERVAL",    "14400"))  # 4h
+        resolve_interval = int(os.environ.get("AUTO_RESOLVE_INTERVAL", "3600"))   # 1h
+        if scan_interval > 0:
+            app.job_queue.run_repeating(_auto_scan,    interval=scan_interval,    first=300)
+        if resolve_interval > 0:
+            app.job_queue.run_repeating(_auto_resolve, interval=resolve_interval, first=600)
+
         await app.updater.start_polling(drop_pending_updates=True)
         print("Polymarket Bot online.", flush=True)
         await asyncio.Event().wait()

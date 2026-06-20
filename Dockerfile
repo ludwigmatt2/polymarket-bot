@@ -9,9 +9,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy source
 COPY . .
 
-# Logs directory (will be overridden by volume mount)
-RUN mkdir -p logs
+# Persistent data dirs — overridden by Railway volume mount at /data
+RUN mkdir -p /data/logs /data/config
 
-EXPOSE 8765
-
-CMD ["python", "-m", "uvicorn", "dashboard.server:app", "--host", "0.0.0.0", "--port", "8765", "--log-level", "info"]
+CMD ["python", "telegram_bot.py"]
