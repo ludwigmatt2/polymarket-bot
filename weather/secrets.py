@@ -31,8 +31,16 @@ _ENC_KEYS_FILE = _DATA_DIR / "config" / "user_keys.enc.json"
 
 @functools.lru_cache(maxsize=1)
 def _get_keyring():
+    # Skip keyring when a Fernet key is configured — Fernet is portable across
+    # all environments (including headless Linux containers on Railway).
+    if os.environ.get("POLYMARKET_SECRETS_KEY", "").strip():
+        return None
     try:
         import keyring as _kr
+        # Detect the no-op fail backend (installed but no daemon running).
+        from keyring.backends.fail import Keyring as _FailBackend
+        if isinstance(_kr.get_keyring(), _FailBackend):
+            return None
         return _kr
     except Exception:
         return None
