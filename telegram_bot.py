@@ -1099,13 +1099,17 @@ async def cmd_mymode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             + "\n".join(f"  · {r}" for r in reasons),
         )
         return
+    # One-time token ties this confirm button to this prompt, so a stale button
+    # tapped later (or after a restart) can't silently flip the user to live.
+    token = os.urandom(6).hex()
+    ctx.user_data["liveconfirm_token"] = token
     await update.message.reply_text(
         "⚠️ *Switching to LIVE trading*\n\n"
         "The bot will place real orders with *your* USDC on every scheduled scan, "
         "sized by Kelly fraction against your balance. Losses are real.\n\n"
         "Confirm?",
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Yes, trade my real money", callback_data="liveconfirm"),
+            InlineKeyboardButton("✅ Yes, trade my real money", callback_data=f"liveconfirm:{token}"),
             InlineKeyboardButton("❌ Cancel", callback_data="status"),
         ]]),
         parse_mode="Markdown",
@@ -1195,23 +1199,41 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(
             fmt_trades(uid), reply_markup=why_kb(uid) or main_kb(uid), parse_mode="Markdown"
         )
-    elif data == "liveconfirm":
+    elif data.startswith("liveconfirm"):
+        # One-time token: rejects a stale confirm button from an earlier prompt
+        # (or one left over across a bot restart) so it can't flip mode to live.
+        token    = data.split(":", 1)[1] if ":" in data else ""
+        expected = ctx.user_data.pop("liveconfirm_token", None)
+        if not token or token != expected:
+            await q.edit_message_text(
+                "⌛ This confirmation expired — run /mymode live again.",
+                reply_markup=main_kb(uid),
+            )
+            return
+        # Distinguish "no wallet" from "gate not ready" — the old combined check
+        # rendered an empty reason list when the only problem was a missing key.
+        if not (get_user_key(uid) or get_user_private_key(uid)):
+            await q.edit_message_text(
+                "🔴 No wallet connected — run /wallet\\_setup first.",
+                reply_markup=main_kb(uid), parse_mode="Markdown",
+            )
+            return
         # Re-check the gate at confirm time — it may have flipped since the prompt.
         ready, reasons = _global_gate_check()
-        if not (get_user_key(uid) or get_user_private_key(uid)) or not ready:
+        if not ready:
             await q.edit_message_text(
                 "🔴 Live no longer available:\n" + "\n".join(f"  · {r}" for r in reasons),
                 reply_markup=main_kb(uid),
             )
-        else:
-            with _users_transaction() as users:
-                users[uid]["mode"] = "live"
-                users[uid]["live_confirmed_at"] = datetime.utcnow().isoformat()
-            await q.edit_message_text(
-                "🟢 *Mode set to LIVE.* Orders execute on the next scheduled scan.\n"
-                "Switch back any time with `/mymode paper`.",
-                reply_markup=main_kb(uid), parse_mode="Markdown",
-            )
+            return
+        with _users_transaction() as users:
+            users[uid]["mode"] = "live"
+            users[uid]["live_confirmed_at"] = datetime.utcnow().isoformat()
+        await q.edit_message_text(
+            "🟢 *Mode set to LIVE.* Orders execute on the next scheduled scan.\n"
+            "Switch back any time with `/mymode paper`.",
+            reply_markup=main_kb(uid), parse_mode="Markdown",
+        )
     elif data.startswith("why:"):
         trades_csv = _trades_csv_path(uid)
         rows: list[dict] = []
@@ -1319,10 +1341,14 @@ async def check_alerts(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if halt_file.exists():
             mtime = halt_file.stat().st_mtime
             if mtime > _seen_halt_mtimes.get(uid, 0.0):
-                _seen_halt_mtimes[uid] = mtime
-                if mtime >= _BOT_START_TS:
+                try:
+                    halt = json.loads(halt_file.read_text())
+                except (OSError, json.JSONDecodeError):
+                    halt = None  # half-written/corrupt — retry next cycle
+                if halt is not None:
+                    _seen_halt_mtimes[uid] = mtime
+                if halt is not None and mtime >= _BOT_START_TS:
                     try:
-                        halt = json.loads(halt_file.read_text())
                         text = (
                             f"⛔ *Live trading halted*\n"
                             f"Reason: {halt.get('reason', '?')}\n"
@@ -1341,33 +1367,40 @@ async def check_alerts(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if signals_file.exists():
             mtime = signals_file.stat().st_mtime
             if mtime > _seen_signals_mtimes.get(uid, 0.0):
-                _seen_signals_mtimes[uid] = mtime
-                data    = json.loads(signals_file.read_text())
-                signals = [s for s in data.get("signals", []) if s.get("edge_pp", 0) >= 0.30]
-                if signals:
-                    text = (
-                        f"🔔 *Scheduled scan — {len(signals)} signal(s)*\n\n"
-                        f"{fmt_signals(signals, uid)}"
-                    )
-                    try:
-                        await bot.send_message(uid, text, parse_mode="Markdown")
-                    except Exception:
-                        pass
+                try:
+                    data = json.loads(signals_file.read_text())
+                except (OSError, json.JSONDecodeError):
+                    data = None  # half-written/corrupt — retry next cycle, keep mtime
+                if data is not None:
+                    _seen_signals_mtimes[uid] = mtime
+                    signals = [s for s in data.get("signals", []) if s.get("edge_pp", 0) >= 0.30]
+                    if signals:
+                        text = (
+                            f"🔔 *Scheduled scan — {len(signals)} signal(s)*\n\n"
+                            f"{fmt_signals(signals, uid)}"
+                        )
+                        try:
+                            await bot.send_message(uid, text, parse_mode="Markdown")
+                        except Exception:
+                            pass
 
         # Resolved trades alert — enhanced with wallet context
         if resolved_file.exists():
             mtime = resolved_file.stat().st_mtime
             if mtime > _seen_resolved_mtimes.get(uid, 0.0):
+                try:
+                    data = json.loads(resolved_file.read_text())
+                except (OSError, json.JSONDecodeError):
+                    continue  # half-written/corrupt — retry next cycle, keep mtime
                 _seen_resolved_mtimes[uid] = mtime
-                data     = json.loads(resolved_file.read_text())
                 resolved = data.get("resolved", [])
                 if resolved:
-                    batch_pnl = sum(t.get("pnl_usd", 0) for t in resolved)
+                    batch_pnl = sum(float(t.get("pnl_usd") or 0) for t in resolved)
                     e         = "✅" if batch_pnl >= 0 else "❌"
                     lines     = [f"{e} *{len(resolved)} trade(s) resolved* — *${batch_pnl:+.2f}*\n"]
 
                     for t in resolved[:5]:
-                        pnl   = t.get("pnl_usd", 0)
+                        pnl   = float(t.get("pnl_usd") or 0)
                         em    = "✅" if pnl > 0 else "❌"
                         title = t.get("market_title", "?")
                         if " - " in title:

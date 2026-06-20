@@ -245,7 +245,10 @@ def _find_gaps(poly_markets: list[dict], kalshi_markets: list[dict], min_gap: fl
             poly_yes = float(prices[0])
         except (IndexError, TypeError, ValueError):
             continue
-        kalshi_yes = float(best_km.get("yes", {}).get("price") or 0) or None
+        # `yes` may be a {"price": ...} dict or a bare scalar price depending on
+        # the sidecar payload — handle both rather than assuming a dict.
+        yv = best_km.get("yes")
+        kalshi_yes = float((yv.get("price") if isinstance(yv, dict) else yv) or 0) or None
         if not kalshi_yes or poly_yes <= 0 or poly_yes >= 1:
             continue
 
