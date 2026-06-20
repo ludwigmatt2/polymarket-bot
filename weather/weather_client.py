@@ -14,6 +14,7 @@ import time
 from datetime import date, datetime, timedelta
 from functools import lru_cache
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -374,9 +375,8 @@ class WeatherClient:
         Fetch all ensemble member values for a single model on a target date.
         Returns a flat list of member values (one float per member).
         """
-        days_ahead = (target_date - date.today()).days + 1
         # Ensemble models cap at 7–10 days; clamp to 7 for safety
-        forecast_days = max(1, min(days_ahead, 7))
+        forecast_days = _forecast_days_for(location.timezone, target_date, cap=7)
         params = {
             "latitude": location.lat,
             "longitude": location.lon,
@@ -398,7 +398,7 @@ class WeatherClient:
         Fetch deterministic forecast from each model separately for spread calculation.
         Returns {model_name: forecast_value}.
         """
-        forecast_days = max(1, (target_date - date.today()).days + 1)
+        forecast_days = _forecast_days_for(location.timezone, target_date)
         target_str = target_date.isoformat()
         means: dict[str, float] = {}
 
@@ -513,6 +513,23 @@ class WeatherClient:
         avg_monthly = sum(monthly_totals) / len(monthly_totals)
         avg_first7 = sum(first7_totals) / len(first7_totals)
         return avg_monthly / avg_first7 if avg_first7 > 0 else naive_ratio
+
+
+def _forecast_days_for(timezone: str, target_date: date, cap: int | None = None) -> int:
+    """forecast_days to request so target_date lands inside the returned window.
+
+    Open-Meteo counts forecast_days from 'today' in the *requested* timezone,
+    which can differ from the server's UTC date by up to a day. Anchor on the
+    location's local date (NOT date.today(), which is server-UTC) and add a
+    1-day buffer for the midnight boundary; _find_time_index then selects the
+    exact day. Over-fetching is harmless; under-fetching silently drops markets.
+    """
+    try:
+        local_today = datetime.now(ZoneInfo(timezone)).date()
+    except Exception:
+        local_today = date.today()  # invalid/"auto" tz — fall back to UTC date
+    days = max(1, (target_date - local_today).days + 2)  # +1 inclusive, +1 buffer
+    return min(days, cap) if cap is not None else days
 
 
 def _find_time_index(daily: dict, target_date: date) -> int | None:
