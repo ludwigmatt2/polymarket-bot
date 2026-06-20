@@ -37,7 +37,13 @@ import os
 
 from weather._io import atomic_write_text
 from weather.config import MIN_PROFIT_FACTOR, MIN_RESOLVED_TRADES
-from weather.secrets import get_user_creds, get_user_key, set_user_creds, set_user_key
+from weather.secrets import (
+    derive_and_store_clob_creds,
+    get_user_creds,
+    get_user_key,
+    set_user_creds,
+    set_user_key,
+)
 
 ROOT = Path(__file__).parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", ROOT))
@@ -387,7 +393,19 @@ async def on_proxy_paste(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return PROXY_PASTE
 
-    await update.message.reply_text("✅ Account connected. Checking it works...")
+    await update.message.reply_text("✅ Account connected. Deriving trading credentials...")
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(derive_and_store_clob_creds, uid),
+            timeout=20,
+        )
+        await update.effective_chat.send_message("🔑 L2 credentials derived and stored.")
+    except Exception as exc:
+        await update.effective_chat.send_message(
+            f"⚠️ Could not derive L2 credentials ({type(exc).__name__}). "
+            "Balance checks may show $0. Run /wallet\\_setup again to retry.",
+            parse_mode="Markdown",
+        )
     await _balance_reply(update.effective_chat, uid)
     await update.effective_chat.send_message(_DONE_TEXT, parse_mode="Markdown")
     return ConversationHandler.END

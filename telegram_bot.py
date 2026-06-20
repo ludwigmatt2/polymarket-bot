@@ -30,7 +30,7 @@ from typing import Optional
 
 from dotenv import load_dotenv
 from weather._io import atomic_write_text
-from weather.secrets import get_user_key, set_user_creds, set_user_key
+from weather.secrets import derive_and_store_clob_creds, get_user_key, set_user_creds, set_user_key
 import telegram_views
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -982,8 +982,20 @@ async def cmd_setup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception:
         key_deleted = False
 
+    # Derive L2 CLOB credentials from L1 key (non-blocking, best-effort)
+    try:
+        import asyncio as _asyncio
+        await _asyncio.wait_for(
+            _asyncio.to_thread(derive_and_store_clob_creds, uid),
+            timeout=20,
+        )
+        l2_note = "🔑 L2 trading credentials derived and stored.\n"
+    except Exception:
+        l2_note = "⚠️ L2 credential derivation failed — balance checks may show $0. Run /setup again to retry.\n"
+
     reply = (
-        "✅ Credentials saved (encrypted). Use `/mymode live` to switch to live trading.\n\n"
+        f"✅ Credentials saved (encrypted).\n{l2_note}\n"
+        "Use `/mymode live` to switch to live trading.\n\n"
     )
     if not key_deleted:
         reply += (

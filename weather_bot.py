@@ -810,6 +810,15 @@ def main() -> None:
         from weather.secrets import get_user_creds, set_user_creds
         admin_uid = int(os.environ.get("ADMIN_ID", "0"))
         _creds = get_user_creds(admin_uid) if admin_uid else None
+        # Auto-derive L2 creds if missing (first run after key was stored)
+        if _creds and _creds.get("pk") and not _creds.get("clob_api_key"):
+            try:
+                from weather.secrets import derive_and_store_clob_creds
+                l2 = derive_and_store_clob_creds(admin_uid)
+                _creds.update(l2)
+                print("  ✅ L2 CLOB credentials derived and stored.")
+            except Exception as exc:
+                print(f"  ⚠️  L2 credential derivation failed: {exc}", file=sys.stderr)
         if not _creds or not _creds.get("pk"):
             # One-time migration: seed from env vars if still present
             pk_env = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
@@ -825,6 +834,14 @@ def main() -> None:
                     "  ℹ️  Migrated admin credentials from env to encrypted store.\n"
                     "  You can now remove POLYMARKET_PRIVATE_KEY and POLYMARKET_PROXY_ADDRESS from .env."
                 )
+                # Derive L2 CLOB credentials so balance checks work
+                try:
+                    from weather.secrets import derive_and_store_clob_creds
+                    l2 = derive_and_store_clob_creds(admin_uid)
+                    _creds.update(l2)
+                    print("  ✅ L2 CLOB credentials derived and stored.")
+                except Exception as exc:
+                    print(f"  ⚠️  L2 credential derivation failed: {exc}", file=sys.stderr)
             else:
                 print(
                     "  ❌ No admin credentials in encrypted store.\n"

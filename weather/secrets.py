@@ -135,6 +135,86 @@ def get_user_creds(uid: int) -> dict | None:
     return None
 
 
+# ── L2 credential derivation ─────────────────────────────────────────────────
+
+def derive_clob_creds(pk: str) -> dict:
+    """Derive L2 CLOB API credentials from an L1 private key.
+
+    Signs a ClobAuth EIP-712 message with the private key and calls
+    POST https://clob.polymarket.com/auth/api-key to get (or re-derive)
+    the deterministic L2 credentials tied to this key.
+
+    Returns {"clob_api_key": ..., "clob_secret": ..., "clob_passphrase": ...}.
+    Raises RuntimeError on network or auth failure.
+    """
+    import json as _json
+    import time
+    import urllib.request
+    import urllib.error
+    from eth_account import Account
+    from eth_account.messages import encode_typed_data
+
+    account = Account.from_key(pk)
+    ts = str(int(time.time()))
+    nonce = 0
+
+    msg = encode_typed_data(
+        domain_data={"name": "ClobAuthDomain", "version": "1", "chainId": 137},
+        message_types={
+            "ClobAuth": [
+                {"name": "key", "type": "string"},
+                {"name": "value", "type": "string"},
+            ]
+        },
+        message_data={
+            "key": "user",
+            "value": _json.dumps({"timestamp": ts, "nonce": nonce}, separators=(",", ":")),
+        },
+    )
+    signed = account.sign_message(msg)
+    sig = "0x" + signed.signature.hex()
+
+    req = urllib.request.Request(
+        "https://clob.polymarket.com/auth/api-key",
+        data=b"",
+        method="POST",
+        headers={
+            "POLY_ADDRESS": account.address,
+            "POLY_SIGNATURE": sig,
+            "POLY_TIMESTAMP": ts,
+            "POLY_NONCE": str(nonce),
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = _json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode(errors="replace")
+        raise RuntimeError(f"CLOB auth failed ({exc.code}): {body}") from None
+
+    return {
+        "clob_api_key": data["apiKey"],
+        "clob_secret": data["secret"],
+        "clob_passphrase": data["passphrase"],
+    }
+
+
+def derive_and_store_clob_creds(uid: int) -> dict:
+    """Derive L2 CLOB credentials for uid and persist them in the encrypted store.
+
+    Requires pk to already be stored for uid.
+    Returns the derived creds dict.
+    Raises RuntimeError if pk is missing or derivation fails.
+    """
+    creds = get_user_creds(uid)
+    if not creds or not creds.get("pk"):
+        raise RuntimeError(f"No private key stored for uid={uid}")
+    l2 = derive_clob_creds(creds["pk"])
+    set_user_creds(uid, **l2)
+    return l2
+
+
 # ── Backward-compat wrappers ──────────────────────────────────────────────────
 
 def set_user_key(uid: int, pk: str) -> None:
