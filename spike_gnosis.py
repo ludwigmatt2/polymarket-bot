@@ -25,13 +25,11 @@ Polymarket login flow where Polymarket holds a proxy wallet on your behalf.
 
 from __future__ import annotations
 
-import json
 import os
 import time
-import urllib.parse
-import urllib.request
 
 from dotenv import load_dotenv
+from spike_eoa import _fail, _find_cheap_weather_market
 
 load_dotenv()
 
@@ -53,41 +51,6 @@ def _check_onchain_balance(address: str) -> float | None:
         return int(resp.json()["result"], 16) / 1e6
     except Exception:
         return None
-
-
-def _find_cheap_weather_market() -> dict | None:
-    """Use Gamma API to find a cheap active weather market (NO price 5–25¢)."""
-    tick_map = {0.1: "0.1", 0.01: "0.01", 0.001: "0.001", 0.0001: "0.0001"}
-    for term in ("temperature", "weather", "rain"):
-        url = (
-            "https://gamma-api.polymarket.com/markets"
-            f"?active=true&limit=50&q={urllib.parse.quote(term)}"
-        )
-        try:
-            with urllib.request.urlopen(url, timeout=10) as r:
-                markets = json.loads(r.read())
-        except Exception:
-            continue
-        items = markets if isinstance(markets, list) else markets.get("markets", [])
-        for m in items:
-            try:
-                prices = json.loads(m.get("outcomePrices", "[]"))
-                yes_p = float(prices[0]) if prices else 0.5
-                no_p = 1.0 - yes_p
-                token_ids = json.loads(m.get("clobTokenIds", "[]"))
-                tick_raw = float(m.get("orderPriceMinTickSize", 0.01) or 0.01)
-                if 0.05 <= no_p <= 0.25 and len(token_ids) >= 2:
-                    return {
-                        "title": m.get("question", m.get("slug", "?")),
-                        "yes_price": yes_p,
-                        "no_price": no_p,
-                        "yes_token_id": token_ids[0],
-                        "no_token_id": token_ids[1],
-                        "tick_size": tick_map.get(tick_raw, "0.01"),
-                    }
-            except Exception:
-                continue
-    return None
 
 
 def run_spike() -> None:
@@ -236,10 +199,6 @@ def run_spike() -> None:
         print(f"\nPOLY_PROXY PATH: works — admin live trading unblocked")
         print(f"\n⚠️  Cancel the open order via Polymarket UI or note the ID:")
         print(f"   order_id = {order_id!r}")
-
-
-def _fail(step: str, err: Exception) -> None:
-    print(f"\n❌ FAILED at {step}: {type(err).__name__}: {err}")
 
 
 def _check_hints(err: Exception) -> None:

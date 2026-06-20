@@ -803,7 +803,7 @@ def main() -> None:
         if not _creds or not _creds.get("pk"):
             # One-time migration: seed from env vars if still present
             pk_env = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
-            funder_env = os.environ.get("POLYMARKET_PROXY_ADDRESS", "") or os.environ.get("POLYMARKET_FUNDER_ADDRESS", "")
+            funder_env = os.environ.get("POLYMARKET_FUNDER_ADDRESS", "") or os.environ.get("POLYMARKET_PROXY_ADDRESS", "")
             if pk_env and admin_uid:
                 sig = 1 if funder_env else 0  # POLY_PROXY vs EOA
                 set_user_creds(

@@ -23,6 +23,7 @@ from .config import (
 )
 from .models import Location, Signal
 from .paper_trader import PaperTrader, _brier, _evaluate_outcome
+from .secrets import _LEGACY_SIG_MAP
 
 from .paths import DATA_DIR as _DATA_DIR
 LIVE_TRADES_LOG = _DATA_DIR / "logs" / "live_trades.csv"
@@ -90,6 +91,40 @@ def _get_max_trade_usd() -> float:
     return MAX_LIVE_TRADE_USD
 
 
+def _make_clob_client(
+    pk: str,
+    funder_address: str | None = None,
+    signature_type: int | str | None = None,
+    clob_api_key: str | None = None,
+    clob_secret: str | None = None,
+    clob_passphrase: str | None = None,
+) -> Any:
+    """Build an authenticated ClobClient. Normalises signature_type to int."""
+    from py_clob_client_v2 import ClobClient
+    if isinstance(signature_type, str):
+        sig_type: int = _LEGACY_SIG_MAP.get(signature_type.lower(), 0)
+    elif signature_type is None:
+        sig_type = 0 if not funder_address else 1
+    else:
+        sig_type = signature_type
+    creds = None
+    if clob_api_key:
+        from py_clob_client_v2.clob_types import ApiCreds
+        creds = ApiCreds(
+            api_key=clob_api_key,
+            api_secret=clob_secret or "",
+            api_passphrase=clob_passphrase or "",
+        )
+    return ClobClient(
+        host="https://clob.polymarket.com",
+        chain_id=137,
+        key=pk,
+        creds=creds,
+        signature_type=sig_type,
+        funder=funder_address,
+    )
+
+
 def fetch_balance_for_creds(creds: dict) -> float:
     """Read available USDC for a user's stored creds via the official CLOB SDK.
 
@@ -98,29 +133,18 @@ def fetch_balance_for_creds(creds: dict) -> float:
     weather.secrets.get_user_creds (pk + funder_address + integer signature_type
     + optional clob_* L2 creds).
     """
-    trader = LiveTrader(
-        paper_trader=None,  # balance read never touches paper state
-        bankroll_usd=0.0,
-        private_key=creds.get("pk"),
+    from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
+    client = _make_clob_client(
+        pk=creds.get("pk", ""),
         funder_address=creds.get("funder_address"),
         signature_type=creds.get("signature_type"),
         clob_api_key=creds.get("clob_api_key"),
         clob_secret=creds.get("clob_secret"),
         clob_passphrase=creds.get("clob_passphrase"),
     )
-    return trader.fetch_balance()
-
-
-# Maps legacy pmxt string signature types → official SDK integers (mirrors secrets.py).
-_LEGACY_SIG_MAP: dict[str, int] = {
-    "eoa": 0,
-    "poly-proxy": 1,
-    "poly_proxy": 1,
-    "gnosis-safe": 1,   # pmxt used this for email/Google proxy accounts (POLY_PROXY)
-    "gnosis_safe": 2,
-    "poly-1271": 3,
-    "poly_1271": 3,
-}
+    result = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+    raw = result.get("balance", result.get("allowance", "0")) or "0"
+    return float(raw)
 
 
 class LiveTrader:
@@ -147,11 +171,7 @@ class LiveTrader:
         self._idempotency_path = idempotency_path
         self._private_key = private_key
         self._funder_address = funder_address or proxy_address  # accept legacy name
-        # Normalise signature_type to int
-        if isinstance(signature_type, str):
-            self._signature_type: int | None = _LEGACY_SIG_MAP.get(signature_type.lower(), 0)
-        else:
-            self._signature_type = signature_type
+        self._signature_type = signature_type  # normalised to int by _make_clob_client
         self._clob_api_key = clob_api_key
         self._clob_secret = clob_secret
         self._clob_passphrase = clob_passphrase
@@ -445,29 +465,13 @@ class LiveTrader:
             raise RuntimeError(
                 "No private key — pass credentials via LiveTrader constructor"
             )
-        from py_clob_client_v2 import ClobClient
-        from py_clob_client_v2.clob_types import ApiCreds
-
-        creds = None
-        if self._clob_api_key:
-            creds = ApiCreds(
-                api_key=self._clob_api_key,
-                api_secret=self._clob_secret or "",
-                api_passphrase=self._clob_passphrase or "",
-            )
-
-        sig_type = self._signature_type
-        if sig_type is None:
-            # Default: EOA when no funder set, POLY_PROXY (1) when funder is set
-            sig_type = 0 if not self._funder_address else 1
-
-        self._client = ClobClient(
-            host="https://clob.polymarket.com",
-            chain_id=137,
-            key=pk,
-            creds=creds,
-            signature_type=sig_type,
-            funder=self._funder_address,
+        self._client = _make_clob_client(
+            pk=pk,
+            funder_address=self._funder_address,
+            signature_type=self._signature_type,
+            clob_api_key=self._clob_api_key,
+            clob_secret=self._clob_secret,
+            clob_passphrase=self._clob_passphrase,
         )
         return self._client
 

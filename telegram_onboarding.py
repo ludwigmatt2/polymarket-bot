@@ -165,7 +165,7 @@ def register_user(uid: int, username: str, role: str, invited_by: int) -> None:
             "username": username or "",
             "added_at": datetime.utcnow().isoformat(),
             "mode": "paper",
-            "proxy_address": None,
+            "funder_address": None,
             "wallet_address": None,
             "wallet_type": "none",
             "signature_type": None,

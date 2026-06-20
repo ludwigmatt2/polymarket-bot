@@ -327,16 +327,9 @@ class TestPerUserCredentials:
             def __init__(self, **kwargs):
                 captured.update(kwargs)
 
-        class FakeApiCreds:
-            def __init__(self, **kwargs): pass
-
         import types as _types
         fake_root = _types.ModuleType("py_clob_client_v2")
         fake_root.ClobClient = FakeClobClient
-        fake_clob_types = sys.modules.get("py_clob_client_v2.clob_types")
-        if fake_clob_types is not None:
-            fake_clob_types.ApiCreds = FakeApiCreds
-
         monkeypatch.setitem(sys.modules, "py_clob_client_v2", fake_root)
         return captured
 

@@ -475,11 +475,10 @@ class WeatherMarketScanner:
         if not yes_token_id:
             return 0.0
         try:
-            client = self._clob_client
-            if client is None:
+            if self._clob_client is None:
                 from py_clob_client_v2 import ClobClient
-                client = ClobClient(host="https://clob.polymarket.com", chain_id=137)
-            ob = client.get_order_book(yes_token_id)
+                self._clob_client = ClobClient(host="https://clob.polymarket.com", chain_id=137)
+            ob = self._clob_client.get_order_book(yes_token_id)
             asks = ob.get("asks", [])
             return sum(float(a["price"]) * float(a["size"]) for a in asks) if asks else 0.0
         except Exception:
