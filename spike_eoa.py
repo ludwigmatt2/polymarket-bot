@@ -51,12 +51,14 @@ def generate_eoa() -> None:
 
 
 def _find_cheap_weather_market() -> dict | None:
-    """Use Gamma API to find a cheap active weather market (NO price 5–25¢)."""
+    """Gamma API → any active weather market with valid clobTokenIds and a sane
+    (non-pinned) price. Broad on purpose: the spike places a resting bid far
+    below market, so we just need a real, tradeable book — not a cheap one."""
     tick_map = {0.1: "0.1", 0.01: "0.01", 0.001: "0.001", 0.0001: "0.0001"}
-    for term in ("temperature", "weather", "rain"):
+    for term in ("temperature", "weather", "rain", "snow", "climate", "heat"):
         url = (
             "https://gamma-api.polymarket.com/markets"
-            f"?active=true&limit=50&q={urllib.parse.quote(term)}"
+            f"?active=true&closed=false&limit=100&q={urllib.parse.quote(term)}"
         )
         try:
             with urllib.request.urlopen(url, timeout=10) as r:
@@ -67,11 +69,13 @@ def _find_cheap_weather_market() -> dict | None:
         for m in items:
             try:
                 prices = json.loads(m.get("outcomePrices", "[]"))
-                yes_p = float(prices[0]) if prices else 0.5
+                yes_p = float(prices[0]) if prices else 0.0
                 no_p = 1.0 - yes_p
                 token_ids = json.loads(m.get("clobTokenIds", "[]"))
                 tick_raw = float(m.get("orderPriceMinTickSize", 0.01) or 0.01)
-                if 0.05 <= no_p <= 0.25 and len(token_ids) >= 2:
+                # Both outcomes must be tradeable (price not pinned at 0/1) and
+                # the market must expose two CLOB token IDs.
+                if 0.02 <= yes_p <= 0.98 and len(token_ids) >= 2:
                     return {
                         "title": m.get("question", m.get("slug", "?")),
                         "yes_price": yes_p,

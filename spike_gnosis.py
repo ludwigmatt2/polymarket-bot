@@ -57,7 +57,7 @@ def run_spike() -> None:
     from py_clob_client_v2 import ClobClient
     from py_clob_client_v2.clob_types import (
         ApiCreds, AssetType, BalanceAllowanceParams,
-        OrderArgsV2, PartialCreateOrderOptions,
+        OrderArgsV2, OrderPayload, PartialCreateOrderOptions,
     )
     from py_clob_client_v2.order_builder.constants import BUY
 
@@ -154,52 +154,56 @@ def run_spike() -> None:
     print(f"      YES={market['yes_price']:.3f}  NO={market['no_price']:.3f}")
     print(f"      NO token ID: {market['no_token_id'][:20]}...")
 
-    # ── 4. $1 limit order ────────────────────────────────────────────────────
+    # ── 4. Resting NO bid, well below market — validates the post path without
+    #       taking a position. post_only makes it maker-only (rejected, never
+    #       filled, if it would ever cross the book). ──────────────────────────
     no_price = market["no_price"]
-    n_contracts = round(1.0 / no_price, 2)
-    tick_size = market["tick_size"]
-    print(f"\n[4/5] Submitting $1 limit order (NO side)...")
-    print(f"      {n_contracts} contracts @ {no_price:.3f}  tick={tick_size}")
+    tick = float(market["tick_size"])
+    bid = max(tick, round(round(no_price * 0.25 / tick) * tick, 6))  # 75% below market
+    n_contracts = round(max(1.0 / bid, 5.0), 2)
+    print(f"\n[4/5] Posting a resting NO bid (~${bid * n_contracts:.2f}, won't fill)...")
+    print(f"      {n_contracts} @ {bid:.4f}   (market NO={no_price:.3f}, tick={market['tick_size']})")
 
     order_id = None
     try:
         result = client.create_and_post_order(
             OrderArgsV2(
                 token_id=market["no_token_id"],
-                price=no_price,
+                price=bid,
                 size=n_contracts,
                 side=BUY,
             ),
-            options=PartialCreateOrderOptions(tick_size=tick_size, neg_risk=False),
+            options=PartialCreateOrderOptions(tick_size=market["tick_size"], neg_risk=False),
+            post_only=True,
         )
         order_id = result.get("orderID") or result.get("id") or str(result)
-        print(f"      OK — id={order_id}")
+        print(f"      OK — posted id={order_id}")
     except Exception as e:
         _fail("create_and_post_order", e)
         _check_hints(e)
         return
 
-    # ── 5. Poll status ────────────────────────────────────────────────────────
-    print("\n[5/5] Polling order status (3s)...")
-    time.sleep(3)
-    status, filled = "unknown", 0.0
+    # ── 5. Cancel the test order ────────────────────────────────────────────────
+    print("\n[5/5] Cancelling the test order...")
+    time.sleep(2)  # let the order register before cancelling
+    cancelled = False
     try:
-        obj = client.get_order(order_id)
-        status = str(obj.get("status", "unknown"))
-        filled = float(obj.get("size_matched", obj.get("filled", 0)) or 0)
-        print(f"      Status={status}  filled={filled}")
+        resp = client.cancel_order(OrderPayload(orderID=order_id))
+        cancelled = True
+        print(f"      Cancel response: {resp}")
     except Exception as e:
-        print(f"      get_order (non-fatal): {e}")
+        print(f"      ⚠️ cancel failed: {e}")
+        print(f"      Cancel manually in the Polymarket UI → order_id={order_id!r}")
 
     # ── Result ────────────────────────────────────────────────────────────────
     print("\n=== VERDICT ===")
     print(f"{'✅' if balance > 0 else '❌'} Balance: ${round(balance, 2)}")
-    print(f"{'✅' if order_id else '❌'} Order submitted: {order_id}")
-    if order_id:
-        print(f"   Status={status}  filled={filled}")
-        print(f"\nPOLY_PROXY PATH: works — admin live trading unblocked")
-        print(f"\n⚠️  Cancel the open order via Polymarket UI or note the ID:")
-        print(f"   order_id = {order_id!r}")
+    print(f"{'✅' if order_id else '❌'} Order posted:    {order_id}")
+    print(f"{'✅' if cancelled else '⚠️ '} Order cancelled: {cancelled}")
+    if order_id and cancelled:
+        print("\nPOLY_PROXY PATH: create → post → cancel all work — live trading unblocked.")
+    elif order_id:
+        print("\nPOLY_PROXY PATH: order posts, but cancel failed — cancel the ID above manually.")
 
 
 def _check_hints(err: Exception) -> None:
