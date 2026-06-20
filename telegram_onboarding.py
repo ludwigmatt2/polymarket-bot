@@ -131,12 +131,11 @@ def generate_wallet() -> tuple[str, str]:
     return acct.address, acct.key.hex()
 
 
-def fetch_user_balance_sync(uid: int, proxy: str | None, signature_type: str) -> float:
+def fetch_user_balance_sync(uid: int) -> float:
     """Blocking USDC balance fetch via the official CLOB SDK (same path as live trading).
 
-    `proxy`/`signature_type` are kept for call-site compatibility, but the stored
-    creds (funder_address + integer signature_type, legacy-migrated on read) are
-    the source of truth.
+    Stored creds (funder_address + integer signature_type, legacy-migrated on
+    read) are the source of truth.
     """
     creds = get_user_creds(uid)
     if not creds or not creds.get("pk"):
@@ -407,13 +406,9 @@ async def on_proxy_paste(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def _balance_reply(chat, uid: int) -> None:
     tb = _tb()
-    user = tb._load_users().get(uid, {})
     try:
         balance = await asyncio.wait_for(
-            asyncio.to_thread(
-                fetch_user_balance_sync, uid,
-                user.get("proxy_address"), user.get("signature_type") or "eoa",
-            ),
+            asyncio.to_thread(fetch_user_balance_sync, uid),
             timeout=30,
         )
     except Exception as exc:

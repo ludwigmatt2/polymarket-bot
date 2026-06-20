@@ -1303,6 +1303,24 @@ _seen_alarm_mtime: float = 0.0
 _BOT_START_TS = datetime.now().timestamp()
 _SCANNER_ALARM_LOG = DATA_DIR / "logs" / "scanner_alarm.csv"
 
+def _read_json_if_new(path: Path, seen: dict[int, float], uid: int) -> "tuple[dict, float] | None":
+    """Return (parsed_json, mtime) only when `path` is newer than the last seen
+    mtime for uid, advancing the seen-mtime on a successful read. Returns None
+    when the file is absent, unchanged, or unreadable — a corrupt/half-written
+    file keeps the old mtime so it's retried next cycle instead of being lost."""
+    if not path.exists():
+        return None
+    mtime = path.stat().st_mtime
+    if mtime <= seen.get(uid, 0.0):
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    seen[uid] = mtime
+    return data, mtime
+
+
 async def check_alerts(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     bot = ctx.bot
 
@@ -1337,94 +1355,73 @@ async def check_alerts(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         # Live-halt alert: weather_bot writes live_halt.json when a user's live
         # execution stops (kill switch, missing key, balance failure). Tell the
         # user AND the admin — silence here means money sits idle unnoticed.
-        halt_file = user_log_dir(uid) / "live_halt.json"
-        if halt_file.exists():
-            mtime = halt_file.stat().st_mtime
-            if mtime > _seen_halt_mtimes.get(uid, 0.0):
-                try:
-                    halt = json.loads(halt_file.read_text())
-                except (OSError, json.JSONDecodeError):
-                    halt = None  # half-written/corrupt — retry next cycle
-                if halt is not None:
-                    _seen_halt_mtimes[uid] = mtime
-                if halt is not None and mtime >= _BOT_START_TS:
-                    try:
-                        text = (
-                            f"⛔ *Live trading halted*\n"
-                            f"Reason: {halt.get('reason', '?')}\n"
-                            f"_{halt.get('halted_at', '')[:16]}_"
-                        )
-                        await bot.send_message(uid, text, parse_mode="Markdown")
-                        if uid != ADMIN_ID:
-                            await bot.send_message(
-                                ADMIN_ID, f"⛔ Live halt for user `{uid}`: "
-                                f"{halt.get('reason', '?')}", parse_mode="Markdown",
-                            )
-                    except Exception:
-                        pass
+        halt_new = _read_json_if_new(user_log_dir(uid) / "live_halt.json", _seen_halt_mtimes, uid)
+        if halt_new is not None and halt_new[1] >= _BOT_START_TS:
+            halt = halt_new[0]
+            try:
+                text = (
+                    f"⛔ *Live trading halted*\n"
+                    f"Reason: {halt.get('reason', '?')}\n"
+                    f"_{halt.get('halted_at', '')[:16]}_"
+                )
+                await bot.send_message(uid, text, parse_mode="Markdown")
+                if uid != ADMIN_ID:
+                    await bot.send_message(
+                        ADMIN_ID, f"⛔ Live halt for user `{uid}`: "
+                        f"{halt.get('reason', '?')}", parse_mode="Markdown",
+                    )
+            except Exception:
+                pass
 
         # New signals alert
-        if signals_file.exists():
-            mtime = signals_file.stat().st_mtime
-            if mtime > _seen_signals_mtimes.get(uid, 0.0):
+        sig_new = _read_json_if_new(signals_file, _seen_signals_mtimes, uid)
+        if sig_new is not None:
+            signals = [s for s in sig_new[0].get("signals", []) if s.get("edge_pp", 0) >= 0.30]
+            if signals:
+                text = (
+                    f"🔔 *Scheduled scan — {len(signals)} signal(s)*\n\n"
+                    f"{fmt_signals(signals, uid)}"
+                )
                 try:
-                    data = json.loads(signals_file.read_text())
-                except (OSError, json.JSONDecodeError):
-                    data = None  # half-written/corrupt — retry next cycle, keep mtime
-                if data is not None:
-                    _seen_signals_mtimes[uid] = mtime
-                    signals = [s for s in data.get("signals", []) if s.get("edge_pp", 0) >= 0.30]
-                    if signals:
-                        text = (
-                            f"🔔 *Scheduled scan — {len(signals)} signal(s)*\n\n"
-                            f"{fmt_signals(signals, uid)}"
-                        )
-                        try:
-                            await bot.send_message(uid, text, parse_mode="Markdown")
-                        except Exception:
-                            pass
+                    await bot.send_message(uid, text, parse_mode="Markdown")
+                except Exception:
+                    pass
 
         # Resolved trades alert — enhanced with wallet context
-        if resolved_file.exists():
-            mtime = resolved_file.stat().st_mtime
-            if mtime > _seen_resolved_mtimes.get(uid, 0.0):
+        res_new = _read_json_if_new(resolved_file, _seen_resolved_mtimes, uid)
+        if res_new is not None:
+            resolved = res_new[0].get("resolved", [])
+            if resolved:
+                batch_pnl = sum(float(t.get("pnl_usd") or 0) for t in resolved)
+                e         = "✅" if batch_pnl >= 0 else "❌"
+                lines     = [f"{e} *{len(resolved)} trade(s) resolved* — *${batch_pnl:+.2f}*\n"]
+
+                for t in resolved[:5]:
+                    pnl   = float(t.get("pnl_usd") or 0)
+                    em    = "✅" if pnl > 0 else "❌"
+                    title = t.get("market_title", "?")
+                    if " - " in title:
+                        title = title.split(" - ", 1)[1]
+                    lines.append(f"{em} ${pnl:+.2f} — _{title[:44]}_")
+                if len(resolved) > 5:
+                    lines.append(f"_...and {len(resolved) - 5} more_")
+
+                # Running wallet summary
+                ws = wallet_stats(uid)
+                lines.append(f"\n📊 *All-time: ${ws['realized_pnl']:+,.2f}*")
+                if ws["return_pct"] is not None:
+                    sign = "+" if ws["return_pct"] >= 0 else ""
+                    lines.append(f"   Return:  {sign}{ws['return_pct']:.1f}%")
+                if abs(ws["pnl_today"]) > 0:
+                    lines.append(f"   Today:   ${ws['pnl_today']:+.2f}")
+                if ws["pending_count"] > 0:
+                    lines.append(f"   Open:    {ws['pending_count']} positions · ${ws['deployed']:,.0f} deployed")
+
+                text = "\n".join(line for line in lines if line)
                 try:
-                    data = json.loads(resolved_file.read_text())
-                except (OSError, json.JSONDecodeError):
-                    continue  # half-written/corrupt — retry next cycle, keep mtime
-                _seen_resolved_mtimes[uid] = mtime
-                resolved = data.get("resolved", [])
-                if resolved:
-                    batch_pnl = sum(float(t.get("pnl_usd") or 0) for t in resolved)
-                    e         = "✅" if batch_pnl >= 0 else "❌"
-                    lines     = [f"{e} *{len(resolved)} trade(s) resolved* — *${batch_pnl:+.2f}*\n"]
-
-                    for t in resolved[:5]:
-                        pnl   = float(t.get("pnl_usd") or 0)
-                        em    = "✅" if pnl > 0 else "❌"
-                        title = t.get("market_title", "?")
-                        if " - " in title:
-                            title = title.split(" - ", 1)[1]
-                        lines.append(f"{em} ${pnl:+.2f} — _{title[:44]}_")
-                    if len(resolved) > 5:
-                        lines.append(f"_...and {len(resolved) - 5} more_")
-
-                    # Running wallet summary
-                    ws = wallet_stats(uid)
-                    lines.append(f"\n📊 *All-time: ${ws['realized_pnl']:+,.2f}*")
-                    if ws["return_pct"] is not None:
-                        sign = "+" if ws["return_pct"] >= 0 else ""
-                        lines.append(f"   Return:  {sign}{ws['return_pct']:.1f}%")
-                    if abs(ws["pnl_today"]) > 0:
-                        lines.append(f"   Today:   ${ws['pnl_today']:+.2f}")
-                    if ws["pending_count"] > 0:
-                        lines.append(f"   Open:    {ws['pending_count']} positions · ${ws['deployed']:,.0f} deployed")
-
-                    text = "\n".join(line for line in lines if line)
-                    try:
-                        await bot.send_message(uid, text, parse_mode="Markdown")
-                    except Exception:
-                        pass
+                    await bot.send_message(uid, text, parse_mode="Markdown")
+                except Exception:
+                    pass
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
