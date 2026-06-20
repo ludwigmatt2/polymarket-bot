@@ -318,7 +318,7 @@ class LiveTrader:
             if t.get("direction") == "YES":
                 pnl = filled_size * ((1.0 - filled_price) if outcome else -filled_price)
             else:
-                pnl = filled_size * (filled_price if not outcome else -(1.0 - filled_price))
+                pnl = filled_size * ((1.0 - filled_price) if (not outcome) else -filled_price)
 
             model_p = float(t.get("model_p", 0.5) or 0.5)
             t["actual_outcome"] = int(outcome)

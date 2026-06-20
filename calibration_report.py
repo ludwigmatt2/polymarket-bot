@@ -284,7 +284,7 @@ def main() -> None:
     print("  5 WORST CALLS  (highest Brier = most confidently wrong)")
     print("─" * 58)
     for e in worst:
-        td  = orig.get(e["trade_id"], "?")
+        td  = e["trade_id"]
         print(f"  {td:>3} | model={e['model_p']:.0%} clim={e['p_clim']:.0%} actual={e['actual']} "
               f"brier={e['brier_model']:.3f}")
         print(f"      {e['market_title']}")

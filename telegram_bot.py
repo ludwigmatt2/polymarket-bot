@@ -1231,7 +1231,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=confirm_kb("scan", "Run scan"),
             parse_mode="Markdown",
         )
-    elif data == "scan_confirm":
+    elif data == "scan_confirm" and is_admin(uid):
         await q.edit_message_text("🔍 Scanning Polymarket...")
         stdout, stderr, rc = await run_bot_async("paper", uid)
         if rc == -2:
@@ -1250,7 +1250,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=confirm_kb("resolve", "Run resolve"),
             parse_mode="Markdown",
         )
-    elif data == "resolve_confirm":
+    elif data == "resolve_confirm" and is_admin(uid):
         await q.edit_message_text("⏳ Running auto-resolve...")
         stdout, stderr, rc = await run_bot_async("auto-resolve", uid)
         if rc == -2:
