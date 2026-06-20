@@ -1,30 +1,28 @@
 """
-Phase 0 spike — POLY_PROXY path (your own Polymarket account, email/Google login).
+Phase 0 spike — EOA path (fresh wallet created by the onboarding wizard).
 
 Usage:
-  venv/bin/python spike_gnosis.py
+  # Step 1 — generate a throwaway EOA and get funding instructions:
+  venv/bin/python spike_eoa.py --generate
 
-Reads POLYMARKET_PRIVATE_KEY + POLYMARKET_PROXY_ADDRESS (or POLYMARKET_FUNDER_ADDRESS)
-from .env (your existing keys).
+  # Step 2 — fund the address shown (USDC.e + ~0.5 POL for gas), then:
+  venv/bin/python spike_eoa.py --key 0x<private_key>
 
 What this tests:
-  1. get_balance_allowance() works with POLY_PROXY signature type (1)
-  2. create_and_post_order() succeeds with a funder address
-  3. No proxy/nonce errors specific to email/Google-login accounts
+  1. get_balance_allowance() sees non-zero USDC collateral
+  2. create_and_post_order() succeeds on a cheap weather market
+  3. Order appears as open/unfilled in the book (or fills immediately)
 
 Decision after running:
-  - All OK          → your own account works; admin live trading is unblocked
-  - "proxy" error   → funder_address is wrong or not set correctly
-  - Balance = 0     → funds may still be processing (Polymarket credits CLOB after deposit)
-  - Any other error → note exact message for investigation
-
-Note: "POLY_PROXY" (signature_type=1) is what pmxt used to call "gnosis-safe".
-It is NOT the same as a Gnosis Safe multisig. It's the standard email/Google
-Polymarket login flow where Polymarket holds a proxy wallet on your behalf.
+  - Balance > 0 AND order submitted → EOA path works, no ensure_approvals() needed
+  - Balance = 0              → deposit not yet credited to CLOB; wait and retry
+  - "allowance" in error     → add USDC approval step before first order
+  - Any other error          → investigate and note exact message
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import time
@@ -36,23 +34,20 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-def _check_onchain_balance(address: str) -> float | None:
-    """Read USDC.e balance on Polygon via public RPC — no credentials needed."""
-    import requests as _req
-    USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-    padded = address.lower().replace("0x", "").zfill(64)
-    try:
-        resp = _req.post(
-            "https://polygon-bor-rpc.publicnode.com",
-            json={
-                "jsonrpc": "2.0", "id": 1, "method": "eth_call",
-                "params": [{"to": USDC_E, "data": "0x70a08231" + padded}, "latest"],
-            },
-            timeout=10,
-        )
-        return int(resp.json()["result"], 16) / 1e6
-    except Exception:
-        return None
+def generate_eoa() -> None:
+    from eth_account import Account
+    acct = Account.create()
+    print("\n=== GENERATED THROWAWAY EOA ===")
+    print(f"Address     : {acct.address}")
+    print(f"Private key : {acct.key.hex()}")
+    print()
+    print("Next steps:")
+    print("  1. Send ~$3 USDC.e to this address on Polygon")
+    print("     (bridge from Ethereum or buy on exchange → withdraw to Polygon)")
+    print("  2. Send ~0.5 POL to this address for gas")
+    print("  3. Run: venv/bin/python spike_eoa.py --key", acct.key.hex())
+    print()
+    print("IMPORTANT: this key is shown once. Save it if you want to recover funds.")
 
 
 def _find_cheap_weather_market() -> dict | None:
@@ -90,7 +85,7 @@ def _find_cheap_weather_market() -> dict | None:
     return None
 
 
-def run_spike() -> None:
+def run_spike(pk: str) -> None:
     from py_clob_client_v2 import ClobClient
     from py_clob_client_v2.clob_types import (
         ApiCreds, AssetType, BalanceAllowanceParams,
@@ -98,34 +93,16 @@ def run_spike() -> None:
     )
     from py_clob_client_v2.order_builder.constants import BUY
 
-    pk = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
-    funder = (
-        os.environ.get("POLYMARKET_FUNDER_ADDRESS")
-        or os.environ.get("POLYMARKET_PROXY_ADDRESS")
-        or ""
-    )
+    print("\n=== PHASE 0 SPIKE — EOA PATH ===\n")
 
-    if not pk or pk in ("0x...", ""):
-        print("❌ POLYMARKET_PRIVATE_KEY not set in .env")
-        return
-
-    sig_type = 1 if funder else 0  # POLY_PROXY vs EOA
-    mode_label = "POLY_PROXY / signature_type=1" if funder else "EOA / signature_type=0 (no funder set)"
-
-    print("\n=== PHASE 0 SPIKE — POLY_PROXY PATH ===\n")
-    print(f"Key    : {pk[:6]}...{pk[-4:]}")
-    print(f"Funder : {funder or '(none — falling back to EOA mode)'}")
-    print(f"Mode   : {mode_label}\n")
-
-    # ── 1. Connect ────────────────────────────────────────────────────────────
-    print("[1/5] Connecting and deriving L2 API key...")
+    # ── 1. Connect (L1 → derive L2 creds) ────────────────────────────────────
+    print("[1/5] Connecting with EOA credentials (derives L2 API key)...")
     try:
         init_client = ClobClient(
             host="https://clob.polymarket.com",
             chain_id=137,
             key=pk,
-            signature_type=sig_type,
-            funder=funder or None,
+            signature_type=0,  # EOA
         )
         creds = init_client.create_or_derive_api_key()
         print(f"      L2 key: {creds.api_key[:12]}...")
@@ -138,8 +115,7 @@ def run_spike() -> None:
                 api_secret=creds.api_secret,
                 api_passphrase=creds.api_passphrase,
             ),
-            signature_type=sig_type,
-            funder=funder or None,
+            signature_type=0,
         )
         print("      OK")
     except Exception as e:
@@ -147,41 +123,25 @@ def run_spike() -> None:
         return
 
     # ── 2. Balance ────────────────────────────────────────────────────────────
-    print("[2/5] Fetching balance...")
-
-    check_addr = funder or ""
-    if not check_addr:
-        from eth_account import Account
-        check_addr = Account.from_key(pk).address
-    onchain = _check_onchain_balance(check_addr)
-    if onchain is not None:
-        print(f"      On-chain USDC.e (Polygon): ${onchain:.2f}")
-
+    print("[2/5] Fetching CLOB balance...")
     balance = 0.0
     try:
         result = client.get_balance_allowance(
             BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         )
-        print(f"      CLOB response: {result}")
+        print(f"      Raw response: {result}")
         balance = float(result.get("balance", result.get("allowance", "0")) or "0")
+        verdict = f"✅ ${round(balance, 2)}" if balance > 0 else "❌ zero"
+        print(f"\n      VERDICT balance: {verdict}")
     except Exception as e:
         _fail("get_balance_allowance", e)
 
-    if onchain is not None and onchain > 0 and balance == 0:
-        print("\n      ⚠️  Funds on-chain but CLOB shows 0.")
-        print("      Polymarket may still be crediting the deposit (wait 1–5 min).")
-    elif onchain is not None and onchain == 0 and balance == 0:
-        print("\n      ⏳ Deposit not yet on-chain — wait a few minutes and re-run.")
-    else:
-        verdict = f"✅ ${round(balance, 2)}" if balance > 0 else "❌ zero"
-        print(f"\n      VERDICT balance: {verdict}")
-
     if balance <= 0:
-        print("\nCan't test order placement without CLOB balance. Re-run once balance shows up.")
+        print("\nAborting: no CLOB balance. Deposit USDC.e to Polymarket first.")
         return
 
-    # ── 3. Find a cheap weather market ───────────────────────────────────────
-    print("\n[3/5] Finding a cheap weather market via Gamma API...")
+    # ── 3. Find a cheap active weather market ─────────────────────────────────
+    print("\n[3/5] Finding a cheap active weather market via Gamma API...")
     market = _find_cheap_weather_market()
     if market is None:
         print("      ❌ No suitable market found (need NO price 5–25¢ with clobTokenIds)")
@@ -190,11 +150,11 @@ def run_spike() -> None:
     print(f"      YES={market['yes_price']:.3f}  NO={market['no_price']:.3f}")
     print(f"      NO token ID: {market['no_token_id'][:20]}...")
 
-    # ── 4. $1 limit order ────────────────────────────────────────────────────
+    # ── 4. Submit a $1 limit order ────────────────────────────────────────────
     no_price = market["no_price"]
     n_contracts = round(1.0 / no_price, 2)
     tick_size = market["tick_size"]
-    print(f"\n[4/5] Submitting $1 limit order (NO side)...")
+    print(f"\n[4/5] Building and submitting a $1 limit order (NO side)...")
     print(f"      {n_contracts} contracts @ {no_price:.3f}  tick={tick_size}")
 
     order_id = None
@@ -209,10 +169,10 @@ def run_spike() -> None:
             options=PartialCreateOrderOptions(tick_size=tick_size, neg_risk=False),
         )
         order_id = result.get("orderID") or result.get("id") or str(result)
-        print(f"      OK — id={order_id}")
+        print(f"      OK — order_id={order_id}")
     except Exception as e:
         _fail("create_and_post_order", e)
-        _check_hints(e)
+        _check_approval_hint(e)
         return
 
     # ── 5. Poll status ────────────────────────────────────────────────────────
@@ -229,11 +189,15 @@ def run_spike() -> None:
 
     # ── Result ────────────────────────────────────────────────────────────────
     print("\n=== VERDICT ===")
-    print(f"{'✅' if balance > 0 else '❌'} Balance: ${round(balance, 2)}")
+    print(f"{'✅' if balance > 0 else '❌'} Balance: ${round(balance, 2)} USDC")
     print(f"{'✅' if order_id else '❌'} Order submitted: {order_id}")
     if order_id:
         print(f"   Status={status}  filled={filled}")
-        print(f"\nPOLY_PROXY PATH: works — admin live trading unblocked")
+        if status.upper() in ("OPEN", "LIVE"):
+            print("   → Limit order sitting in book (normal — may fill later)")
+        elif filled > 0:
+            print("   → Filled immediately!")
+        print("\nEOA PATH: works — no ensure_approvals() needed in live_trader.py")
         print(f"\n⚠️  Cancel the open order via Polymarket UI or note the ID:")
         print(f"   order_id = {order_id!r}")
 
@@ -242,17 +206,22 @@ def _fail(step: str, err: Exception) -> None:
     print(f"\n❌ FAILED at {step}: {type(err).__name__}: {err}")
 
 
-def _check_hints(err: Exception) -> None:
+def _check_approval_hint(err: Exception) -> None:
     msg = str(err).lower()
-    if "proxy" in msg or "funder" in msg:
-        print("\n⚠️  PROXY ERROR: check POLYMARKET_FUNDER_ADDRESS / POLYMARKET_PROXY_ADDRESS in .env")
-        print("   It's the Safe address shown at polymarket.com → Settings → Export Key")
-    if "nonce" in msg or "signature" in msg or "sig" in msg:
-        print("\n⚠️  SIGNATURE ERROR: verify signature_type=1 (POLY_PROXY) is correct for your account")
-        print("   EOA accounts use signature_type=0")
-    if "approv" in msg or "allowance" in msg:
-        print("\n⚠️  APPROVAL NEEDED — report this exact error for investigation")
+    if any(k in msg for k in ("approv", "allowance", "permit", "erc20")):
+        print("\n⚠️  APPROVAL NEEDED: USDC approval may be required for the CLOB contract.")
+        print("   Report exact error above so we can investigate.")
 
 
 if __name__ == "__main__":
-    run_spike()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--generate", action="store_true", help="Generate a new throwaway EOA")
+    parser.add_argument("--key", help="Private key of funded EOA to test")
+    args = parser.parse_args()
+
+    if args.generate:
+        generate_eoa()
+    elif args.key:
+        run_spike(args.key)
+    else:
+        parser.print_help()
