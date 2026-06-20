@@ -89,6 +89,61 @@ def _find_cheap_weather_market() -> dict | None:
     return None
 
 
+def _field(obj, name, default=None):
+    """Read a field whether the SDK returned a dict or a dataclass instance."""
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def _find_tradeable_token(client) -> dict | None:
+    """Find a token the CLOB is actively accepting orders on, via the SDK.
+
+    Uses sampling-simplified-markets (markets with live order flow) and the
+    per-token order book for the authoritative tick size + neg_risk flag — the
+    correct source for "what can I place an order on", unlike the Gamma /markets
+    endpoint (which ignores the `q` keyword param). Returns a dict with
+    token_id / price / tick_size / neg_risk / min_order_size, or None.
+    """
+    rows = []
+    for getter in ("get_sampling_simplified_markets", "get_simplified_markets"):
+        try:
+            resp = getattr(client, getter)()
+        except Exception:
+            continue
+        rows = resp.get("data", []) if isinstance(resp, dict) else (resp or [])
+        if rows:
+            break
+
+    for mk in rows:
+        tokens = _field(mk, "tokens", []) or []
+        for t in tokens:
+            tid = _field(t, "token_id")
+            try:
+                price = float(_field(t, "price") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not tid or not (0.05 <= price <= 0.95):
+                continue
+            try:
+                book = client.get_order_book(tid)
+            except Exception:
+                continue
+            tick = _field(book, "tick_size")
+            if not tick:
+                continue
+            return {
+                "token_id": tid,
+                "price": price,
+                "outcome": _field(t, "outcome", "?"),
+                "condition_id": _field(mk, "condition_id", "?"),
+                "tick_size": str(tick),
+                "neg_risk": bool(_field(book, "neg_risk", False)),
+                "min_order_size": _field(book, "min_order_size"),
+            }
+    return None
+
+
 def run_spike(pk: str) -> None:
     from py_clob_client_v2 import ClobClient
     from py_clob_client_v2.clob_types import (

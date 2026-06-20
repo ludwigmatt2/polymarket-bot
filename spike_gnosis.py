@@ -29,7 +29,7 @@ import os
 import time
 
 from dotenv import load_dotenv
-from spike_eoa import _fail, _find_cheap_weather_market
+from spike_eoa import _fail, _find_tradeable_token
 
 load_dotenv()
 
@@ -144,36 +144,38 @@ def run_spike() -> None:
         print("\nCan't test order placement without CLOB balance. Re-run once balance shows up.")
         return
 
-    # ── 3. Find a cheap weather market ───────────────────────────────────────
-    print("\n[3/5] Finding a cheap weather market via Gamma API...")
-    market = _find_cheap_weather_market()
+    # ── 3. Find an order-accepting market via the CLOB SDK ───────────────────
+    print("\n[3/5] Finding an order-accepting market via the CLOB API...")
+    market = _find_tradeable_token(client)
     if market is None:
-        print("      ❌ No suitable market found (need NO price 5–25¢ with clobTokenIds)")
+        print("      ❌ No order-accepting token found via sampling markets.")
         return
-    print(f"      Market     : {market['title'][:70]}")
-    print(f"      YES={market['yes_price']:.3f}  NO={market['no_price']:.3f}")
-    print(f"      NO token ID: {market['no_token_id'][:20]}...")
+    print(f"      condition={market['condition_id'][:12]}…  outcome={market['outcome']}  "
+          f"price={market['price']:.3f}  tick={market['tick_size']}  neg_risk={market['neg_risk']}")
 
-    # ── 4. Resting NO bid, well below market — validates the post path without
+    # ── 4. Resting bid, well below market — validates the post path without
     #       taking a position. post_only makes it maker-only (rejected, never
     #       filled, if it would ever cross the book). ──────────────────────────
-    no_price = market["no_price"]
+    ref = market["price"]
     tick = float(market["tick_size"])
-    bid = max(tick, round(round(no_price * 0.25 / tick) * tick, 6))  # 75% below market
-    n_contracts = round(max(1.0 / bid, 5.0), 2)
-    print(f"\n[4/5] Posting a resting NO bid (~${bid * n_contracts:.2f}, won't fill)...")
-    print(f"      {n_contracts} @ {bid:.4f}   (market NO={no_price:.3f}, tick={market['tick_size']})")
+    bid = max(tick, round(round(ref * 0.25 / tick) * tick, 6))  # 75% below market
+    min_sz = float(market.get("min_order_size") or 5)
+    n_contracts = round(max(1.0 / bid, min_sz), 2)
+    print(f"\n[4/5] Posting a resting BUY bid (~${bid * n_contracts:.2f}, won't fill)...")
+    print(f"      {n_contracts} @ {bid:.4f}   (market={ref:.3f}, tick={market['tick_size']})")
 
     order_id = None
     try:
         result = client.create_and_post_order(
             OrderArgsV2(
-                token_id=market["no_token_id"],
+                token_id=market["token_id"],
                 price=bid,
                 size=n_contracts,
                 side=BUY,
             ),
-            options=PartialCreateOrderOptions(tick_size=market["tick_size"], neg_risk=False),
+            options=PartialCreateOrderOptions(
+                tick_size=market["tick_size"], neg_risk=market["neg_risk"]
+            ),
             post_only=True,
         )
         order_id = result.get("orderID") or result.get("id") or str(result)
