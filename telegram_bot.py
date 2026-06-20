@@ -48,7 +48,7 @@ load_dotenv()
 # DATA_DIR separates code (ROOT) from mutable data so a persistent volume can be
 # mounted on Railway without touching source files.  Locally defaults to ROOT.
 ROOT          = Path(__file__).parent
-DATA_DIR      = Path(os.environ.get("DATA_DIR") or os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") or ROOT)
+DATA_DIR      = Path(os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") or ROOT)
 USERS_FILE    = DATA_DIR / "config" / "users.json"
 WALLET_FILE   = DATA_DIR / "logs" / "wallet.json"
 
