@@ -38,6 +38,8 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 load_dotenv()
@@ -1398,6 +1400,36 @@ _ADMIN_COMMANDS = _USER_COMMANDS + [
     ("setmaxbet",   "💰 Set max bet size per trade (e.g. /setmaxbet 50)"),
 ]
 
+_UPLOAD_TARGETS: dict[str, Path] = {
+    "paper_trades.csv":      DATA_DIR / "logs" / "paper_trades.csv",
+    "calibration_log.csv":   DATA_DIR / "logs" / "calibration_log.csv",
+    "historical_skill.json": DATA_DIR / "logs" / "historical_skill.json",
+    "city_bias.csv":         DATA_DIR / "logs" / "city_bias.csv",
+}
+
+async def handle_admin_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin sends a data file as Telegram document → saved to DATA_DIR/logs/."""
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        return
+    doc = update.effective_message.document
+    if not doc or doc.file_name not in _UPLOAD_TARGETS:
+        await update.effective_message.reply_text(
+            "📂 Send one of these files to upload it to the Railway volume:\n"
+            + "\n".join(f"• `{n}`" for n in _UPLOAD_TARGETS),
+            parse_mode="Markdown",
+        )
+        return
+    dest = _UPLOAD_TARGETS[doc.file_name]
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tg_file = await ctx.bot.get_file(doc.file_id)
+    await tg_file.download_to_drive(str(dest))
+    await update.effective_message.reply_text(
+        f"✅ `{doc.file_name}` saved ({doc.file_size:,} bytes)\n`{dest}`",
+        parse_mode="Markdown",
+    )
+
+
 async def _auto_scan(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Scheduled job: paper scan + fan-out to all users. Runs every AUTO_SCAN_INTERVAL seconds."""
     stdout, stderr, rc = await run_bot_async("paper", ADMIN_ID)
@@ -1475,6 +1507,10 @@ async def _run() -> None:
     ]:
         app.add_handler(CommandHandler(cmd, handler))
 
+    app.add_handler(MessageHandler(
+        filters.Document.ALL & filters.ChatType.PRIVATE,
+        handle_admin_upload,
+    ))
     app.add_handler(CallbackQueryHandler(on_button))
 
     async with app:
