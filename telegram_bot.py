@@ -113,6 +113,31 @@ def _users_transaction():
         yield users
         _save_users(users)
 
+def _seed_volume_data() -> None:
+    """One-time: copy seed files from /app/_seed/ into DATA_DIR if they don't exist yet.
+
+    _seed/ is bundled in the Docker image for the initial Railway deployment.
+    Once data lives on the persistent volume this function is a no-op.
+    """
+    seed_dir = ROOT / "_seed"
+    if not seed_dir.exists():
+        return
+    copied = 0
+    for src in sorted(seed_dir.rglob("*")):
+        if not src.is_file():
+            continue
+        rel  = src.relative_to(seed_dir)
+        dest = DATA_DIR / rel
+        if dest.exists():
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(src.read_bytes())
+        print(f"[seed] {dest} ({src.stat().st_size:,} bytes)", flush=True)
+        copied += 1
+    if copied:
+        print(f"[seed] Migration complete — {copied} file(s) written to {DATA_DIR}", flush=True)
+
+
 def _seed_admin() -> None:
     with _users_lock:
         users = _load_users()
@@ -1470,6 +1495,7 @@ async def _register_commands(app) -> None:
 
 
 async def _run() -> None:
+    _seed_volume_data()
     _seed_admin()
     _seed_admin_creds()
     _migrate_global_wallet()

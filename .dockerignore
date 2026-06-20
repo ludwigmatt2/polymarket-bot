@@ -10,3 +10,5 @@ htmlcov/
 .claude/
 logs/
 *.log
+!_seed/
+!_seed/**

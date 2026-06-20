@@ -27,6 +27,10 @@ htmlcov/
 logs/
 *.log
 
+# ── One-time Railway seed data (committed intentionally, remove after migration) ─
+!_seed/
+!_seed/**
+
 # ── Claude Code — personal config, not for repos ───────────────────────────────
 .claude/
 CLAUDE.md
