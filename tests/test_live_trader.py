@@ -304,9 +304,9 @@ class TestPerUserCredentials:
             "signature_type": "gnosis-safe",
         }
 
-    def test_env_fallback_preserved(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("POLYMARKET_PRIVATE_KEY", "0xenvkey")
-        monkeypatch.delenv("POLYMARKET_PROXY_ADDRESS", raising=False)
+    def test_constructor_creds_used(self, tmp_path, monkeypatch):
+        """Credentials must come from the constructor, not env vars."""
+        monkeypatch.setenv("POLYMARKET_PRIVATE_KEY", "0xenvkey")  # must be ignored
         captured = {}
 
         class FakePmxt:
@@ -319,9 +319,10 @@ class TestPerUserCredentials:
         trader = LiveTrader(
             paper_trader=MagicMock(), bankroll_usd=100,
             log_path=tmp_path / "lt.csv", idempotency_path=tmp_path / "id.json",
+            private_key="0xconstructorkey",
         )
         trader._get_poly()
-        assert captured["private_key"] == "0xenvkey"
+        assert captured["private_key"] == "0xconstructorkey"
         assert captured["signature_type"] == "eoa"
 
     def test_no_key_anywhere_raises(self, tmp_path, monkeypatch):

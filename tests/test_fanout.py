@@ -208,7 +208,7 @@ class TestLiveFanOut:
         assert executed == [int(USER_A)]
 
     def test_missing_key_writes_halt_and_skips(self, fanout_env, monkeypatch):
-        monkeypatch.setattr("weather.secrets.get_user_key", lambda uid: None)
+        monkeypatch.setattr("weather.secrets.get_user_creds", lambda uid: None)
         user_dir = fanout_env / "logs" / "users" / USER_A
         user_dir.mkdir(parents=True)
         weather_bot._execute_live_for_user(
@@ -220,7 +220,7 @@ class TestLiveFanOut:
     def test_kill_switch_halts_user_but_not_loop(self, fanout_env, monkeypatch):
         from weather.live_trader import LiveTrader
 
-        monkeypatch.setattr("weather.secrets.get_user_key", lambda uid: "0xkey")
+        monkeypatch.setattr("weather.secrets.get_user_creds", lambda uid: {"pk": "0xkey"})
         monkeypatch.setattr(LiveTrader, "fetch_balance", lambda self: 500.0)
 
         calls = []
@@ -244,7 +244,7 @@ class TestLiveFanOut:
     def test_ledger_caps_bankroll(self, fanout_env, monkeypatch):
         from weather.live_trader import LiveTrader
 
-        monkeypatch.setattr("weather.secrets.get_user_key", lambda uid: "0xkey")
+        monkeypatch.setattr("weather.secrets.get_user_creds", lambda uid: {"pk": "0xkey"})
         monkeypatch.setattr(LiveTrader, "fetch_balance", lambda self: 500.0)
         seen = {}
         monkeypatch.setattr(

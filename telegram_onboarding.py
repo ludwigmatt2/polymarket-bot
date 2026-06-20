@@ -37,7 +37,7 @@ import os
 
 from weather._io import atomic_write_text
 from weather.config import MIN_PROFIT_FACTOR, MIN_RESOLVED_TRADES
-from weather.secrets import get_user_key, set_user_key
+from weather.secrets import get_user_creds, get_user_key, set_user_creds, set_user_key
 
 ROOT = Path(__file__).parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", ROOT))
@@ -129,15 +129,15 @@ def generate_wallet() -> tuple[str, str]:
 
 
 def fetch_user_balance_sync(uid: int, proxy: str | None, signature_type: str) -> float:
-    """Blocking USDC/USDC.e balance fetch with the user's stored key."""
-    pk = get_user_key(uid)
-    if not pk:
+    """Blocking USDC/USDC.e balance fetch with the user's stored credentials."""
+    creds = get_user_creds(uid)
+    if not creds or not creds.get("pk"):
         raise RuntimeError("no key stored")
     import pmxt
     poly = pmxt.Polymarket(
-        private_key=pk,
-        proxy_address=proxy or None,
-        signature_type=signature_type,
+        private_key=creds["pk"],
+        proxy_address=proxy or creds.get("proxy_address") or None,
+        signature_type=signature_type or creds.get("signature_type") or "eoa",
     )
     for b in poly.fetch_balance():
         if getattr(b, "currency", "") in ("USDC", "USDC.e"):
@@ -284,7 +284,7 @@ async def on_wallet_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> in
     if q.data == "ob_create":
         address, pk = generate_wallet()
         try:
-            set_user_key(uid, pk)
+            set_user_creds(uid, pk=pk, proxy_address=None, signature_type="eoa")
         except RuntimeError as exc:
             await q.edit_message_text(f"❌ Key storage unavailable: {exc}")
             return ConversationHandler.END
@@ -337,7 +337,7 @@ async def on_key_paste(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         return KEY_PASTE
 
     try:
-        set_user_key(uid, key)
+        set_user_creds(uid, pk=key)
     except RuntimeError as exc:
         await update.effective_chat.send_message(f"❌ Key storage unavailable: {exc}")
         return ConversationHandler.END
@@ -362,6 +362,7 @@ async def on_proxy_paste(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     text = (update.message.text or "").strip()
 
     if text.lower() in ("none", "no", "skip"):
+        set_user_creds(uid, signature_type="eoa")
         _set_user_fields(
             uid,
             wallet_type="imported-eoa",
@@ -370,6 +371,7 @@ async def on_proxy_paste(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             onboarded_at=datetime.utcnow().isoformat(),
         )
     elif is_eth_address(text):
+        set_user_creds(uid, proxy_address=text, signature_type="gnosis-safe")
         _set_user_fields(
             uid,
             wallet_address=text,
@@ -429,7 +431,8 @@ async def on_funding_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> i
         return FUNDING
 
     if q.data == "ob_reveal":
-        pk = get_user_key(uid)
+        creds = get_user_creds(uid)
+        pk = creds.get("pk") if creds else None
         if not pk:
             await update.effective_chat.send_message("❌ No key stored.")
             return FUNDING

@@ -13,15 +13,18 @@ class TestSecretsKeyring:
         monkeypatch.chdir(tmp_path)
         # Patch keyring module to avoid touching the real OS keychain
         mock_kr = MagicMock()
-        mock_kr.get_password.return_value = "test-private-key"
+        # get_password returns None on first read (no existing creds), then the stored JSON
+        mock_kr.get_password.side_effect = [None, '{"pk":"test-private-key"}']
         with patch.dict("sys.modules", {"keyring": mock_kr}):
             from importlib import reload
             import weather.secrets as sec
             reload(sec)
             sec.set_user_key(42, "test-private-key")
-            mock_kr.set_password.assert_called_once_with("polymarket-bot", "uid-42", "test-private-key")
+            # Now stores a JSON dict, not a raw pk string
+            mock_kr.set_password.assert_called_once_with(
+                "polymarket-bot", "uid-42", '{"pk":"test-private-key"}'
+            )
             result = sec.get_user_key(42)
-            mock_kr.get_password.assert_called_once_with("polymarket-bot", "uid-42")
             assert result == "test-private-key"
 
     def test_get_returns_none_if_unset_keyring(self, tmp_path, monkeypatch):

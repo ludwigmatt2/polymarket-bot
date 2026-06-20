@@ -184,11 +184,10 @@ def _execute_live_for_user(
     uid: int, user: dict, user_dir: Path, root_paper: PaperTrader, actionable: list[Signal],
 ) -> None:
     """Execute the shared signals with this user's wallet. Failures stay per-user."""
-    from weather.secrets import get_user_key
+    from weather.secrets import get_user_creds
 
-    pk = get_user_key(uid)
-    if not pk:
-        # Keychain locked (e.g. reboot without login) or key never stored.
+    creds = get_user_creds(uid)
+    if not creds or not creds.get("pk"):
         _write_live_halt(user_dir, "private key unavailable — skipped live execution")
         print(f"    ⚠ user {uid}: no key available, live skipped", file=sys.stderr)
         return
@@ -198,9 +197,12 @@ def _execute_live_for_user(
         bankroll_usd=0.0,
         log_path=user_dir / "live_trades.csv",
         idempotency_path=user_dir / "live_idempotency.json",
-        private_key=pk,
-        proxy_address=user.get("proxy_address"),
-        signature_type=user.get("signature_type"),
+        private_key=creds["pk"],
+        proxy_address=creds.get("proxy_address") or user.get("proxy_address"),
+        signature_type=creds.get("signature_type") or user.get("signature_type"),
+        clob_api_key=creds.get("clob_api_key"),
+        clob_secret=creds.get("clob_secret"),
+        clob_passphrase=creds.get("clob_passphrase"),
     )
     try:
         balance = trader.fetch_balance()
@@ -805,11 +807,42 @@ def main() -> None:
 
     live_trader = None
     if args.mode == "live":
+        from weather.secrets import get_user_creds, set_user_creds
+        admin_uid = int(os.environ.get("ADMIN_ID", "0"))
+        _creds = get_user_creds(admin_uid) if admin_uid else None
+        if not _creds or not _creds.get("pk"):
+            # One-time migration: seed from env vars if still present
+            pk_env = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
+            proxy_env = os.environ.get("POLYMARKET_PROXY_ADDRESS", "")
+            if pk_env and admin_uid:
+                sig = "gnosis-safe" if proxy_env else "eoa"
+                set_user_creds(
+                    admin_uid, pk=pk_env,
+                    proxy_address=proxy_env or None, signature_type=sig,
+                )
+                _creds = {"pk": pk_env, "proxy_address": proxy_env or None, "signature_type": sig}
+                print(
+                    "  ℹ️  Migrated admin credentials from env to encrypted store.\n"
+                    "  You can now remove POLYMARKET_PRIVATE_KEY and POLYMARKET_PROXY_ADDRESS from .env."
+                )
+            else:
+                print(
+                    "  ❌ No admin credentials in encrypted store.\n"
+                    "  Run the Telegram bot onboarding (/wallet_setup) to store credentials.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
         live_trader = LiveTrader(
             paper_trader=paper,
             bankroll_usd=args.bankroll,
             log_path=log_dir / "live_trades.csv",
             idempotency_path=log_dir / "live_idempotency.json",
+            private_key=_creds["pk"],
+            proxy_address=_creds.get("proxy_address"),
+            signature_type=_creds.get("signature_type"),
+            clob_api_key=_creds.get("clob_api_key"),
+            clob_secret=_creds.get("clob_secret"),
+            clob_passphrase=_creds.get("clob_passphrase"),
         )
         if not live_trader.is_unlocked():
             print("  Go-live gates not passed. Run: python weather_bot.py --mode stats", file=sys.stderr)

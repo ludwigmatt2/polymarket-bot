@@ -2,7 +2,8 @@
 Live trader — Kelly-sized order execution via pmxt.
 
 Activated only when paper_trader.compute_stats().ready_for_live == True.
-Set POLYMARKET_PRIVATE_KEY + POLYMARKET_PROXY_ADDRESS in .env before using.
+Credentials are passed via the LiveTrader constructor (from the per-user
+encrypted store — see weather.secrets).
 """
 
 from __future__ import annotations
@@ -90,6 +91,48 @@ def _get_max_trade_usd() -> float:
     return MAX_LIVE_TRADE_USD
 
 
+def _fetch_clob_balance_direct(
+    address: str, api_key: str, secret: str, passphrase: str
+) -> float:
+    """Query CLOB /balance directly with L2 HMAC auth, bypassing pmxt sidecar.
+
+    Used as a fallback for gnosis-safe accounts where pmxt's hosted sidecar
+    returns 0 despite the account having funds.
+    """
+    import base64
+    import hashlib
+    import hmac as _hmac
+    import json as _json
+    import time
+    import urllib.request
+
+    ts = str(int(time.time()))
+    msg = ts + "GET" + "/balance" + ""
+    try:
+        key_bytes = base64.b64decode(secret)
+    except Exception:
+        key_bytes = secret.encode()
+    sig = base64.b64encode(
+        _hmac.new(key_bytes, msg.encode(), hashlib.sha256).digest()
+    ).decode()
+
+    req = urllib.request.Request(
+        "https://clob.polymarket.com/balance",
+        headers={
+            "POLY_ADDRESS": address,
+            "POLY_SIGNATURE": sig,
+            "POLY_TIMESTAMP": ts,
+            "POLY_NONCE": "0",
+            "POLY_API_KEY": api_key,
+            "POLY_PASSPHRASE": passphrase,
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = _json.loads(resp.read())
+    return float(data.get("balance", 0) or data.get("free", 0))
+
+
 class LiveTrader:
     def __init__(
         self,
@@ -101,16 +144,21 @@ class LiveTrader:
         private_key: str | None = None,
         proxy_address: str | None = None,
         signature_type: str | None = None,
+        clob_api_key: str | None = None,
+        clob_secret: str | None = None,
+        clob_passphrase: str | None = None,
     ):
         self.paper_trader = paper_trader
         self.bankroll_usd = bankroll_usd
         self._fill_poll_delay = fill_poll_delay  # override to 0 in tests
         self._log_path = log_path
         self._idempotency_path = idempotency_path
-        # Per-user credentials; env vars remain the fallback (owner's flow)
         self._private_key = private_key
         self._proxy_address = proxy_address
         self._signature_type = signature_type
+        self._clob_api_key = clob_api_key
+        self._clob_secret = clob_secret
+        self._clob_passphrase = clob_passphrase
         self._poly: Any = None
 
     def is_unlocked(self) -> bool:
@@ -293,14 +341,35 @@ class LiveTrader:
         return resolved, skipped
 
     def fetch_balance(self) -> float:
-        """Return available USDC balance."""
+        """Return available USDC balance.
+
+        Tries pmxt first.  If pmxt returns 0 and L2 CLOB credentials are stored
+        (clob_api_key / clob_secret), falls back to a direct CLOB /balance call —
+        needed for gnosis-safe accounts where pmxt's hosted sidecar returns 0.
+        """
         poly = self._get_poly()
         balances = poly.fetch_balance()
         for b in balances:
             if getattr(b, "currency", "") in ("USDC", "USDC.e"):
                 try:
-                    return float(getattr(b, "free", 0) or getattr(b, "total", 0))
+                    val = float(getattr(b, "free", 0) or getattr(b, "total", 0))
+                    if val > 0:
+                        return val
                 except (TypeError, ValueError):
+                    pass
+        # pmxt returned 0 — try direct CLOB query if L2 creds are available
+        if self._clob_api_key and self._clob_secret:
+            address = self._proxy_address
+            if not address and self._private_key:
+                from eth_account import Account
+                address = Account.from_key(self._private_key).address
+            if address:
+                try:
+                    return _fetch_clob_balance_direct(
+                        address, self._clob_api_key,
+                        self._clob_secret, self._clob_passphrase or "",
+                    )
+                except Exception:
                     pass
         return 0.0
 
@@ -361,13 +430,13 @@ class LiveTrader:
     def _get_poly(self) -> Any:
         if self._poly is not None:
             return self._poly
-        pk = self._private_key or os.environ.get("POLYMARKET_PRIVATE_KEY", "")
-        proxy = self._proxy_address or os.environ.get("POLYMARKET_PROXY_ADDRESS", "")
+        pk = self._private_key
         if not pk or pk in ("0x...", ""):
             raise RuntimeError(
-                "No private key — pass one to LiveTrader or set POLYMARKET_PRIVATE_KEY in .env"
+                "No private key — pass credentials via LiveTrader constructor"
             )
         import pmxt
+        proxy = self._proxy_address
         self._poly = pmxt.Polymarket(
             private_key=pk,
             proxy_address=proxy or None,
