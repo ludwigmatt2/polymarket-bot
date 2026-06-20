@@ -33,10 +33,9 @@ from telegram.ext import (
     filters,
 )
 
-import os
-
 from weather._io import atomic_write_text
 from weather.config import MIN_PROFIT_FACTOR, MIN_RESOLVED_TRADES
+from weather.paths import DATA_DIR
 from weather.secrets import (
     derive_and_store_clob_creds,
     get_user_creds,
@@ -45,8 +44,6 @@ from weather.secrets import (
     set_user_key,
 )
 
-ROOT = Path(__file__).parent
-DATA_DIR = Path(os.environ.get("DATA_DIR", ROOT))
 INVITES_FILE = DATA_DIR / "config" / "invites.json"
 INVITE_TTL_DAYS = 7
 

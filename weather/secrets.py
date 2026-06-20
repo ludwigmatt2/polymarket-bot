@@ -22,10 +22,9 @@ import os
 from pathlib import Path
 
 from ._io import atomic_write_json
+from .paths import DATA_DIR as _DATA_DIR
 
 _SERVICE_NAME = "polymarket-bot"
-# DATA_DIR lets Railway (or any deployment) point to a persistent volume.
-_DATA_DIR = Path(os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") or Path(__file__).parent.parent)
 _ENC_KEYS_FILE = _DATA_DIR / "config" / "user_keys.enc.json"
 
 
@@ -33,16 +32,15 @@ _ENC_KEYS_FILE = _DATA_DIR / "config" / "user_keys.enc.json"
 def _get_keyring():
     # Skip keyring when a Fernet key is configured — Fernet is portable across
     # all environments (including headless Linux containers on Railway).
-    if os.environ.get("POLYMARKET_SECRETS_KEY", "").strip():
+    if os.environ.get("POLYMARKET_SECRETS_KEY"):
         return None
     try:
         import keyring as _kr
-        # Detect the no-op fail backend (installed but no daemon running).
         from keyring.backends.fail import Keyring as _FailBackend
         if isinstance(_kr.get_keyring(), _FailBackend):
             return None
         return _kr
-    except Exception:
+    except ImportError:
         return None
 
 

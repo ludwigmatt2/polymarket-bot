@@ -44,11 +44,8 @@ from telegram.ext import (
 
 load_dotenv()
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
-# DATA_DIR separates code (ROOT) from mutable data so a persistent volume can be
-# mounted on Railway without touching source files.  Locally defaults to ROOT.
 ROOT          = Path(__file__).parent
-DATA_DIR      = Path(os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") or ROOT)
+from weather.paths import DATA_DIR
 USERS_FILE    = DATA_DIR / "config" / "users.json"
 WALLET_FILE   = DATA_DIR / "logs" / "wallet.json"
 
@@ -123,16 +120,17 @@ def _seed_volume_data() -> None:
     if not seed_dir.exists():
         return
     copied = 0
-    for src in sorted(seed_dir.rglob("*")):
+    for src in seed_dir.rglob("*"):
         if not src.is_file():
             continue
         rel  = src.relative_to(seed_dir)
         dest = DATA_DIR / rel
         if dest.exists():
             continue
+        size = src.stat().st_size
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(src.read_bytes())
-        print(f"[seed] {dest} ({src.stat().st_size:,} bytes)", flush=True)
+        print(f"[seed] {dest} ({size:,} bytes)", flush=True)
         copied += 1
     if copied:
         print(f"[seed] Migration complete — {copied} file(s) written to {DATA_DIR}", flush=True)
@@ -1425,27 +1423,26 @@ _ADMIN_COMMANDS = _USER_COMMANDS + [
     ("setmaxbet",   "💰 Set max bet size per trade (e.g. /setmaxbet 50)"),
 ]
 
-_UPLOAD_TARGETS: dict[str, Path] = {
-    "paper_trades.csv":      DATA_DIR / "logs" / "paper_trades.csv",
-    "calibration_log.csv":   DATA_DIR / "logs" / "calibration_log.csv",
-    "historical_skill.json": DATA_DIR / "logs" / "historical_skill.json",
-    "city_bias.csv":         DATA_DIR / "logs" / "city_bias.csv",
-}
-
 async def handle_admin_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Admin sends a data file as Telegram document → saved to DATA_DIR/logs/."""
     uid = update.effective_user.id
     if not is_admin(uid):
         return
+    targets = {
+        "paper_trades.csv":      DATA_DIR / "logs" / "paper_trades.csv",
+        "calibration_log.csv":   DATA_DIR / "logs" / "calibration_log.csv",
+        "historical_skill.json": DATA_DIR / "logs" / "historical_skill.json",
+        "city_bias.csv":         DATA_DIR / "logs" / "city_bias.csv",
+    }
     doc = update.effective_message.document
-    if not doc or doc.file_name not in _UPLOAD_TARGETS:
+    if not doc or doc.file_name not in targets:
         await update.effective_message.reply_text(
             "📂 Send one of these files to upload it to the Railway volume:\n"
-            + "\n".join(f"• `{n}`" for n in _UPLOAD_TARGETS),
+            + "\n".join(f"• `{n}`" for n in targets),
             parse_mode="Markdown",
         )
         return
-    dest = _UPLOAD_TARGETS[doc.file_name]
+    dest = targets[doc.file_name]
     dest.parent.mkdir(parents=True, exist_ok=True)
     tg_file = await ctx.bot.get_file(doc.file_id)
     await tg_file.download_to_drive(str(dest))

@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import csv
 import json
-import os
 import time
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -25,7 +24,7 @@ from .config import (
 from .models import Location, Signal
 from .paper_trader import PaperTrader, _brier, _evaluate_outcome
 
-_DATA_DIR = Path(os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") or ".")
+from .paths import DATA_DIR as _DATA_DIR
 LIVE_TRADES_LOG = _DATA_DIR / "logs" / "live_trades.csv"
 _IDEMPOTENCY_FILE = _DATA_DIR / "logs" / "live_idempotency.json"
 _RUNTIME_CONFIG = _DATA_DIR / "logs" / "runtime_config.json"
