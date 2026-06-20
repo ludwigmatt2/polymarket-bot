@@ -125,6 +125,26 @@ def _seed_admin() -> None:
             }
             _save_users(users)
 
+
+def _seed_admin_creds() -> None:
+    """One-time: import admin credentials from env vars into the encrypted store.
+
+    Runs on every startup but is a no-op once credentials are already stored.
+    Keeps POLYMARKET_PRIVATE_KEY / POLYMARKET_PROXY_ADDRESS as Railway env vars
+    for the initial bootstrap; after the first successful seed they are no longer
+    read at runtime (the encrypted store takes over).
+    """
+    from weather.secrets import get_user_creds, set_user_creds
+    if get_user_creds(ADMIN_ID):
+        return  # already stored — nothing to do
+    pk    = os.environ.get("POLYMARKET_PRIVATE_KEY", "").strip()
+    proxy = os.environ.get("POLYMARKET_PROXY_ADDRESS", "").strip()
+    if not pk:
+        return  # env vars not set yet — skip silently
+    sig = "gnosis-safe" if proxy else "eoa"
+    set_user_creds(ADMIN_ID, pk=pk, proxy_address=proxy or None, signature_type=sig)
+    print(f"[startup] Admin credentials seeded from env vars into encrypted store (sig={sig}).", flush=True)
+
 def get_user_mode(uid: int) -> str:
     return _load_users().get(uid, {}).get("mode", "paper")
 
@@ -1419,6 +1439,7 @@ async def _register_commands(app) -> None:
 
 async def _run() -> None:
     _seed_admin()
+    _seed_admin_creds()
     _migrate_global_wallet()
     _log_startup()
 
