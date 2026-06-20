@@ -25,7 +25,7 @@ from .config import (
 from .models import Location, Signal
 from .paper_trader import PaperTrader, _brier, _evaluate_outcome
 
-_DATA_DIR = Path(os.environ.get("DATA_DIR", "."))
+_DATA_DIR = Path(os.environ.get("DATA_DIR") or os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") or ".")
 LIVE_TRADES_LOG = _DATA_DIR / "logs" / "live_trades.csv"
 _IDEMPOTENCY_FILE = _DATA_DIR / "logs" / "live_idempotency.json"
 _RUNTIME_CONFIG = _DATA_DIR / "logs" / "runtime_config.json"

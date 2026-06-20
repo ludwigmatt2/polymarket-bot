@@ -25,7 +25,7 @@ from ._io import atomic_write_json
 
 _SERVICE_NAME = "polymarket-bot"
 # DATA_DIR lets Railway (or any deployment) point to a persistent volume.
-_DATA_DIR = Path(os.environ.get("DATA_DIR", Path(__file__).parent.parent))
+_DATA_DIR = Path(os.environ.get("DATA_DIR") or os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") or Path(__file__).parent.parent)
 _ENC_KEYS_FILE = _DATA_DIR / "config" / "user_keys.enc.json"
 
 
