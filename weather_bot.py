@@ -39,7 +39,7 @@ from weather.live_backtest import LiveSignalBacktester
 from weather.market_scanner import WeatherMarketScanner
 from weather.city_bias import CityBiasCorrector
 from weather.models import Signal
-from weather.live_trader import LiveTrader
+from weather.live_trader import LiveTrader, check_geoblock
 from weather.paper_trader import PaperTrader
 from weather.position_monitor import PositionMonitor, print_flags
 from weather.price_tracker import PriceTracker
@@ -72,7 +72,12 @@ def run_scan(
     rejected = [s for s in signals if not s.quality_gate_passed]
     print(f"{len(actionable)} signals pass quality gates")
 
-    if live_trader and actionable:
+    geo = check_geoblock() if (live_trader and actionable) else None
+    if live_trader and actionable and geo and geo.get("blocked"):
+        print(f"  LIVE HALT: geoblocked from {geo.get('country','?')}/{geo.get('region','?')} "
+              f"(IP {geo.get('ip','?')}) — route order traffic through a permitted region "
+              f"(set HTTPS_PROXY).", file=sys.stderr)
+    elif live_trader and actionable:
         print(f"  [3/3] Executing {len(actionable)} live order(s)...")
         for s in actionable:
             try:
@@ -191,6 +196,15 @@ def _execute_live_for_user(
     if not creds or not creds.get("pk"):
         _write_live_halt(user_dir, "private key unavailable — skipped live execution")
         print(f"    ⚠ user {uid}: no key available, live skipped", file=sys.stderr)
+        return
+
+    geo = check_geoblock()
+    if geo and geo.get("blocked"):
+        reason = (f"geoblocked — order placement restricted from "
+                  f"{geo.get('country','?')}/{geo.get('region','?')} (IP {geo.get('ip','?')}); "
+                  f"set HTTPS_PROXY to a permitted region")
+        _write_live_halt(user_dir, reason)
+        print(f"    ⛔ user {uid}: {reason}", file=sys.stderr)
         return
 
     trader = LiveTrader(

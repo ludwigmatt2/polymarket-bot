@@ -140,6 +140,34 @@ def _read_collateral_balance(client) -> float:
     return float(raw) / _USDC_BASE_UNITS
 
 
+_geoblock_cache: "tuple[float, dict] | None" = None
+
+
+def check_geoblock(ttl: float = 300.0) -> dict | None:
+    """Whether the current egress IP may place orders on Polymarket.
+
+    Hits the geoblock endpoint (on polymarket.com, not the CLOB API) and returns
+    {'blocked': bool, 'country': str, 'region': str, 'ip': str}, or None if the
+    check itself fails — None means "unknown, proceed" (the order POST is the
+    real gate). Successful results are cached for `ttl`s since the egress IP is
+    stable within a run. Honours HTTPS_PROXY like every other call, so it reports
+    the same region the /order endpoint will see.
+    """
+    global _geoblock_cache
+    now = time.monotonic()
+    if _geoblock_cache is not None and now - _geoblock_cache[0] < ttl:
+        return _geoblock_cache[1]
+    import requests
+    try:
+        r = requests.get("https://polymarket.com/api/geoblock", timeout=8)
+        r.raise_for_status()
+        result = r.json()
+    except Exception:
+        return None
+    _geoblock_cache = (now, result)
+    return result
+
+
 def fetch_balance_for_creds(creds: dict) -> float:
     """Read available USDC for a user's stored creds via the official CLOB SDK.
 

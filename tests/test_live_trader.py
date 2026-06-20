@@ -368,3 +368,47 @@ class TestPerUserCredentials:
         )
         with pytest.raises(RuntimeError, match="private key"):
             trader._get_client()
+
+
+# ---------------------------------------------------------------------------
+# Geoblock pre-flight check
+# ---------------------------------------------------------------------------
+
+class TestGeoblock:
+    def _reset_cache(self):
+        import weather.live_trader as lt
+        lt._geoblock_cache = None
+
+    def test_returns_parsed_payload(self, monkeypatch):
+        self._reset_cache()
+        import weather.live_trader as lt
+        resp = MagicMock()
+        resp.json.return_value = {"blocked": True, "country": "DE", "region": "BY", "ip": "1.2.3.4"}
+        resp.raise_for_status.return_value = None
+        monkeypatch.setattr("requests.get", lambda *a, **k: resp)
+        geo = lt.check_geoblock()
+        assert geo["blocked"] is True and geo["country"] == "DE"
+
+    def test_none_on_failure_not_cached(self, monkeypatch):
+        self._reset_cache()
+        import weather.live_trader as lt
+        def boom(*a, **k):
+            raise OSError("network down")
+        monkeypatch.setattr("requests.get", boom)
+        assert lt.check_geoblock() is None
+        assert lt._geoblock_cache is None  # failures are not cached → retried next call
+
+    def test_success_is_cached(self, monkeypatch):
+        self._reset_cache()
+        import weather.live_trader as lt
+        calls = {"n": 0}
+        def once(*a, **k):
+            calls["n"] += 1
+            r = MagicMock()
+            r.json.return_value = {"blocked": False, "country": "IE"}
+            r.raise_for_status.return_value = None
+            return r
+        monkeypatch.setattr("requests.get", once)
+        lt.check_geoblock()
+        lt.check_geoblock()
+        assert calls["n"] == 1  # second call served from cache
