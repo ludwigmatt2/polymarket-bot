@@ -125,6 +125,21 @@ def _make_clob_client(
     )
 
 
+_USDC_BASE_UNITS = 1_000_000  # CLOB returns USDC collateral in 6-decimal base units
+
+
+def _read_collateral_balance(client) -> float:
+    """Available USDC collateral in dollars.
+
+    The CLOB /balance-allowance endpoint returns the amount as a string in
+    6-decimal base units (e.g. "7330000" == $7.33), so scale by 1e6.
+    """
+    from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
+    result = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+    raw = result.get("balance", "0") or "0"
+    return float(raw) / _USDC_BASE_UNITS
+
+
 def fetch_balance_for_creds(creds: dict) -> float:
     """Read available USDC for a user's stored creds via the official CLOB SDK.
 
@@ -133,7 +148,6 @@ def fetch_balance_for_creds(creds: dict) -> float:
     weather.secrets.get_user_creds (pk + funder_address + integer signature_type
     + optional clob_* L2 creds).
     """
-    from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
     client = _make_clob_client(
         pk=creds.get("pk", ""),
         funder_address=creds.get("funder_address"),
@@ -142,9 +156,7 @@ def fetch_balance_for_creds(creds: dict) -> float:
         clob_secret=creds.get("clob_secret"),
         clob_passphrase=creds.get("clob_passphrase"),
     )
-    result = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
-    raw = result.get("balance", result.get("allowance", "0")) or "0"
-    return float(raw)
+    return _read_collateral_balance(client)
 
 
 class LiveTrader:
@@ -394,14 +406,8 @@ class LiveTrader:
         return resolved, skipped
 
     def fetch_balance(self) -> float:
-        """Return available USDC balance via the official CLOB SDK."""
-        from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
-        client = self._get_client()
-        result = client.get_balance_allowance(
-            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-        )
-        raw = result.get("balance", result.get("allowance", "0")) or "0"
-        return float(raw)
+        """Return available USDC balance (dollars) via the official CLOB SDK."""
+        return _read_collateral_balance(self._get_client())
 
     # ------------------------------------------------------------------
     # Internal helpers

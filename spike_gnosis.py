@@ -126,7 +126,8 @@ def run_spike() -> None:
             BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         )
         print(f"      CLOB response: {result}")
-        balance = float(result.get("balance", result.get("allowance", "0")) or "0")
+        # CLOB returns USDC collateral in 6-decimal base units ("7330000" = $7.33)
+        balance = float(result.get("balance", "0") or "0") / 1_000_000
     except Exception as e:
         _fail("get_balance_allowance", e)
 
