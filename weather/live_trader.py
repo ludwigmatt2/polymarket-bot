@@ -90,6 +90,27 @@ def _get_max_trade_usd() -> float:
     return MAX_LIVE_TRADE_USD
 
 
+def fetch_balance_for_creds(creds: dict) -> float:
+    """Read available USDC for a user's stored creds via the official CLOB SDK.
+
+    Shared by the onboarding wizard so balance display goes through the same
+    path as live trading (no pmxt dependency). `creds` is the dict returned by
+    weather.secrets.get_user_creds (pk + funder_address + integer signature_type
+    + optional clob_* L2 creds).
+    """
+    trader = LiveTrader(
+        paper_trader=None,  # balance read never touches paper state
+        bankroll_usd=0.0,
+        private_key=creds.get("pk"),
+        funder_address=creds.get("funder_address"),
+        signature_type=creds.get("signature_type"),
+        clob_api_key=creds.get("clob_api_key"),
+        clob_secret=creds.get("clob_secret"),
+        clob_passphrase=creds.get("clob_passphrase"),
+    )
+    return trader.fetch_balance()
+
+
 # Maps legacy pmxt string signature types → official SDK integers (mirrors secrets.py).
 _LEGACY_SIG_MAP: dict[str, int] = {
     "eoa": 0,
