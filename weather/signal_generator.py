@@ -41,6 +41,7 @@ from .config import (
     MIN_ENSEMBLE_MEMBERS,
     MIN_ENTRY_HOURS_AHEAD,
     MIN_MARKET_LIQUIDITY_USD,
+    BLOCKED_YES_CITIES,
     MIN_NET_EV_PP,
     MIN_YES_ENTRY_PRICE,
     ROUND_TRIP_FEE,
@@ -253,6 +254,15 @@ class SignalGenerator:
         # Cutting these recovers $95 and lifts overall ROI 37% → 45%.
         if prob.calibrated_p > market.yes_price and market.yes_price < MIN_YES_ENTRY_PRICE:
             return False, f"gate9.7_low_priced_yes:{market.yes_price:.3f}", 0.0
+
+        # Gate 9.8: City-specific YES blocks — data-driven per-city YES suppression.
+        # 577-trade dataset (Jun 2026): Tokyo YES → 0% WR, -37% ROI (7 trades).
+        # Direction inferred from calibrated_p; shrinkage is anchored at market price so
+        # direction cannot flip post-shrinkage.
+        implied_yes = prob.calibrated_p > market.yes_price
+        if implied_yes and any(city in market.title for city in BLOCKED_YES_CITIES):
+            matched = next(c for c in BLOCKED_YES_CITIES if c in market.title)
+            return False, f"gate9.8_city_yes_blocked:{matched}", 0.0
 
         # Gate 4: Fee-adjusted edge (blocks the majority of candidate trades)
         gross_ev = abs(prob.calibrated_p - market.yes_price)

@@ -6,13 +6,19 @@ All thresholds and constants live here — no magic numbers in other modules.
 import os
 
 # ── Signal quality thresholds ──────────────────────────────────────────────────
-MIN_NET_EV_PP = 0.04            # Gate 4: minimum edge after subtracting round-trip fees
+MIN_NET_EV_PP = 0.08            # Gate 4: minimum edge after subtracting round-trip fees
+                                # Raised 0.04→0.08 (Jun 2026): 5-10% gross-edge trades earned
+                                # only +28.6% ROI vs +50.8% for >20% edge (577-trade dataset).
 MAX_DAYS_TO_RESOLUTION = 31     # Include monthly (May) markets
 MAX_ENSEMBLE_SPREAD = 0.20      # Allow slightly more uncertainty for monthly markets
 MIN_ENSEMBLE_MEMBERS = 3        # Minimum model count for a valid ensemble
 
 # ── Entry timing (Gate 1) ──────────────────────────────────────────────────────
-MAX_ENTRY_DAYS_AHEAD = 5        # Reject if resolution is more than 5 days out
+MAX_ENTRY_DAYS_AHEAD = 7        # Reject if resolution is more than 7 days out
+                                # Raised 5→7 (Jun 2026): d=3-4 trades show +69%/+43% ROI vs
+                                # +36-39% at d=0-1; also rescales Gate 8 timing_component so
+                                # 3-4 day markets receive higher confidence and are not
+                                # unfairly penalised by the timing term.
 MIN_ENTRY_HOURS_AHEAD = 4       # Reject if resolution is less than 4 hours away
 
 # ── Forecast freshness (Gate 0) ───────────────────────────────────────────────
@@ -59,6 +65,11 @@ BLOCK_EQUAL_YES = True
 # The market is near-zero on YES; our model says otherwise but is consistently wrong.
 # Cutting these 53 trades recovers $95 in losses and lifts overall ROI 37% → 45%.
 MIN_YES_ENTRY_PRICE = 0.15
+
+# ── City-specific YES blocks (Gate 9.8) ───────────────────────────────────────
+# Data (577 resolved trades, Jun 2026): Tokyo YES bets → 0% WR, -37% ROI (7 trades).
+# Tokyo NO remains tradeable (+19.8% ROI). Other cities may be added as data accumulates.
+BLOCKED_YES_CITIES: list[str] = ["Tokyo"]
 
 # ── Fee model ──────────────────────────────────────────────────────────────────
 TAKER_FEE_PER_SIDE = 0.02       # 2% per trade (Polymarket CLOB taker)
@@ -120,7 +131,7 @@ ENSEMBLE_MODELS = ["gfs_seamless", "icon_seamless", "ecmwf_ifs025"]
 # inverse-MAE ≈ 1.0/1.2/1.4). model_skill_tracker.py replaces it with fitted weights
 # once enough resolved trades carry model_breakdown_json. Equal weights reproduce the
 # pre-Phase-4 member-pooled behavior exactly.
-MODEL_WEIGHTS = {"ecmwf_ifs025": 1.5, "icon_seamless": 1.1, "gfs_seamless": 1.0}
+MODEL_WEIGHTS = {"ecmwf_ifs025": 1.1, "icon_seamless": 1.1, "gfs_seamless": 1.0}
 # Kill switch — False reverts to equal member pooling (no weighting).
 MODEL_WEIGHTING_ENABLED = True
 
