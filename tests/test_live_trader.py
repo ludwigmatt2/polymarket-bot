@@ -519,3 +519,95 @@ class TestGeoblock:
         lt.check_geoblock()
         lt.check_geoblock()
         assert calls["n"] == 1  # second call served from cache
+
+
+# ---------------------------------------------------------------------------
+# On-chain position reconciliation (Data API /positions)
+# ---------------------------------------------------------------------------
+
+class TestPositionsReconciliation:
+    def test_fetch_positions_empty_without_wallet(self, tmp_path):
+        trader = _make_trader(tmp_path)  # no funder_address
+        assert trader.fetch_positions() == []
+
+    def test_fetch_positions_parses_data_api(self, tmp_path, monkeypatch):
+        trader = _make_trader(tmp_path)
+        trader._funder_address = "0xproxy"
+        payload = [{"conditionId": "0xabc", "outcome": "Yes", "size": 10.0, "redeemable": False}]
+
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return json.dumps(payload).encode()
+
+        captured = {}
+        def fake_urlopen(url, timeout=10):
+            captured["url"] = url
+            return _Resp()
+        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+        positions = trader.fetch_positions()
+        assert positions == payload
+        assert "user=0xproxy" in captured["url"]
+
+    def test_fetch_positions_returns_empty_on_error(self, tmp_path, monkeypatch):
+        trader = _make_trader(tmp_path)
+        trader._funder_address = "0xproxy"
+        def boom(*a, **k):
+            raise OSError("network down")
+        monkeypatch.setattr("urllib.request.urlopen", boom)
+        assert trader.fetch_positions() == []
+
+    def test_redeemable_positions_filters(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        trader.fetch_positions = lambda: [
+            {"conditionId": "0xa", "redeemable": True},
+            {"conditionId": "0xb", "redeemable": False},
+            {"conditionId": "0xc", "redeemable": True},
+        ]
+        redeemable = trader.redeemable_positions()
+        assert [p["conditionId"] for p in redeemable] == ["0xa", "0xc"]
+
+    def test_reconcile_flags_missing_on_chain(self, tmp_path):
+        """An open local trade with no matching on-chain position is flagged."""
+        trader = _make_trader(tmp_path)
+        trader.fetch_positions = lambda: []
+        _write_live_trades(trader._log_path, [
+            {"market_id": "0xABC", "direction": "YES", "order_id": "ord1", "actual_outcome": ""},
+        ])
+        div = trader.reconcile_positions()
+        assert len(div) == 1
+        assert div[0]["type"] == "missing_on_chain"
+        assert div[0]["order_id"] == "ord1"
+
+    def test_reconcile_flags_untracked_on_chain(self, tmp_path):
+        """An on-chain position with no matching open local trade is flagged."""
+        trader = _make_trader(tmp_path)
+        trader.fetch_positions = lambda: [
+            {"conditionId": "0xabc", "outcome": "Yes", "size": 5.0}
+        ]
+        _write_live_trades(trader._log_path, [])
+        div = trader.reconcile_positions()
+        assert len(div) == 1
+        assert div[0]["type"] == "untracked_on_chain"
+        assert div[0]["market_id"] == "0xabc"
+
+    def test_reconcile_matches_case_insensitively(self, tmp_path):
+        """A local trade matching an on-chain position (any case) yields no flag."""
+        trader = _make_trader(tmp_path)
+        trader.fetch_positions = lambda: [
+            {"conditionId": "0xabc", "outcome": "Yes", "size": 10.0}
+        ]
+        _write_live_trades(trader._log_path, [
+            {"market_id": "0xABC", "direction": "YES", "order_id": "ord1", "actual_outcome": ""},
+        ])
+        assert trader.reconcile_positions() == []
+
+    def test_reconcile_ignores_resolved_local_trades(self, tmp_path):
+        """Resolved local trades (actual_outcome set) are not reconciled."""
+        trader = _make_trader(tmp_path)
+        trader.fetch_positions = lambda: []
+        _write_live_trades(trader._log_path, [
+            {"market_id": "0xABC", "direction": "YES", "order_id": "ord1", "actual_outcome": "1"},
+        ])
+        assert trader.reconcile_positions() == []

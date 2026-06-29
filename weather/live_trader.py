@@ -47,6 +47,9 @@ _CSV_HEADERS = [
     "eur_rate", "pnl_eur",
 ]
 
+# Public Data API — on-chain positions per wallet address (no auth required).
+_DATA_API_POSITIONS = "https://data-api.polymarket.com/positions"
+
 
 def _fetch_ecb_rate(dt: "date") -> "float | None":
     """ECB reference rate: USD → EUR for given date. Tries up to 4 days back for weekends/holidays."""
@@ -466,6 +469,78 @@ class LiveTrader:
     def fetch_balance(self) -> float:
         """Return available USDC balance (dollars) via the official CLOB SDK."""
         return _read_collateral_balance(self._get_client())
+
+    def fetch_positions(self) -> list[dict]:
+        """Current on-chain positions for the bot's wallet via the public Data API.
+
+        Read-only, no auth (positions are public per address). Returns the raw
+        Position list from data-api.polymarket.com/positions, or [] when no
+        wallet address is configured or the call fails.
+        """
+        if not self._funder_address:
+            return []
+        import urllib.parse
+        import urllib.request
+
+        query = urllib.parse.urlencode({"user": self._funder_address})
+        try:
+            with urllib.request.urlopen(f"{_DATA_API_POSITIONS}?{query}", timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def redeemable_positions(self) -> list[dict]:
+        """On-chain positions whose market has resolved and whose winnings are
+        claimable (redeemable=True). Use to drive post-resolution settlement."""
+        return [p for p in self.fetch_positions() if p.get("redeemable")]
+
+    def reconcile_positions(self) -> list[dict]:
+        """Compare local open live trades against actual on-chain positions.
+
+        Surfaces divergences only (never mutates the trade log):
+          - "missing_on_chain": an open local trade with no matching on-chain
+            position (order never filled, or already resolved/redeemed)
+          - "untracked_on_chain": an on-chain position with no matching open
+            local trade (placed out-of-band, or a resolved trade not yet logged)
+        Matched positions are not reported. Returns [] when there is nothing to
+        reconcile or the wallet/API is unavailable.
+        """
+        on_chain: dict[tuple[str, str], dict] = {}
+        for p in self.fetch_positions():
+            cond = (p.get("conditionId") or "").lower()
+            if cond:
+                on_chain[(cond, (p.get("outcome") or "").upper())] = p
+
+        divergences: list[dict] = []
+        matched: set[tuple[str, str]] = set()
+        for t in self._load_open_live_trades():
+            key = ((t.get("market_id") or "").lower(), (t.get("direction") or "").upper())
+            if key in on_chain:
+                matched.add(key)
+            else:
+                divergences.append({
+                    "type": "missing_on_chain",
+                    "market_id": t.get("market_id", ""),
+                    "direction": key[1],
+                    "order_id": t.get("order_id", ""),
+                })
+        for key, p in on_chain.items():
+            if key not in matched:
+                divergences.append({
+                    "type": "untracked_on_chain",
+                    "market_id": p.get("conditionId", ""),
+                    "direction": key[1],
+                    "size": p.get("size", 0),
+                })
+        return divergences
+
+    def _load_open_live_trades(self) -> list[dict]:
+        """Rows in the live trade log with no resolution outcome yet."""
+        if not self._log_path.exists():
+            return []
+        with open(self._log_path) as f:
+            return [r for r in csv.DictReader(f) if r.get("actual_outcome") in (None, "")]
 
     # ------------------------------------------------------------------
     # Internal helpers
