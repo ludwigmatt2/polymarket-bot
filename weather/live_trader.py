@@ -343,9 +343,20 @@ class LiveTrader:
         if self._fill_poll_delay > 0:
             time.sleep(self._fill_poll_delay)
         order_obj = client.get_order(order_id)
-        filled = float(order_obj.get("size_matched", order_obj.get("filled", 0)) or 0)
+        # size_matched is 6-decimal fixed-math per the CLOB OpenOrder schema
+        # ("100000000" == 100 contracts); py-clob-client-v2 returns the raw API
+        # JSON unmodified, so normalise here. price is a plain decimal — leave it.
+        raw_matched = order_obj.get("size_matched", order_obj.get("filled", 0)) or 0
+        filled = float(raw_matched) / 1e6
         filled_price = float(order_obj.get("price", ep) or ep)
         order_status = str(order_obj.get("status", "unknown"))
+
+        # A fill can never exceed what we ordered. If this trips, the fixed-math
+        # scaling assumption above is wrong (API changed) — fail loud rather than
+        # log a 1e6x-inflated size into the P&L.
+        assert filled <= n_contracts * 1.01, (
+            f"fill {filled} exceeds order size {n_contracts} — check size_matched scaling"
+        )
 
         if filled <= 0:
             return {"order_id": order_id, "status": "unfilled", "filled": 0.0}

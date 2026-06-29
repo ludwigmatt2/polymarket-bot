@@ -124,10 +124,16 @@ def _make_trader(tmp_path: Path, bankroll: float = 500.0) -> LiveTrader:
 
 
 def _make_mock_client(filled: float, price: float = 0.35, status: str = "filled") -> MagicMock:
-    """Minimal ClobClient mock for execute_signal tests."""
+    """Minimal ClobClient mock for execute_signal tests.
+
+    `filled` is the contract count; the real API reports size_matched in
+    6-decimal fixed-math, so the mock emits it that way (filled * 1e6).
+    """
     mock = MagicMock()
     mock.create_and_post_order.return_value = {"orderID": "ord_mock"}
-    mock.get_order.return_value = {"size_matched": filled, "price": price, "status": status}
+    mock.get_order.return_value = {
+        "size_matched": filled * 1e6, "price": price, "status": status
+    }
     return mock
 
 
@@ -235,6 +241,34 @@ class TestFillReconciliation:
         trader._client = _make_mock_client(filled=20.0)
         trader.execute_signal(_make_signal())
         trader.paper_trader.log_trade.assert_called_once()
+
+    def test_size_matched_fixed_math_is_normalized(self, tmp_path):
+        """Raw 6-decimal fixed-math size_matched must be divided down to contracts."""
+        trader = _make_trader(tmp_path, bankroll=500.0)
+        mock = MagicMock()
+        mock.create_and_post_order.return_value = {"orderID": "ord_mock"}
+        # Raw API shape: "5500000" == 5.5 contracts (not 5.5 million).
+        mock.get_order.return_value = {"size_matched": "5500000", "price": "0.36", "status": "partial"}
+        trader._client = mock
+
+        result = trader.execute_signal(_make_signal(market_p=0.35))
+
+        assert result["filled"] == pytest.approx(5.5)
+        rows = list(csv.DictReader(open(trader._log_path)))
+        assert float(rows[0]["filled_size"]) == pytest.approx(5.5)
+
+    def test_impossible_fill_trips_guard(self, tmp_path):
+        """A fill exceeding the order size signals a scaling/API regression — fail loud."""
+        trader = _make_trader(tmp_path)
+        trader.kelly_size_usd = lambda signal: 3.5  # ~10 contracts at ep 0.35
+        mock = MagicMock()
+        mock.create_and_post_order.return_value = {"orderID": "ord_mock"}
+        # 1e9 fixed-math == 1000 contracts, far above the ~10 ordered.
+        mock.get_order.return_value = {"size_matched": "1000000000", "price": "0.35", "status": "filled"}
+        trader._client = mock
+
+        with pytest.raises(AssertionError, match="size_matched scaling"):
+            trader.execute_signal(_make_signal(market_p=0.35))
 
 
 # ---------------------------------------------------------------------------
