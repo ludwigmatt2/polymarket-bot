@@ -1,0 +1,19 @@
+[package]
+name = "rust_deposit_spike"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88.0"
+
+# Re-verification spike: does rs-clob-client-v2 0.6.0-canary.1 place a
+# deposit-wallet (POLY_1271) order, or does it hit the same EOA-binding wall as
+# py-clob-client-v2? See src/main.rs and the project memory order_placement_blocked.
+[dependencies]
+polymarket_client_sdk_v2 = { git = "https://github.com/Polymarket/rs-clob-client-v2", features = ["clob"] }
+alloy = { version = "1.6.3", default-features = false, features = ["signers", "signer-local"] }
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
+chrono = "0.4"
+rust_decimal = "1.41"
+rust_decimal_macros = "1.40"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = "1.0"
+anyhow = "1.0"
