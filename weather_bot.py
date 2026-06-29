@@ -41,7 +41,7 @@ from weather.city_bias import CityBiasCorrector
 from weather.models import Signal
 from weather.live_trader import LiveTrader, check_geoblock
 from weather.paper_trader import PaperTrader
-from weather.position_monitor import PositionMonitor, print_flags
+from weather.position_monitor import PositionMonitor, print_divergences, print_flags
 from weather.price_tracker import PriceTracker
 from weather.probability_model import ProbabilityModel
 from weather.signal_generator import SignalGenerator
@@ -110,6 +110,15 @@ def run_scan(
         if flags:
             print()
             print_flags(flags)
+
+    if live_trader is not None:
+        print("  [+] Reconciling open positions on-chain...")
+        try:
+            divergences = live_trader.reconcile_positions()
+        except Exception as e:
+            print(f"  reconcile skipped ({e})", file=sys.stderr)
+        else:
+            print_divergences(divergences)
 
     return signals
 

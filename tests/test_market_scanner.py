@@ -58,20 +58,18 @@ class TestBookDepthAttached:
         assert wm is not None
         assert wm.book_depth_usd == 0.0  # default; scan() sets it via _fetch_book_depth_usd
 
-    def test_fetch_book_depth_returns_zero_for_empty_token_id(self):
+    def test_fetch_book_summary_returns_empty_for_empty_token_id(self):
         scanner = _make_scanner_with_geocode()
-        depth = scanner._fetch_book_depth_usd("")
-        assert depth == 0.0
+        assert scanner._fetch_book_summary("") == {}
 
-    def test_fetch_book_depth_returns_zero_on_clob_error(self):
+    def test_fetch_book_summary_returns_empty_on_clob_error(self):
         scanner = _make_scanner_with_geocode()
         mock_client = MagicMock()
         mock_client.get_order_book.side_effect = Exception("network error")
         scanner._clob_client = mock_client
-        depth = scanner._fetch_book_depth_usd("yes-token-123")
-        assert depth == 0.0
+        assert scanner._fetch_book_summary("yes-token-123") == {}
 
-    def test_fetch_book_depth_computes_ask_side_usd(self):
+    def test_fetch_book_summary_computes_ask_side_usd(self):
         scanner = _make_scanner_with_geocode()
         mock_client = MagicMock()
         mock_client.get_order_book.return_value = {
@@ -81,9 +79,37 @@ class TestBookDepthAttached:
             ]
         }
         scanner._clob_client = mock_client
-        depth = scanner._fetch_book_depth_usd("yes-token-123")
+        summary = scanner._fetch_book_summary("yes-token-123")
         # 0.55*100 + 0.57*50 = 55 + 28.5 = 83.5
-        assert abs(depth - 83.5) < 0.01
+        assert abs(summary["depth_usd"] - 83.5) < 0.01
+
+    def test_fetch_book_summary_extracts_constraints(self):
+        """tick_size, min_order_size and neg_risk come from the book itself."""
+        scanner = _make_scanner_with_geocode()
+        mock_client = MagicMock()
+        mock_client.get_order_book.return_value = {
+            "asks": [{"price": "0.55", "size": "100"}],
+            "tick_size": "0.001",
+            "min_order_size": "5",
+            "neg_risk": True,
+        }
+        scanner._clob_client = mock_client
+        summary = scanner._fetch_book_summary("yes-token-123")
+        assert summary["tick_size"] == "0.001"
+        assert summary["min_order_size"] == 5.0
+        assert summary["neg_risk"] is True
+
+    def test_fetch_book_summary_ignores_invalid_tick(self):
+        """A tick the order builder can't accept is dropped, leaving Gamma's value."""
+        scanner = _make_scanner_with_geocode()
+        mock_client = MagicMock()
+        mock_client.get_order_book.return_value = {
+            "asks": [],
+            "tick_size": "0.025",  # not a valid PartialCreateOrderOptions tick
+        }
+        scanner._clob_client = mock_client
+        summary = scanner._fetch_book_summary("yes-token-123")
+        assert "tick_size" not in summary
 
     def test_parse_market_populates_token_ids(self):
         """clobTokenIds from Gamma API must be stored on the WeatherMarket."""

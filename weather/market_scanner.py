@@ -127,6 +127,20 @@ class _YesSide:
 _TICK_MAP = {0.1: "0.1", 0.01: "0.01", 0.001: "0.001", 0.0001: "0.0001"}
 
 
+def _normalize_tick(raw) -> str | None:
+    """Canonical tick string PartialCreateOrderOptions accepts, or None if the
+    value isn't a recognized tick. Accepts a float (Gamma orderPriceMinTickSize)
+    or a string (CLOB book tick_size)."""
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        return raw if raw in _TICK_MAP.values() else None
+    try:
+        return _TICK_MAP.get(float(raw))
+    except (TypeError, ValueError):
+        return None
+
+
 class _GammaMarket:
     """Wraps a Gamma API market dict into a structured object for parsing."""
 
@@ -154,8 +168,7 @@ class _GammaMarket:
         self.yes_token_id: str = token_ids[0] if token_ids else ""
         self.no_token_id: str = token_ids[1] if len(token_ids) > 1 else ""
         # Minimum tick size required by PartialCreateOrderOptions (must be a string literal)
-        tick_raw = float(market.get("orderPriceMinTickSize", 0.01) or 0.01)
-        self.tick_size: str = _TICK_MAP.get(tick_raw, "0.01")
+        self.tick_size: str = _normalize_tick(market.get("orderPriceMinTickSize")) or "0.01"
 
 
 _GAMMA_SEARCH_URL = "https://gamma-api.polymarket.com/public-search"
@@ -222,9 +235,15 @@ class WeatherMarketScanner:
                 }], _ALARM_FIELDS)
 
         tradeable = self._filter_tradeable(parsed)
-        # Fetch live CLOB order-book depth only for markets that survived all other filters.
+        # Fetch the live CLOB order book only for markets that survived all other
+        # filters. Beyond depth, the book carries the authoritative tick_size,
+        # min_order_size and neg_risk — prefer them over the Gamma-derived values.
         for wm in tradeable:
-            wm.book_depth_usd = self._fetch_book_depth_usd(wm.yes_token_id)
+            summary = self._fetch_book_summary(wm.yes_token_id)
+            wm.book_depth_usd = summary.get("depth_usd", 0.0)
+            for attr in ("tick_size", "min_order_size", "neg_risk"):
+                if attr in summary:
+                    setattr(wm, attr, summary[attr])
         print(f"    tradeable after filters: {len(tradeable)} / {len(parsed)}")
         self.last_funnel = {
             "fetched": len(raw_markets),
@@ -466,23 +485,38 @@ class WeatherMarketScanner:
 
         return True
 
-    def _fetch_book_depth_usd(self, yes_token_id: str) -> float:
-        """B4: Fetch live CLOB order-book depth (ask side in USD) for the YES outcome.
+    def _fetch_book_summary(self, yes_token_id: str) -> dict:
+        """B4: Fetch the live CLOB order book for the YES outcome and extract the
+        order-placement constraints the API hands us authoritatively.
 
-        Uses the official py-clob-client-v2 SDK with no authentication required
-        (order book is a public endpoint). Returns 0.0 on any error or missing token ID.
+        Returns a dict with ask-side depth (USD) plus the book's own tick_size,
+        min_order_size and neg_risk — preferring these over the Gamma-derived
+        values, which can be stale or missing (see OrderBookSummary spec). Uses
+        the official py-clob-client-v2 SDK with no authentication required
+        (order book is a public endpoint). Returns {} on error or missing token ID.
         """
         if not yes_token_id:
-            return 0.0
+            return {}
         try:
             if self._clob_client is None:
                 from py_clob_client_v2 import ClobClient
                 self._clob_client = ClobClient(host="https://clob.polymarket.com", chain_id=137)
             ob = self._clob_client.get_order_book(yes_token_id)
             asks = ob.get("asks", [])
-            return sum(float(a["price"]) * float(a["size"]) for a in asks) if asks else 0.0
+            depth_usd = sum(float(a["price"]) * float(a["size"]) for a in asks) if asks else 0.0
+            summary: dict = {"depth_usd": depth_usd}
+            # Keep the book's tick only if it's one the order builder accepts,
+            # else let the Gamma-derived value stand.
+            tick = _normalize_tick(ob.get("tick_size"))
+            if tick is not None:
+                summary["tick_size"] = tick
+            if ob.get("min_order_size") is not None:
+                summary["min_order_size"] = float(ob["min_order_size"])
+            if "neg_risk" in ob:
+                summary["neg_risk"] = bool(ob["neg_risk"])
+            return summary
         except Exception:
-            return 0.0
+            return {}
 
     def _extract_location(self, title: str) -> Location | None:
         """Try to find a city name in the title and geocode it."""

@@ -47,6 +47,9 @@ _CSV_HEADERS = [
     "eur_rate", "pnl_eur",
 ]
 
+# Public Data API — on-chain positions per wallet address (no auth required).
+_DATA_API_POSITIONS = "https://data-api.polymarket.com/positions"
+
 
 def _fetch_ecb_rate(dt: "date") -> "float | None":
     """ECB reference rate: USD → EUR for given date. Tries up to 4 days back for weekends/holidays."""
@@ -281,12 +284,24 @@ class LiveTrader:
         if size_usd < 1.0:
             return None
 
-        from py_clob_client_v2.clob_types import OrderArgsV2, PartialCreateOrderOptions
+        from py_clob_client_v2.clob_types import OrderArgsV2, OrderType, PartialCreateOrderOptions
         from py_clob_client_v2.order_builder.constants import BUY
 
         client = self._get_client()
         ep = signal.entry_price
         n_contracts = round(size_usd / ep, 2)
+
+        # Enforce the CLOB minimum order size (in contracts). An undersized order
+        # is rejected by the book ("breaks minimum" 400), so bump up to the floor
+        # when the resulting stake stays within the per-trade cap; otherwise skip.
+        min_size = signal.market.min_order_size
+        if min_size > 0 and n_contracts < min_size:
+            bumped_usd = min_size * ep
+            if bumped_usd <= _get_max_trade_usd():
+                n_contracts = round(min_size, 2)
+                size_usd = bumped_usd
+            else:
+                return None
 
         # Resolve the CLOB token ID for the direction we're trading
         token_id = (
@@ -315,9 +330,16 @@ class LiveTrader:
         # duplicate order on the next run. Roll back if submit itself fails.
         self._write_idempotency_key(signal, "pending")
         try:
+            # FAK (Fill-And-Kill): fill whatever depth is available at/inside our
+            # limit price immediately, kill the remainder. Avoids GTC orders
+            # resting unfilled and getting picked off later at a stale weather
+            # edge. Partial fills are fine — reconciled from size_matched below.
             result = client.create_and_post_order(
                 OrderArgsV2(token_id=token_id, price=ep, size=n_contracts, side=BUY),
-                options=PartialCreateOrderOptions(tick_size=tick_size, neg_risk=False),
+                options=PartialCreateOrderOptions(
+                    tick_size=tick_size, neg_risk=signal.market.neg_risk
+                ),
+                order_type=OrderType.FAK,
             )
         except Exception:
             self._remove_idempotency_key(signal)
@@ -329,9 +351,20 @@ class LiveTrader:
         if self._fill_poll_delay > 0:
             time.sleep(self._fill_poll_delay)
         order_obj = client.get_order(order_id)
-        filled = float(order_obj.get("size_matched", order_obj.get("filled", 0)) or 0)
+        # size_matched is 6-decimal fixed-math per the CLOB OpenOrder schema
+        # ("100000000" == 100 contracts); py-clob-client-v2 returns the raw API
+        # JSON unmodified, so normalise here. price is a plain decimal — leave it.
+        raw_matched = order_obj.get("size_matched", order_obj.get("filled", 0)) or 0
+        filled = float(raw_matched) / 1e6
         filled_price = float(order_obj.get("price", ep) or ep)
         order_status = str(order_obj.get("status", "unknown"))
+
+        # A fill can never exceed what we ordered. If this trips, the fixed-math
+        # scaling assumption above is wrong (API changed) — fail loud rather than
+        # log a 1e6x-inflated size into the P&L.
+        assert filled <= n_contracts * 1.01, (
+            f"fill {filled} exceeds order size {n_contracts} — check size_matched scaling"
+        )
 
         if filled <= 0:
             return {"order_id": order_id, "status": "unfilled", "filled": 0.0}
@@ -437,6 +470,83 @@ class LiveTrader:
         """Return available USDC balance (dollars) via the official CLOB SDK."""
         return _read_collateral_balance(self._get_client())
 
+    def fetch_positions(self) -> list[dict] | None:
+        """Current on-chain positions for the bot's wallet via the public Data API.
+
+        Read-only, no auth (positions are public per address). Returns the raw
+        Position list from data-api.polymarket.com/positions, [] when no wallet
+        is configured, or None when the API call fails — so callers can tell a
+        genuinely empty wallet apart from an unavailable snapshot.
+        """
+        if not self._funder_address:
+            return []
+        import urllib.parse
+        import urllib.request
+
+        query = urllib.parse.urlencode({"user": self._funder_address})
+        try:
+            with urllib.request.urlopen(f"{_DATA_API_POSITIONS}?{query}", timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+            return data if isinstance(data, list) else []
+        except Exception:
+            return None
+
+    def redeemable_positions(self) -> list[dict]:
+        """On-chain positions whose market has resolved and whose winnings are
+        claimable (redeemable=True). Use to drive post-resolution settlement."""
+        return [p for p in (self.fetch_positions() or []) if p.get("redeemable")]
+
+    def reconcile_positions(self) -> list[dict]:
+        """Compare local open live trades against actual on-chain positions.
+
+        Surfaces divergences only (never mutates the trade log):
+          - "missing_on_chain": an open local trade with no matching on-chain
+            position (order never filled, or already resolved/redeemed)
+          - "untracked_on_chain": an on-chain position with no matching open
+            local trade (placed out-of-band, or a resolved trade not yet logged)
+        Matched positions are not reported. Returns [] when there is nothing to
+        reconcile. If the positions snapshot is unavailable (API error) returns
+        [] rather than false-flagging every local trade as missing.
+        """
+        positions = self.fetch_positions()
+        if positions is None:
+            return []
+
+        on_chain: dict[tuple[str, str], dict] = {}
+        for p in positions:
+            cond = (p.get("conditionId") or "").lower()
+            if cond:
+                on_chain[(cond, (p.get("outcome") or "").upper())] = p
+
+        divergences: list[dict] = []
+        local_keys: set[tuple[str, str]] = set()
+        for t in self._load_open_live_trades():
+            key = ((t.get("market_id") or "").lower(), (t.get("direction") or "").upper())
+            local_keys.add(key)
+            if key not in on_chain:
+                divergences.append({
+                    "type": "missing_on_chain",
+                    "market_id": t.get("market_id", ""),
+                    "direction": key[1],
+                    "order_id": t.get("order_id", ""),
+                })
+        for key, p in on_chain.items():
+            if key not in local_keys:
+                divergences.append({
+                    "type": "untracked_on_chain",
+                    "market_id": p.get("conditionId", ""),
+                    "direction": key[1],
+                    "size": p.get("size", 0),
+                })
+        return divergences
+
+    def _load_open_live_trades(self) -> list[dict]:
+        """Rows in the live trade log with no resolution outcome yet."""
+        if not self._log_path.exists():
+            return []
+        with open(self._log_path) as f:
+            return [r for r in csv.DictReader(f) if r.get("actual_outcome") in (None, "")]
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -457,15 +567,12 @@ class LiveTrader:
             except (json.JSONDecodeError, OSError):
                 pass
 
-        if self._log_path.exists():
-            with open(self._log_path) as f:
-                for row in csv.DictReader(f):
-                    if (
-                        row.get("market_id") == signal.market.market_id
-                        and row.get("direction") == signal.direction
-                        and row.get("actual_outcome") in (None, "")
-                    ):
-                        return True
+        for row in self._load_open_live_trades():
+            if (
+                row.get("market_id") == signal.market.market_id
+                and row.get("direction") == signal.direction
+            ):
+                return True
 
         return False
 

@@ -26,7 +26,8 @@ if "py_clob_client_v2" not in sys.modules:
             self.size = size; self.side = side
 
     class _PartialCreateOrderOptions:
-        def __init__(self, tick_size="0.01", neg_risk=False): pass
+        def __init__(self, tick_size="0.01", neg_risk=False):
+            self.tick_size = tick_size; self.neg_risk = neg_risk
 
     class _BalanceAllowanceParams:
         def __init__(self, asset_type=None): pass
@@ -37,12 +38,16 @@ if "py_clob_client_v2" not in sys.modules:
     class _ApiCreds:
         def __init__(self, api_key="", api_secret="", api_passphrase=""): pass
 
+    class _OrderType:
+        GTC = "GTC"; FOK = "FOK"; GTD = "GTD"; FAK = "FAK"
+
     _ct = _t.ModuleType("py_clob_client_v2.clob_types")
     _ct.OrderArgsV2 = _OrderArgsV2
     _ct.PartialCreateOrderOptions = _PartialCreateOrderOptions
     _ct.BalanceAllowanceParams = _BalanceAllowanceParams
     _ct.AssetType = _AssetType
     _ct.ApiCreds = _ApiCreds
+    _ct.OrderType = _OrderType
 
     _ob_const = _t.ModuleType("py_clob_client_v2.order_builder.constants")
     _ob_const.BUY = "BUY"
@@ -71,6 +76,8 @@ def _make_signal(
     direction: str = "YES",
     market_p: float = 0.35,
     model_p: float = 0.60,
+    min_order_size: float = 0.0,
+    neg_risk: bool = False,
 ) -> Signal:
     market = WeatherMarket(
         market_id=market_id,
@@ -87,6 +94,8 @@ def _make_signal(
         yes_token_id="yes_token_id",
         no_token_id="no_token_id",
         tick_size="0.01",
+        min_order_size=min_order_size,
+        neg_risk=neg_risk,
     )
     return Signal(
         market=market,
@@ -119,10 +128,16 @@ def _make_trader(tmp_path: Path, bankroll: float = 500.0) -> LiveTrader:
 
 
 def _make_mock_client(filled: float, price: float = 0.35, status: str = "filled") -> MagicMock:
-    """Minimal ClobClient mock for execute_signal tests."""
+    """Minimal ClobClient mock for execute_signal tests.
+
+    `filled` is the contract count; the real API reports size_matched in
+    6-decimal fixed-math, so the mock emits it that way (filled * 1e6).
+    """
     mock = MagicMock()
     mock.create_and_post_order.return_value = {"orderID": "ord_mock"}
-    mock.get_order.return_value = {"size_matched": filled, "price": price, "status": status}
+    mock.get_order.return_value = {
+        "size_matched": filled * 1e6, "price": price, "status": status
+    }
     return mock
 
 
@@ -231,6 +246,34 @@ class TestFillReconciliation:
         trader.execute_signal(_make_signal())
         trader.paper_trader.log_trade.assert_called_once()
 
+    def test_size_matched_fixed_math_is_normalized(self, tmp_path):
+        """Raw 6-decimal fixed-math size_matched must be divided down to contracts."""
+        trader = _make_trader(tmp_path, bankroll=500.0)
+        mock = MagicMock()
+        mock.create_and_post_order.return_value = {"orderID": "ord_mock"}
+        # Raw API shape: "5500000" == 5.5 contracts (not 5.5 million).
+        mock.get_order.return_value = {"size_matched": "5500000", "price": "0.36", "status": "partial"}
+        trader._client = mock
+
+        result = trader.execute_signal(_make_signal(market_p=0.35))
+
+        assert result["filled"] == pytest.approx(5.5)
+        rows = list(csv.DictReader(open(trader._log_path)))
+        assert float(rows[0]["filled_size"]) == pytest.approx(5.5)
+
+    def test_impossible_fill_trips_guard(self, tmp_path):
+        """A fill exceeding the order size signals a scaling/API regression — fail loud."""
+        trader = _make_trader(tmp_path)
+        trader.kelly_size_usd = lambda signal: 3.5  # ~10 contracts at ep 0.35
+        mock = MagicMock()
+        mock.create_and_post_order.return_value = {"orderID": "ord_mock"}
+        # 1e9 fixed-math == 1000 contracts, far above the ~10 ordered.
+        mock.get_order.return_value = {"size_matched": "1000000000", "price": "0.35", "status": "filled"}
+        trader._client = mock
+
+        with pytest.raises(AssertionError, match="size_matched scaling"):
+            trader.execute_signal(_make_signal(market_p=0.35))
+
 
 # ---------------------------------------------------------------------------
 # Session 4 tests — sizing, idempotency
@@ -268,6 +311,70 @@ class TestContractConversion:
         entry_price = float(rows[0]["entry_price"])
         expected_contracts = round(size_usd / entry_price, 2)
         assert order_args.size == pytest.approx(expected_contracts, abs=0.01)
+
+
+class TestMinOrderSize:
+    def test_bumps_up_to_min_order_size_within_cap(self, tmp_path):
+        """A sub-minimum order is bumped to the floor when the stake stays in cap."""
+        trader = _make_trader(tmp_path)
+        trader._client = _make_mock_client(filled=15.0)
+        # ep = market_p = 0.35; size_usd 3.5 → 10 contracts, below a min of 15.
+        trader.kelly_size_usd = lambda signal: 3.5
+        signal = _make_signal(market_p=0.35, min_order_size=15.0)  # 15 * 0.35 = 5.25 ≤ 25 cap
+
+        trader.execute_signal(signal)
+
+        order_args = trader._client.create_and_post_order.call_args.args[0]
+        assert order_args.size == pytest.approx(15.0, abs=0.01)
+
+    def test_skips_when_min_order_size_exceeds_cap(self, tmp_path):
+        """If bumping to the floor would breach the per-trade cap, skip entirely."""
+        trader = _make_trader(tmp_path)
+        trader._client = _make_mock_client(filled=0.0)
+        trader.kelly_size_usd = lambda signal: 3.5
+        signal = _make_signal(market_p=0.35, min_order_size=100.0)  # 100 * 0.35 = 35 > 25 cap
+
+        result = trader.execute_signal(signal)
+
+        assert result is None
+        trader._client.create_and_post_order.assert_not_called()
+
+    def test_no_bump_when_already_above_min(self, tmp_path):
+        """An order already at/above the floor is posted unchanged."""
+        trader = _make_trader(tmp_path)
+        trader._client = _make_mock_client(filled=10.0)
+        trader.kelly_size_usd = lambda signal: 3.5  # 10 contracts at ep 0.35
+        signal = _make_signal(market_p=0.35, min_order_size=5.0)
+
+        trader.execute_signal(signal)
+
+        order_args = trader._client.create_and_post_order.call_args.args[0]
+        assert order_args.size == pytest.approx(10.0, abs=0.01)
+
+
+class TestNegRisk:
+    def test_neg_risk_passed_through_to_order_options(self, tmp_path):
+        """neg_risk must come from the market (the book), not be hardcoded False."""
+        trader = _make_trader(tmp_path)
+        trader._client = _make_mock_client(filled=10.0)
+        signal = _make_signal(market_p=0.35, model_p=0.65, neg_risk=True)
+
+        trader.execute_signal(signal)
+
+        options = trader._client.create_and_post_order.call_args.kwargs["options"]
+        assert options.neg_risk is True
+
+
+class TestOrderType:
+    def test_live_order_submitted_as_fak(self, tmp_path):
+        """Orders must be Fill-And-Kill, not resting GTC, to avoid stale fills."""
+        trader = _make_trader(tmp_path)
+        trader._client = _make_mock_client(filled=10.0)
+
+        trader.execute_signal(_make_signal(market_p=0.35, model_p=0.65))
+
+        order_type = trader._client.create_and_post_order.call_args.kwargs["order_type"]
+        assert order_type == "FAK"
 
 
 class TestIdempotency:
@@ -412,3 +519,122 @@ class TestGeoblock:
         lt.check_geoblock()
         lt.check_geoblock()
         assert calls["n"] == 1  # second call served from cache
+
+
+# ---------------------------------------------------------------------------
+# On-chain position reconciliation (Data API /positions)
+# ---------------------------------------------------------------------------
+
+class TestPositionsReconciliation:
+    def test_fetch_positions_empty_without_wallet(self, tmp_path):
+        trader = _make_trader(tmp_path)  # no funder_address
+        assert trader.fetch_positions() == []
+
+    def test_fetch_positions_parses_data_api(self, tmp_path, monkeypatch):
+        trader = _make_trader(tmp_path)
+        trader._funder_address = "0xproxy"
+        payload = [{"conditionId": "0xabc", "outcome": "Yes", "size": 10.0, "redeemable": False}]
+
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return json.dumps(payload).encode()
+
+        captured = {}
+        def fake_urlopen(url, timeout=10):
+            captured["url"] = url
+            return _Resp()
+        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+        positions = trader.fetch_positions()
+        assert positions == payload
+        assert "user=0xproxy" in captured["url"]
+
+    def test_fetch_positions_returns_none_on_error(self, tmp_path, monkeypatch):
+        """API failure returns None (distinct from a genuinely empty wallet)."""
+        trader = _make_trader(tmp_path)
+        trader._funder_address = "0xproxy"
+        def boom(*a, **k):
+            raise OSError("network down")
+        monkeypatch.setattr("urllib.request.urlopen", boom)
+        assert trader.fetch_positions() is None
+
+    def test_reconcile_skips_when_snapshot_unavailable(self, tmp_path):
+        """A failed positions fetch must not false-flag open local trades."""
+        trader = _make_trader(tmp_path)
+        trader.fetch_positions = lambda: None
+        _write_live_trades(trader._log_path, [
+            {"market_id": "0xABC", "direction": "YES", "order_id": "ord1", "actual_outcome": ""},
+        ])
+        assert trader.reconcile_positions() == []
+
+    def test_redeemable_positions_filters(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        trader.fetch_positions = lambda: [
+            {"conditionId": "0xa", "redeemable": True},
+            {"conditionId": "0xb", "redeemable": False},
+            {"conditionId": "0xc", "redeemable": True},
+        ]
+        redeemable = trader.redeemable_positions()
+        assert [p["conditionId"] for p in redeemable] == ["0xa", "0xc"]
+
+    def test_reconcile_flags_missing_on_chain(self, tmp_path):
+        """An open local trade with no matching on-chain position is flagged."""
+        trader = _make_trader(tmp_path)
+        trader.fetch_positions = lambda: []
+        _write_live_trades(trader._log_path, [
+            {"market_id": "0xABC", "direction": "YES", "order_id": "ord1", "actual_outcome": ""},
+        ])
+        div = trader.reconcile_positions()
+        assert len(div) == 1
+        assert div[0]["type"] == "missing_on_chain"
+        assert div[0]["order_id"] == "ord1"
+
+    def test_reconcile_flags_untracked_on_chain(self, tmp_path):
+        """An on-chain position with no matching open local trade is flagged."""
+        trader = _make_trader(tmp_path)
+        trader.fetch_positions = lambda: [
+            {"conditionId": "0xabc", "outcome": "Yes", "size": 5.0}
+        ]
+        _write_live_trades(trader._log_path, [])
+        div = trader.reconcile_positions()
+        assert len(div) == 1
+        assert div[0]["type"] == "untracked_on_chain"
+        assert div[0]["market_id"] == "0xabc"
+
+    def test_reconcile_matches_case_insensitively(self, tmp_path):
+        """A local trade matching an on-chain position (any case) yields no flag."""
+        trader = _make_trader(tmp_path)
+        trader.fetch_positions = lambda: [
+            {"conditionId": "0xabc", "outcome": "Yes", "size": 10.0}
+        ]
+        _write_live_trades(trader._log_path, [
+            {"market_id": "0xABC", "direction": "YES", "order_id": "ord1", "actual_outcome": ""},
+        ])
+        assert trader.reconcile_positions() == []
+
+    def test_reconcile_ignores_resolved_local_trades(self, tmp_path):
+        """Resolved local trades (actual_outcome set) are not reconciled."""
+        trader = _make_trader(tmp_path)
+        trader.fetch_positions = lambda: []
+        _write_live_trades(trader._log_path, [
+            {"market_id": "0xABC", "direction": "YES", "order_id": "ord1", "actual_outcome": "1"},
+        ])
+        assert trader.reconcile_positions() == []
+
+    def test_print_divergences_renders_both_types(self, capsys):
+        from weather.position_monitor import print_divergences
+        print_divergences([
+            {"type": "missing_on_chain", "market_id": "0xabcdef0123456789",
+             "direction": "YES", "order_id": "ord12345"},
+            {"type": "untracked_on_chain", "market_id": "0xfeed0000000000",
+             "direction": "NO", "size": 7.5},
+        ])
+        out = capsys.readouterr().out
+        assert "2 reconciliation divergence(s)" in out
+        assert "local-only" in out and "on-chain-only" in out
+
+    def test_print_divergences_clean_when_empty(self, capsys):
+        from weather.position_monitor import print_divergences
+        print_divergences([])
+        assert "matches on-chain" in capsys.readouterr().out
