@@ -134,22 +134,28 @@ def isvalid_onchain(wallet: str, digest: bytes, signature: str) -> str | None:
 
 
 def post_create_api_key(wallet: str, signature: str, timestamp: str, nonce: int):
+    """POST via the SDK's httpx HTTP/2 helper — raw urllib trips Cloudflare (403
+    code 1010, a browser-fingerprint block) before reaching the CLOB app."""
+    from py_clob_client_v2.http_helpers.helpers import post as _post, get as _get
+    from py_clob_client_v2.exceptions import PolyApiException
     headers = {
         "POLY_ADDRESS": wallet,
         "POLY_SIGNATURE": signature,
         "POLY_TIMESTAMP": str(timestamp),
         "POLY_NONCE": str(nonce),
     }
-    for method, path in (("POST", CREATE_API_KEY), ("GET", DERIVE_API_KEY)):
+    for label, fn, url in (
+        ("POST /auth/api-key", _post, f"{CLOB_HOST}{CREATE_API_KEY}"),
+        ("GET  /auth/derive-api-key", _get, f"{CLOB_HOST}{DERIVE_API_KEY}"),
+    ):
         try:
-            req = urllib.request.Request(f"{CLOB_HOST}{path}", headers=headers, method=method)
-            with urllib.request.urlopen(req, timeout=15) as r:
-                print(f"   {method} {path} -> {r.status}: {r.read().decode()[:400]}")
-                return True
-        except urllib.error.HTTPError as e:
-            print(f"   {method} {path} -> {e.code}: {e.read().decode()[:400]}")
+            resp = fn(url, headers=dict(headers))
+            print(f"   {label} -> 200 OK: {resp}")
+            return True
+        except PolyApiException as e:
+            print(f"   {label} -> {e.status_code}: {e.error_msg}")
         except Exception as e:  # noqa: BLE001
-            print(f"   {method} {path} -> error: {e}")
+            print(f"   {label} -> error: {type(e).__name__}: {e}")
     return False
 
 
