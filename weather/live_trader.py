@@ -281,7 +281,7 @@ class LiveTrader:
         if size_usd < 1.0:
             return None
 
-        from py_clob_client_v2.clob_types import OrderArgsV2, PartialCreateOrderOptions
+        from py_clob_client_v2.clob_types import OrderArgsV2, OrderType, PartialCreateOrderOptions
         from py_clob_client_v2.order_builder.constants import BUY
 
         client = self._get_client()
@@ -327,11 +327,16 @@ class LiveTrader:
         # duplicate order on the next run. Roll back if submit itself fails.
         self._write_idempotency_key(signal, "pending")
         try:
+            # FAK (Fill-And-Kill): fill whatever depth is available at/inside our
+            # limit price immediately, kill the remainder. Avoids GTC orders
+            # resting unfilled and getting picked off later at a stale weather
+            # edge. Partial fills are fine — reconciled from size_matched below.
             result = client.create_and_post_order(
                 OrderArgsV2(token_id=token_id, price=ep, size=n_contracts, side=BUY),
                 options=PartialCreateOrderOptions(
                     tick_size=tick_size, neg_risk=signal.market.neg_risk
                 ),
+                order_type=OrderType.FAK,
             )
         except Exception:
             self._remove_idempotency_key(signal)

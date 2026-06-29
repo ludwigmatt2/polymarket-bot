@@ -38,12 +38,16 @@ if "py_clob_client_v2" not in sys.modules:
     class _ApiCreds:
         def __init__(self, api_key="", api_secret="", api_passphrase=""): pass
 
+    class _OrderType:
+        GTC = "GTC"; FOK = "FOK"; GTD = "GTD"; FAK = "FAK"
+
     _ct = _t.ModuleType("py_clob_client_v2.clob_types")
     _ct.OrderArgsV2 = _OrderArgsV2
     _ct.PartialCreateOrderOptions = _PartialCreateOrderOptions
     _ct.BalanceAllowanceParams = _BalanceAllowanceParams
     _ct.AssetType = _AssetType
     _ct.ApiCreds = _ApiCreds
+    _ct.OrderType = _OrderType
 
     _ob_const = _t.ModuleType("py_clob_client_v2.order_builder.constants")
     _ob_const.BUY = "BUY"
@@ -359,6 +363,18 @@ class TestNegRisk:
 
         options = trader._client.create_and_post_order.call_args.kwargs["options"]
         assert options.neg_risk is True
+
+
+class TestOrderType:
+    def test_live_order_submitted_as_fak(self, tmp_path):
+        """Orders must be Fill-And-Kill, not resting GTC, to avoid stale fills."""
+        trader = _make_trader(tmp_path)
+        trader._client = _make_mock_client(filled=10.0)
+
+        trader.execute_signal(_make_signal(market_p=0.35, model_p=0.65))
+
+        order_type = trader._client.create_and_post_order.call_args.kwargs["order_type"]
+        assert order_type == "FAK"
 
 
 class TestIdempotency:
