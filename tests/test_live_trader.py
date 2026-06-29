@@ -26,7 +26,8 @@ if "py_clob_client_v2" not in sys.modules:
             self.size = size; self.side = side
 
     class _PartialCreateOrderOptions:
-        def __init__(self, tick_size="0.01", neg_risk=False): pass
+        def __init__(self, tick_size="0.01", neg_risk=False):
+            self.tick_size = tick_size; self.neg_risk = neg_risk
 
     class _BalanceAllowanceParams:
         def __init__(self, asset_type=None): pass
@@ -71,6 +72,8 @@ def _make_signal(
     direction: str = "YES",
     market_p: float = 0.35,
     model_p: float = 0.60,
+    min_order_size: float = 0.0,
+    neg_risk: bool = False,
 ) -> Signal:
     market = WeatherMarket(
         market_id=market_id,
@@ -87,6 +90,8 @@ def _make_signal(
         yes_token_id="yes_token_id",
         no_token_id="no_token_id",
         tick_size="0.01",
+        min_order_size=min_order_size,
+        neg_risk=neg_risk,
     )
     return Signal(
         market=market,
@@ -268,6 +273,58 @@ class TestContractConversion:
         entry_price = float(rows[0]["entry_price"])
         expected_contracts = round(size_usd / entry_price, 2)
         assert order_args.size == pytest.approx(expected_contracts, abs=0.01)
+
+
+class TestMinOrderSize:
+    def test_bumps_up_to_min_order_size_within_cap(self, tmp_path):
+        """A sub-minimum order is bumped to the floor when the stake stays in cap."""
+        trader = _make_trader(tmp_path)
+        trader._client = _make_mock_client(filled=15.0)
+        # ep = market_p = 0.35; size_usd 3.5 → 10 contracts, below a min of 15.
+        trader.kelly_size_usd = lambda signal: 3.5
+        signal = _make_signal(market_p=0.35, min_order_size=15.0)  # 15 * 0.35 = 5.25 ≤ 25 cap
+
+        trader.execute_signal(signal)
+
+        order_args = trader._client.create_and_post_order.call_args.args[0]
+        assert order_args.size == pytest.approx(15.0, abs=0.01)
+
+    def test_skips_when_min_order_size_exceeds_cap(self, tmp_path):
+        """If bumping to the floor would breach the per-trade cap, skip entirely."""
+        trader = _make_trader(tmp_path)
+        trader._client = _make_mock_client(filled=0.0)
+        trader.kelly_size_usd = lambda signal: 3.5
+        signal = _make_signal(market_p=0.35, min_order_size=100.0)  # 100 * 0.35 = 35 > 25 cap
+
+        result = trader.execute_signal(signal)
+
+        assert result is None
+        trader._client.create_and_post_order.assert_not_called()
+
+    def test_no_bump_when_already_above_min(self, tmp_path):
+        """An order already at/above the floor is posted unchanged."""
+        trader = _make_trader(tmp_path)
+        trader._client = _make_mock_client(filled=10.0)
+        trader.kelly_size_usd = lambda signal: 3.5  # 10 contracts at ep 0.35
+        signal = _make_signal(market_p=0.35, min_order_size=5.0)
+
+        trader.execute_signal(signal)
+
+        order_args = trader._client.create_and_post_order.call_args.args[0]
+        assert order_args.size == pytest.approx(10.0, abs=0.01)
+
+
+class TestNegRisk:
+    def test_neg_risk_passed_through_to_order_options(self, tmp_path):
+        """neg_risk must come from the market (the book), not be hardcoded False."""
+        trader = _make_trader(tmp_path)
+        trader._client = _make_mock_client(filled=10.0)
+        signal = _make_signal(market_p=0.35, model_p=0.65, neg_risk=True)
+
+        trader.execute_signal(signal)
+
+        options = trader._client.create_and_post_order.call_args.kwargs["options"]
+        assert options.neg_risk is True
 
 
 class TestIdempotency:

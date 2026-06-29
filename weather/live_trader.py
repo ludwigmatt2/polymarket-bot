@@ -288,6 +288,18 @@ class LiveTrader:
         ep = signal.entry_price
         n_contracts = round(size_usd / ep, 2)
 
+        # Enforce the CLOB minimum order size (in contracts). An undersized order
+        # is rejected by the book ("breaks minimum" 400), so bump up to the floor
+        # when the resulting stake stays within the per-trade cap; otherwise skip.
+        min_size = signal.market.min_order_size
+        if min_size > 0 and n_contracts < min_size:
+            bumped_usd = min_size * ep
+            if bumped_usd <= _get_max_trade_usd():
+                n_contracts = round(min_size, 2)
+                size_usd = bumped_usd
+            else:
+                return None
+
         # Resolve the CLOB token ID for the direction we're trading
         token_id = (
             signal.market.yes_token_id
@@ -317,7 +329,9 @@ class LiveTrader:
         try:
             result = client.create_and_post_order(
                 OrderArgsV2(token_id=token_id, price=ep, size=n_contracts, side=BUY),
-                options=PartialCreateOrderOptions(tick_size=tick_size, neg_risk=False),
+                options=PartialCreateOrderOptions(
+                    tick_size=tick_size, neg_risk=signal.market.neg_risk
+                ),
             )
         except Exception:
             self._remove_idempotency_key(signal)

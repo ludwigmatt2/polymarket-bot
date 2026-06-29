@@ -222,9 +222,18 @@ class WeatherMarketScanner:
                 }], _ALARM_FIELDS)
 
         tradeable = self._filter_tradeable(parsed)
-        # Fetch live CLOB order-book depth only for markets that survived all other filters.
+        # Fetch the live CLOB order book only for markets that survived all other
+        # filters. Beyond depth, the book carries the authoritative tick_size,
+        # min_order_size and neg_risk — prefer them over the Gamma-derived values.
         for wm in tradeable:
-            wm.book_depth_usd = self._fetch_book_depth_usd(wm.yes_token_id)
+            summary = self._fetch_book_summary(wm.yes_token_id)
+            wm.book_depth_usd = summary.get("depth_usd", 0.0)
+            if "tick_size" in summary:
+                wm.tick_size = summary["tick_size"]
+            if "min_order_size" in summary:
+                wm.min_order_size = summary["min_order_size"]
+            if "neg_risk" in summary:
+                wm.neg_risk = summary["neg_risk"]
         print(f"    tradeable after filters: {len(tradeable)} / {len(parsed)}")
         self.last_funnel = {
             "fetched": len(raw_markets),
@@ -466,23 +475,39 @@ class WeatherMarketScanner:
 
         return True
 
-    def _fetch_book_depth_usd(self, yes_token_id: str) -> float:
-        """B4: Fetch live CLOB order-book depth (ask side in USD) for the YES outcome.
+    def _fetch_book_summary(self, yes_token_id: str) -> dict:
+        """B4: Fetch the live CLOB order book for the YES outcome and extract the
+        order-placement constraints the API hands us authoritatively.
 
-        Uses the official py-clob-client-v2 SDK with no authentication required
-        (order book is a public endpoint). Returns 0.0 on any error or missing token ID.
+        Returns a dict with ask-side depth (USD) plus the book's own tick_size,
+        min_order_size and neg_risk — preferring these over the Gamma-derived
+        values, which can be stale or missing (see OrderBookSummary spec). Uses
+        the official py-clob-client-v2 SDK with no authentication required
+        (order book is a public endpoint). Returns {} on error or missing token ID.
         """
         if not yes_token_id:
-            return 0.0
+            return {}
         try:
             if self._clob_client is None:
                 from py_clob_client_v2 import ClobClient
                 self._clob_client = ClobClient(host="https://clob.polymarket.com", chain_id=137)
             ob = self._clob_client.get_order_book(yes_token_id)
             asks = ob.get("asks", [])
-            return sum(float(a["price"]) * float(a["size"]) for a in asks) if asks else 0.0
+            depth_usd = sum(float(a["price"]) * float(a["size"]) for a in asks) if asks else 0.0
+            summary: dict = {"depth_usd": depth_usd}
+            # Book reports tick_size as a string literal ("0.01"); keep it only if
+            # it's a value PartialCreateOrderOptions accepts, else let Gamma stand.
+            tick_raw = ob.get("tick_size")
+            if tick_raw is not None and str(tick_raw) in _TICK_MAP.values():
+                summary["tick_size"] = str(tick_raw)
+            min_raw = ob.get("min_order_size")
+            if min_raw is not None:
+                summary["min_order_size"] = float(min_raw)
+            if "neg_risk" in ob:
+                summary["neg_risk"] = bool(ob.get("neg_risk"))
+            return summary
         except Exception:
-            return 0.0
+            return {}
 
     def _extract_location(self, title: str) -> Location | None:
         """Try to find a city name in the title and geocode it."""

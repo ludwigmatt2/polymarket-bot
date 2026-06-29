@@ -43,6 +43,10 @@ class WeatherMarket:
     no_token_id: str = ""
     # Minimum tick size as string literal required by PartialCreateOrderOptions
     tick_size: str = "0.01"
+    # Minimum order size in contracts (from CLOB order book); 0.0 = unknown
+    min_order_size: float = 0.0
+    # Whether this is a negative-risk market (from CLOB order book); assume False
+    neg_risk: bool = False
 
 
 @dataclass
