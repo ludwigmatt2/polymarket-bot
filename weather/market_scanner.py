@@ -127,6 +127,20 @@ class _YesSide:
 _TICK_MAP = {0.1: "0.1", 0.01: "0.01", 0.001: "0.001", 0.0001: "0.0001"}
 
 
+def _normalize_tick(raw) -> str | None:
+    """Canonical tick string PartialCreateOrderOptions accepts, or None if the
+    value isn't a recognized tick. Accepts a float (Gamma orderPriceMinTickSize)
+    or a string (CLOB book tick_size)."""
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        return raw if raw in _TICK_MAP.values() else None
+    try:
+        return _TICK_MAP.get(float(raw))
+    except (TypeError, ValueError):
+        return None
+
+
 class _GammaMarket:
     """Wraps a Gamma API market dict into a structured object for parsing."""
 
@@ -154,8 +168,7 @@ class _GammaMarket:
         self.yes_token_id: str = token_ids[0] if token_ids else ""
         self.no_token_id: str = token_ids[1] if len(token_ids) > 1 else ""
         # Minimum tick size required by PartialCreateOrderOptions (must be a string literal)
-        tick_raw = float(market.get("orderPriceMinTickSize", 0.01) or 0.01)
-        self.tick_size: str = _TICK_MAP.get(tick_raw, "0.01")
+        self.tick_size: str = _normalize_tick(market.get("orderPriceMinTickSize")) or "0.01"
 
 
 _GAMMA_SEARCH_URL = "https://gamma-api.polymarket.com/public-search"
@@ -228,12 +241,9 @@ class WeatherMarketScanner:
         for wm in tradeable:
             summary = self._fetch_book_summary(wm.yes_token_id)
             wm.book_depth_usd = summary.get("depth_usd", 0.0)
-            if "tick_size" in summary:
-                wm.tick_size = summary["tick_size"]
-            if "min_order_size" in summary:
-                wm.min_order_size = summary["min_order_size"]
-            if "neg_risk" in summary:
-                wm.neg_risk = summary["neg_risk"]
+            for attr in ("tick_size", "min_order_size", "neg_risk"):
+                if attr in summary:
+                    setattr(wm, attr, summary[attr])
         print(f"    tradeable after filters: {len(tradeable)} / {len(parsed)}")
         self.last_funnel = {
             "fetched": len(raw_markets),
@@ -495,16 +505,15 @@ class WeatherMarketScanner:
             asks = ob.get("asks", [])
             depth_usd = sum(float(a["price"]) * float(a["size"]) for a in asks) if asks else 0.0
             summary: dict = {"depth_usd": depth_usd}
-            # Book reports tick_size as a string literal ("0.01"); keep it only if
-            # it's a value PartialCreateOrderOptions accepts, else let Gamma stand.
-            tick_raw = ob.get("tick_size")
-            if tick_raw is not None and str(tick_raw) in _TICK_MAP.values():
-                summary["tick_size"] = str(tick_raw)
-            min_raw = ob.get("min_order_size")
-            if min_raw is not None:
-                summary["min_order_size"] = float(min_raw)
+            # Keep the book's tick only if it's one the order builder accepts,
+            # else let the Gamma-derived value stand.
+            tick = _normalize_tick(ob.get("tick_size"))
+            if tick is not None:
+                summary["tick_size"] = tick
+            if ob.get("min_order_size") is not None:
+                summary["min_order_size"] = float(ob["min_order_size"])
             if "neg_risk" in ob:
-                summary["neg_risk"] = bool(ob.get("neg_risk"))
+                summary["neg_risk"] = bool(ob["neg_risk"])
             return summary
         except Exception:
             return {}

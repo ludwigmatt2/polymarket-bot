@@ -112,13 +112,12 @@ def run_scan(
             print_flags(flags)
 
     if live_trader is not None:
-        print("  [+] Reconciling open positions on-chain...", end=" ", flush=True)
+        print("  [+] Reconciling open positions on-chain...")
         try:
             divergences = live_trader.reconcile_positions()
         except Exception as e:
-            print(f"skipped ({e})", file=sys.stderr)
+            print(f"  reconcile skipped ({e})", file=sys.stderr)
         else:
-            print(f"{len(divergences)} divergence(s)")
             print_divergences(divergences)
 
     return signals

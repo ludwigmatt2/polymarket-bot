@@ -519,12 +519,11 @@ class LiveTrader:
                 on_chain[(cond, (p.get("outcome") or "").upper())] = p
 
         divergences: list[dict] = []
-        matched: set[tuple[str, str]] = set()
+        local_keys: set[tuple[str, str]] = set()
         for t in self._load_open_live_trades():
             key = ((t.get("market_id") or "").lower(), (t.get("direction") or "").upper())
-            if key in on_chain:
-                matched.add(key)
-            else:
+            local_keys.add(key)
+            if key not in on_chain:
                 divergences.append({
                     "type": "missing_on_chain",
                     "market_id": t.get("market_id", ""),
@@ -532,7 +531,7 @@ class LiveTrader:
                     "order_id": t.get("order_id", ""),
                 })
         for key, p in on_chain.items():
-            if key not in matched:
+            if key not in local_keys:
                 divergences.append({
                     "type": "untracked_on_chain",
                     "market_id": p.get("conditionId", ""),
@@ -568,15 +567,12 @@ class LiveTrader:
             except (json.JSONDecodeError, OSError):
                 pass
 
-        if self._log_path.exists():
-            with open(self._log_path) as f:
-                for row in csv.DictReader(f):
-                    if (
-                        row.get("market_id") == signal.market.market_id
-                        and row.get("direction") == signal.direction
-                        and row.get("actual_outcome") in (None, "")
-                    ):
-                        return True
+        for row in self._load_open_live_trades():
+            if (
+                row.get("market_id") == signal.market.market_id
+                and row.get("direction") == signal.direction
+            ):
+                return True
 
         return False
 
