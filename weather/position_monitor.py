@@ -150,6 +150,22 @@ class PositionMonitor:
             writer.writerows(flags)
 
 
+def print_divergences(divergences: list[dict]) -> None:
+    """Render on-chain reconciliation divergences from LiveTrader.reconcile_positions."""
+    if not divergences:
+        print("  ✅ Local trade log matches on-chain positions.")
+        return
+    print(f"  ⚠️  {len(divergences)} reconciliation divergence(s):")
+    for d in divergences:
+        mkt = str(d.get("market_id", ""))[:14]
+        if d.get("type") == "missing_on_chain":
+            print(f"    local-only  {d.get('direction','?')} {mkt}… "
+                  f"(order {str(d.get('order_id') or '?')[:10]}) — no on-chain position")
+        else:
+            print(f"    on-chain-only {d.get('direction','?')} {mkt}… "
+                  f"(size {d.get('size', 0)}) — no open local trade")
+
+
 def print_flags(flags: list[dict]) -> None:
     if not flags:
         print("  ✅ All open positions healthy — no flags.")

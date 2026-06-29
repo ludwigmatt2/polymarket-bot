@@ -550,13 +550,23 @@ class TestPositionsReconciliation:
         assert positions == payload
         assert "user=0xproxy" in captured["url"]
 
-    def test_fetch_positions_returns_empty_on_error(self, tmp_path, monkeypatch):
+    def test_fetch_positions_returns_none_on_error(self, tmp_path, monkeypatch):
+        """API failure returns None (distinct from a genuinely empty wallet)."""
         trader = _make_trader(tmp_path)
         trader._funder_address = "0xproxy"
         def boom(*a, **k):
             raise OSError("network down")
         monkeypatch.setattr("urllib.request.urlopen", boom)
-        assert trader.fetch_positions() == []
+        assert trader.fetch_positions() is None
+
+    def test_reconcile_skips_when_snapshot_unavailable(self, tmp_path):
+        """A failed positions fetch must not false-flag open local trades."""
+        trader = _make_trader(tmp_path)
+        trader.fetch_positions = lambda: None
+        _write_live_trades(trader._log_path, [
+            {"market_id": "0xABC", "direction": "YES", "order_id": "ord1", "actual_outcome": ""},
+        ])
+        assert trader.reconcile_positions() == []
 
     def test_redeemable_positions_filters(self, tmp_path):
         trader = _make_trader(tmp_path)
@@ -611,3 +621,20 @@ class TestPositionsReconciliation:
             {"market_id": "0xABC", "direction": "YES", "order_id": "ord1", "actual_outcome": "1"},
         ])
         assert trader.reconcile_positions() == []
+
+    def test_print_divergences_renders_both_types(self, capsys):
+        from weather.position_monitor import print_divergences
+        print_divergences([
+            {"type": "missing_on_chain", "market_id": "0xabcdef0123456789",
+             "direction": "YES", "order_id": "ord12345"},
+            {"type": "untracked_on_chain", "market_id": "0xfeed0000000000",
+             "direction": "NO", "size": 7.5},
+        ])
+        out = capsys.readouterr().out
+        assert "2 reconciliation divergence(s)" in out
+        assert "local-only" in out and "on-chain-only" in out
+
+    def test_print_divergences_clean_when_empty(self, capsys):
+        from weather.position_monitor import print_divergences
+        print_divergences([])
+        assert "matches on-chain" in capsys.readouterr().out

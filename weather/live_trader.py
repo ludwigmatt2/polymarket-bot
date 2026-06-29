@@ -470,12 +470,13 @@ class LiveTrader:
         """Return available USDC balance (dollars) via the official CLOB SDK."""
         return _read_collateral_balance(self._get_client())
 
-    def fetch_positions(self) -> list[dict]:
+    def fetch_positions(self) -> list[dict] | None:
         """Current on-chain positions for the bot's wallet via the public Data API.
 
         Read-only, no auth (positions are public per address). Returns the raw
-        Position list from data-api.polymarket.com/positions, or [] when no
-        wallet address is configured or the call fails.
+        Position list from data-api.polymarket.com/positions, [] when no wallet
+        is configured, or None when the API call fails — so callers can tell a
+        genuinely empty wallet apart from an unavailable snapshot.
         """
         if not self._funder_address:
             return []
@@ -488,12 +489,12 @@ class LiveTrader:
                 data = json.loads(resp.read().decode())
             return data if isinstance(data, list) else []
         except Exception:
-            return []
+            return None
 
     def redeemable_positions(self) -> list[dict]:
         """On-chain positions whose market has resolved and whose winnings are
         claimable (redeemable=True). Use to drive post-resolution settlement."""
-        return [p for p in self.fetch_positions() if p.get("redeemable")]
+        return [p for p in (self.fetch_positions() or []) if p.get("redeemable")]
 
     def reconcile_positions(self) -> list[dict]:
         """Compare local open live trades against actual on-chain positions.
@@ -504,10 +505,15 @@ class LiveTrader:
           - "untracked_on_chain": an on-chain position with no matching open
             local trade (placed out-of-band, or a resolved trade not yet logged)
         Matched positions are not reported. Returns [] when there is nothing to
-        reconcile or the wallet/API is unavailable.
+        reconcile. If the positions snapshot is unavailable (API error) returns
+        [] rather than false-flagging every local trade as missing.
         """
+        positions = self.fetch_positions()
+        if positions is None:
+            return []
+
         on_chain: dict[tuple[str, str], dict] = {}
-        for p in self.fetch_positions():
+        for p in positions:
             cond = (p.get("conditionId") or "").lower()
             if cond:
                 on_chain[(cond, (p.get("outcome") or "").upper())] = p
