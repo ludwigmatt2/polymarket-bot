@@ -19,7 +19,7 @@ import time
 import urllib.request
 
 from eth_abi import encode
-from eth_utils import keccak, to_checksum_address
+from eth_utils import to_checksum_address
 
 from . import polymarket_v2 as pm
 

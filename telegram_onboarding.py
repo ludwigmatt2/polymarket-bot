@@ -291,24 +291,32 @@ async def on_wallet_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> in
         finally:
             del pk
         # Wire the V2 deposit wallet (derive from the EOA, store funder + sig=3 +
-        # L2 creds). Funds must go to the DEPOSIT WALLET, not the raw EOA.
-        deposit_wallet = address
+        # L2 creds). Funds must go to the DEPOSIT WALLET, not the raw EOA. Only
+        # commit sig=3 + the deposit address if provisioning actually succeeded —
+        # otherwise creds stay EOA and we must not advertise a deposit wallet.
+        deposit_wallet = None
         try:
             res = await asyncio.to_thread(enable_deposit_wallet, uid)
-            deposit_wallet = res.get("funder_address") or address
+            deposit_wallet = res.get("funder_address")
         except Exception:
-            pass  # fall back to showing the EOA; go-live retries provisioning
+            deposit_wallet = None
+        provisioned = bool(deposit_wallet)
         _set_user_fields(
             uid,
             wallet_address=address,
             deposit_wallet=deposit_wallet,
             wallet_type="generated-eoa",
-            signature_type=3,
+            signature_type=3 if provisioned else "eoa",
             onboarded_at=datetime.utcnow().isoformat(),
+        )
+        fund_addr = deposit_wallet if provisioned else address
+        warn = "" if provisioned else (
+            "\n\n⚠️ Couldn't finish deposit-wallet setup (network). Setup retries "
+            "automatically when you go live — check back before funding."
         )
         await q.edit_message_text(
             "*🆕 Wallet created* (key stored encrypted on the bot machine)\n\n"
-            + _FUNDING_TEXT.format(address=deposit_wallet),
+            + _FUNDING_TEXT.format(address=fund_addr) + warn,
             reply_markup=_funding_kb(show_reveal=True),
             parse_mode="Markdown",
         )

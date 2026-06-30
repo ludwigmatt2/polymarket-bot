@@ -82,8 +82,10 @@ def run_scan(
         for s in actionable:
             try:
                 result = live_trader.execute_signal(s)
-                if result:
+                if result and result.get("filled", 0) > 0:
                     print(f"    ✓ {s.market.title[:55]} | {s.direction} ${result['size_usd']:.2f} @ {result['price']:.3f}  order={result['order_id'][:10]}")
+                elif result:
+                    print(f"    – {s.market.title[:55]} | unfilled (no depth within slippage cap)")
                 else:
                     print(f"    – {s.market.title[:55]} | skipped (size too small)")
             except RuntimeError as e:
@@ -239,7 +241,7 @@ def _execute_live_for_user(
     for s in actionable:
         try:
             result = trader.execute_signal(s)
-            if result:
+            if result and result.get("filled", 0) > 0:
                 print(f"      ✓ {s.market.title[:50]} | {s.direction} "
                       f"${result['size_usd']:.2f} order={result['order_id'][:10]}")
         except RuntimeError as e:

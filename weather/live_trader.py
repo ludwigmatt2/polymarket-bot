@@ -360,6 +360,13 @@ class LiveTrader:
         # limit orders (size×price hits the API's max-2-decimals reject when the
         # order is marketable). Floor to 2 decimals so we never exceed balance.
         amount_usd = math.floor(size_usd * 100) / 100.0
+        # ...but flooring can drop a min-size-bumped order back below the book
+        # minimum (e.g. min 5 @ 0.333 → 1.665 → floor 1.66 → 4.98 shares < 5).
+        # Round the cents UP in that case so the bump still clears the floor.
+        if min_size > 0 and ep > 0 and amount_usd / ep < min_size:
+            bumped = math.ceil(min_size * ep * 100) / 100.0
+            if bumped <= _get_max_trade_usd():
+                amount_usd = bumped
         if amount_usd < 1.0:  # CLOB marketable-BUY minimum is $1 notional
             return None
 
@@ -401,9 +408,17 @@ class LiveTrader:
         assert usd_spent <= amount_usd * 1.02, (
             f"spent {usd_spent} exceeds order amount {amount_usd} — check fill parsing"
         )
+        # A share price must be in (0,1); a value outside that means a units
+        # mismatch in the fill parse (would corrupt resolve PnL / the kill switch).
+        assert filled <= 0 or 0.0 < filled_price < 1.0, (
+            f"filled_price {filled_price} out of (0,1) — check fill parsing"
+        )
 
         if filled <= 0:
-            return {"order_id": order_id, "status": "unfilled", "filled": 0.0}
+            # Shape-complete so display callers (which read size_usd/price) never
+            # KeyError on a no-fill — now a common outcome with FAK + slippage cap.
+            return {"order_id": order_id, "status": "unfilled", "filled": 0.0,
+                    "size_usd": 0.0, "filled_price": 0.0, "price": 0.0}
 
         self._log_trade(signal, order_id, usd_spent, ep, filled, filled_price, order_status)
         self.paper_trader.log_trade(signal)

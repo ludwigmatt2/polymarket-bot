@@ -934,7 +934,9 @@ async def cmd_withdraw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     token = os.urandom(6).hex()
     ctx.user_data["withdraw_pending"] = {
         "token": token, "amount": amount,
-        "amount_raw": int(round(amount * 1_000_000)), "to": to,
+        # Floor, never round up — a raw amount above the on-chain balance reverts
+        # the whole gasless unwrap batch (matters most for the "all" path).
+        "amount_raw": int(amount * 1_000_000), "to": to,
     }
     await update.message.reply_text(
         f"⚠️ *Confirm withdrawal*\n\n"
