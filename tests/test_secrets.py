@@ -135,3 +135,56 @@ class TestEnableDepositWallet:
             reload(sec)
             with pytest.raises(RuntimeError, match="No private key"):
                 sec.enable_deposit_wallet(999)
+
+
+class TestPrepareForLive:
+    _PK = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+
+    def _setup(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "config").mkdir()
+        from cryptography.fernet import Fernet
+        monkeypatch.setenv("POLYMARKET_SECRETS_KEY", Fernet.generate_key().decode())
+
+    def test_noop_without_wallet(self, tmp_path, monkeypatch):
+        self._setup(tmp_path, monkeypatch)
+        with patch.dict("sys.modules", {"keyring": None}):
+            from importlib import reload
+            import weather.secrets as sec
+            reload(sec)
+            sec.set_user_key(1, self._PK)  # pk but no funder
+            res = sec.prepare_for_live(1)
+            assert res["ready"] is False and "no deposit wallet" in res["error"]
+
+    def test_deploys_wraps_approves(self, tmp_path, monkeypatch):
+        self._setup(tmp_path, monkeypatch)
+        with patch.dict("sys.modules", {"keyring": None}):
+            from importlib import reload
+            import weather.secrets as sec
+            reload(sec)
+            sec.set_user_creds(2, pk=self._PK, funder_address="0xWALLET", signature_type=3)
+
+            calls = {"deploy": 0, "wrap": 0, "approve": 0}
+
+            class FakeRC:
+                def __init__(self, pk=None): pass
+                def deploy_deposit_wallet(self, w): calls["deploy"] += 1
+                def wrap_usdce_to_pusd(self, w, amt): calls["wrap"] += 1
+                def approve_exchanges(self, w): calls["approve"] += 1
+
+            import weather.relayer as rl
+            monkeypatch.setattr(rl, "RelayerClient", FakeRC)
+            monkeypatch.setattr(rl, "is_deployed", lambda w: False)   # → deploy
+            monkeypatch.setattr(rl, "usdce_balance", lambda w: 5.0)   # → wrap
+            monkeypatch.setattr(rl, "pusd_balance", lambda w: 5.0)    # final balance
+
+            res = sec.prepare_for_live(2)
+            assert res["ready"] is True and res["pusd"] == 5.0
+            assert calls == {"deploy": 1, "wrap": 1, "approve": 1}
+            # second call: already deployed + approved + no USDC.e → no relayer ops
+            monkeypatch.setattr(rl, "is_deployed", lambda w: True)
+            monkeypatch.setattr(rl, "usdce_balance", lambda w: 0.0)
+            calls.update(deploy=0, wrap=0, approve=0)
+            res2 = sec.prepare_for_live(2)
+            assert res2["ready"] is True
+            assert calls == {"deploy": 0, "wrap": 0, "approve": 0}  # idempotent

@@ -1277,12 +1277,29 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 reply_markup=main_kb(uid),
             )
             return
+        # Provision the deposit wallet for live: deploy (if needed) + wrap any
+        # USDC.e → pUSD + approve exchanges (all gasless). Skips cleanly for
+        # users without a deposit wallet (legacy/paper). Never blocks the flip on
+        # a transient relayer hiccup — surfaces a warning instead.
+        from weather.secrets import get_user_creds, prepare_for_live
+        _c = get_user_creds(uid) or {}
+        prep_note = ""
+        if _c.get("signature_type") == 3 and _c.get("funder_address"):
+            await q.edit_message_text("⏳ Preparing your deposit wallet for live…")
+            import asyncio
+            prep = await asyncio.to_thread(prepare_for_live, uid)
+            if prep.get("error"):
+                prep_note = f"\n⚠️ Wallet prep incomplete: {prep['error'][:120]}"
+            elif prep.get("pusd", 0) <= 0:
+                prep_note = "\n⚠️ Deposit wallet has $0 pUSD — fund it (USDC.e) before orders can fill."
+            else:
+                prep_note = f"\n💰 Deposit wallet ready: ${prep['pusd']:,.2f} pUSD."
         with _users_transaction() as users:
             users[uid]["mode"] = "live"
             users[uid]["live_confirmed_at"] = datetime.utcnow().isoformat()
         await q.edit_message_text(
             "🟢 *Mode set to LIVE.* Orders execute on the next scheduled scan.\n"
-            "Switch back any time with `/mymode paper`.",
+            "Switch back any time with `/mymode paper`." + prep_note,
             reply_markup=main_kb(uid), parse_mode="Markdown",
         )
     elif data.startswith("withdrawconfirm"):

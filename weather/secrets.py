@@ -276,6 +276,37 @@ def enable_deposit_wallet(uid: int) -> dict:
     }
 
 
+def prepare_for_live(uid: int) -> dict:
+    """Make a user's deposit wallet trade-ready at go-live (all gasless via the
+    relayer): deploy it if needed, wrap any USDC.e → pUSD, and approve the V2
+    exchanges once. Idempotent — safe to call on every go-live. Returns
+    {"ready": bool, "pusd": float, "deployed": bool, "error"?: str}.
+
+    Requires the user already wired via enable_deposit_wallet (funder + sig=3).
+    """
+    creds = get_user_creds(uid)
+    if not creds or not creds.get("pk") or not creds.get("funder_address"):
+        return {"ready": False, "pusd": 0.0, "deployed": False,
+                "error": "no deposit wallet configured"}
+    wallet = creds["funder_address"]
+    from . import relayer
+    rc = relayer.RelayerClient(pk=creds["pk"])
+    try:
+        if not relayer.is_deployed(wallet):
+            rc.deploy_deposit_wallet(wallet)
+        usdce = relayer.usdce_balance(wallet)
+        if usdce > 0:
+            rc.wrap_usdce_to_pusd(wallet, int(usdce * 1_000_000))
+        if not creds.get("exchanges_approved"):
+            rc.approve_exchanges(wallet)
+            set_user_creds(uid, exchanges_approved=True)
+    except Exception as e:  # noqa: BLE001
+        return {"ready": False, "pusd": relayer.pusd_balance(wallet),
+                "deployed": relayer.is_deployed(wallet), "error": str(e)}
+    pusd = relayer.pusd_balance(wallet)
+    return {"ready": pusd > 0, "pusd": pusd, "deployed": True}
+
+
 # ── Backward-compat wrappers ──────────────────────────────────────────────────
 
 def set_user_key(uid: int, pk: str) -> None:

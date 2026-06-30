@@ -38,6 +38,7 @@ from weather.config import MIN_PROFIT_FACTOR, MIN_RESOLVED_TRADES
 from weather.paths import DATA_DIR
 from weather.secrets import (
     derive_and_store_clob_creds,
+    enable_deposit_wallet,
     get_user_creds,
     get_user_key,
     set_user_creds,
@@ -289,17 +290,25 @@ async def on_wallet_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> in
             return ConversationHandler.END
         finally:
             del pk
+        # Wire the V2 deposit wallet (derive from the EOA, store funder + sig=3 +
+        # L2 creds). Funds must go to the DEPOSIT WALLET, not the raw EOA.
+        deposit_wallet = address
+        try:
+            res = await asyncio.to_thread(enable_deposit_wallet, uid)
+            deposit_wallet = res.get("funder_address") or address
+        except Exception:
+            pass  # fall back to showing the EOA; go-live retries provisioning
         _set_user_fields(
             uid,
             wallet_address=address,
+            deposit_wallet=deposit_wallet,
             wallet_type="generated-eoa",
-            signature_type="eoa",
-            proxy_address=None,
+            signature_type=3,
             onboarded_at=datetime.utcnow().isoformat(),
         )
         await q.edit_message_text(
             "*🆕 Wallet created* (key stored encrypted on the bot machine)\n\n"
-            + _FUNDING_TEXT.format(address=address),
+            + _FUNDING_TEXT.format(address=deposit_wallet),
             reply_markup=_funding_kb(show_reveal=True),
             parse_mode="Markdown",
         )
@@ -406,10 +415,46 @@ async def on_proxy_paste(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def _balance_reply(chat, uid: int) -> None:
     tb = _tb()
+    creds = get_user_creds(uid) or {}
+    wallet = creds.get("funder_address")
+    # Deposit-wallet users (sig=3): show on-chain USDC.e (just-deposited, pre-wrap)
+    # + pUSD (wrapped, tradeable). USDC.e is auto-wrapped to pUSD at go-live.
+    if wallet and creds.get("signature_type") == 3:
+        try:
+            from weather import relayer
+            usdce, pusd = await asyncio.wait_for(
+                asyncio.to_thread(lambda: (relayer.usdce_balance(wallet),
+                                           relayer.pusd_balance(wallet))),
+                timeout=30,
+            )
+        except Exception as exc:
+            await chat.send_message(
+                f"⚠️ Balance check failed ({type(exc).__name__}). "
+                "Funds may still be in transit — try again shortly.",
+                parse_mode="Markdown",
+            )
+            return
+        total = usdce + pusd
+        if total > 0:
+            ws = tb.wallet_stats(uid)
+            if ws["deposited"] == 0:
+                tb.append_wallet_transaction(uid, "deposit", total, "onboarding funding detected")
+            await chat.send_message(
+                f"💰 Deposit wallet:\n"
+                f"• USDC.e (just deposited): *${usdce:,.2f}*\n"
+                f"• pUSD (tradeable): *${pusd:,.2f}*\n\n"
+                + ("✅ Funds detected. USDC.e is wrapped to pUSD automatically when you go live."
+                   if usdce > 0 else "✅ Ready to trade."),
+                parse_mode="Markdown",
+            )
+        else:
+            await chat.send_message("💰 Balance: $0.00 — no funds detected yet.")
+        return
+
+    # Legacy / paper users — CLOB collateral readout.
     try:
         balance = await asyncio.wait_for(
-            asyncio.to_thread(fetch_user_balance_sync, uid),
-            timeout=30,
+            asyncio.to_thread(fetch_user_balance_sync, uid), timeout=30,
         )
     except Exception as exc:
         await chat.send_message(
@@ -419,7 +464,6 @@ async def _balance_reply(chat, uid: int) -> None:
         )
         return
     if balance > 0:
-        # First sighting of real funds → seed the per-user ledger.
         ws = tb.wallet_stats(uid)
         if ws["deposited"] == 0:
             tb.append_wallet_transaction(uid, "deposit", balance, "onboarding funding detected")

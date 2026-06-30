@@ -51,6 +51,12 @@ def pusd_balance(wallet: str) -> float:
     return int(r, 16) / 10 ** pm.PUSD_DECIMALS if r and r != "0x" else 0.0
 
 
+def usdce_balance(wallet: str) -> float:
+    r = _rpc("eth_call", [{"to": pm.USDCE,
+             "data": "0x70a08231" + wallet.lower().replace("0x", "").zfill(64)}, "latest"])
+    return int(r, 16) / 1e6 if r and r != "0x" else 0.0
+
+
 def is_deployed(wallet: str) -> bool:
     code = _rpc("eth_getCode", [wallet, "latest"]) or "0x"
     return code not in ("0x", "0x0")
@@ -137,6 +143,22 @@ class RelayerClient:
             calls=calls, wallet_address=to_checksum_address(wallet),
             nonce=str(onchain_nonce(wallet)),
             deadline=str(int(time.time()) + 240))
+        try:
+            return resp.wait()
+        except Exception:
+            return resp
+
+    def deploy_deposit_wallet(self, wallet: str):
+        """Deploy the deposit wallet via the relayer (operator). Idempotent —
+        skips if already deployed. Gasless. Returns the relayer result or
+        {'already_deployed': True}."""
+        rc = self._relay()
+        try:
+            if rc.get_deployed(wallet):
+                return {"already_deployed": True}
+        except Exception:
+            pass
+        resp = rc.deploy_deposit_wallet()
         try:
             return resp.wait()
         except Exception:
