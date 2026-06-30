@@ -20,6 +20,7 @@ from .config import (
     DAILY_LOSS_LIMIT_PCT,
     KELLY_FRACTION,
     MAX_LIVE_TRADE_USD,
+    MAX_SLIPPAGE,
 )
 from .models import Location, Signal
 from .paper_trader import PaperTrader, _brier, _evaluate_outcome
@@ -284,7 +285,11 @@ class LiveTrader:
         if size_usd < 1.0:
             return None
 
-        from py_clob_client_v2.clob_types import OrderArgsV2, OrderType, PartialCreateOrderOptions
+        import math
+
+        from py_clob_client_v2.clob_types import (
+            MarketOrderArgsV2, OrderType, PartialCreateOrderOptions,
+        )
         from py_clob_client_v2.order_builder.constants import BUY
 
         client = self._get_client()
@@ -324,18 +329,34 @@ class LiveTrader:
             )
 
         tick_size = signal.market.tick_size or "0.01"
+        tick = float(tick_size)
+
+        # Slippage cap: a marketable BUY must not fill above this price. The
+        # market-order FAK fills only depth at/under the cap and kills the rest,
+        # so a thin book can't drag the fill far from the weather edge.
+        price_cap = min(round(ep * (1.0 + MAX_SLIPPAGE) / tick) * tick, 1.0 - tick)
+        price_cap = round(max(price_cap, tick), 6)
+
+        # USD to spend — market BUYs take a USD amount (2-decimal clean), unlike
+        # limit orders (size×price hits the API's max-2-decimals reject when the
+        # order is marketable). Floor to 2 decimals so we never exceed balance.
+        amount_usd = math.floor(size_usd * 100) / 100.0
+        if amount_usd < 1.0:  # CLOB marketable-BUY minimum is $1 notional
+            return None
 
         # Reserve the idempotency key BEFORE submitting: if the process dies
         # between submit and the post-write, the reservation still blocks a
         # duplicate order on the next run. Roll back if submit itself fails.
         self._write_idempotency_key(signal, "pending")
         try:
-            # FAK (Fill-And-Kill): fill whatever depth is available at/inside our
-            # limit price immediately, kill the remainder. Avoids GTC orders
-            # resting unfilled and getting picked off later at a stale weather
-            # edge. Partial fills are fine — reconciled from size_matched below.
-            result = client.create_and_post_order(
-                OrderArgsV2(token_id=token_id, price=ep, size=n_contracts, side=BUY),
+            # FAK market BUY: fill available depth at/under price_cap immediately,
+            # kill the remainder. Partial fills are fine — reconciled from the
+            # response below.
+            result = client.create_and_post_market_order(
+                MarketOrderArgsV2(
+                    token_id=token_id, amount=amount_usd, side=BUY,
+                    price=price_cap, order_type=OrderType.FAK,
+                ),
                 options=PartialCreateOrderOptions(
                     tick_size=tick_size, neg_risk=signal.market.neg_risk
                 ),
@@ -348,33 +369,29 @@ class LiveTrader:
 
         self._write_idempotency_key(signal, order_id)
 
-        if self._fill_poll_delay > 0:
-            time.sleep(self._fill_poll_delay)
-        order_obj = client.get_order(order_id)
-        # size_matched is 6-decimal fixed-math per the CLOB OpenOrder schema
-        # ("100000000" == 100 contracts); py-clob-client-v2 returns the raw API
-        # JSON unmodified, so normalise here. price is a plain decimal — leave it.
-        raw_matched = order_obj.get("size_matched", order_obj.get("filled", 0)) or 0
-        filled = float(raw_matched) / 1e6
-        filled_price = float(order_obj.get("price", ep) or ep)
-        order_status = str(order_obj.get("status", "unknown"))
+        # Read the fill straight from the order response. For a BUY the maker
+        # amount is USD spent, the taker amount is shares received (both plain
+        # decimals — no fixed-point scaling).
+        filled = float(result.get("takingAmount") or 0)        # shares
+        usd_spent = float(result.get("makingAmount") or 0)     # USD
+        filled_price = (usd_spent / filled) if filled > 0 else ep
+        order_status = str(result.get("status", "unknown"))
 
-        # A fill can never exceed what we ordered. If this trips, the fixed-math
-        # scaling assumption above is wrong (API changed) — fail loud rather than
-        # log a 1e6x-inflated size into the P&L.
-        assert filled <= n_contracts * 1.01, (
-            f"fill {filled} exceeds order size {n_contracts} — check size_matched scaling"
+        # Sanity: we can never spend more than we asked (guards against an API
+        # change silently inflating amounts into the P&L).
+        assert usd_spent <= amount_usd * 1.02, (
+            f"spent {usd_spent} exceeds order amount {amount_usd} — check fill parsing"
         )
 
         if filled <= 0:
             return {"order_id": order_id, "status": "unfilled", "filled": 0.0}
 
-        self._log_trade(signal, order_id, size_usd, ep, filled, filled_price, order_status)
+        self._log_trade(signal, order_id, usd_spent, ep, filled, filled_price, order_status)
         self.paper_trader.log_trade(signal)
 
         return {
             "order_id": order_id,
-            "size_usd": size_usd,
+            "size_usd": round(usd_spent, 2),
             "n_contracts": n_contracts,
             "filled": filled,
             "filled_price": filled_price,

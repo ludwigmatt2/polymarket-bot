@@ -82,6 +82,7 @@ PAPER_TRADE_SIZE_USD = 25.0
 KELLY_FRACTION = 0.25           # Quarter Kelly — conservative for uncertain edge
 MAX_LIVE_TRADE_USD = float(os.environ.get("MAX_LIVE_TRADE_USD", "25.0"))  # overrideable via env or /setmaxbet
 DAILY_LOSS_LIMIT_PCT = 0.05     # Kill switch at -5% of total capital
+MAX_SLIPPAGE = float(os.environ.get("MAX_SLIPPAGE", "0.03"))  # market-buy price cap above entry (thin books)
 
 # ── Go-live gates (all must pass before real money) ────────────────────────────
 MIN_RESOLVED_TRADES = 20

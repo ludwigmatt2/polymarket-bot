@@ -25,6 +25,11 @@ if "py_clob_client_v2" not in sys.modules:
             self.token_id = token_id; self.price = price
             self.size = size; self.side = side
 
+    class _MarketOrderArgsV2:
+        def __init__(self, token_id="", amount=0.0, side=None, price=0.0, order_type=None):
+            self.token_id = token_id; self.amount = amount; self.side = side
+            self.price = price; self.order_type = order_type
+
     class _PartialCreateOrderOptions:
         def __init__(self, tick_size="0.01", neg_risk=False):
             self.tick_size = tick_size; self.neg_risk = neg_risk
@@ -43,6 +48,7 @@ if "py_clob_client_v2" not in sys.modules:
 
     _ct = _t.ModuleType("py_clob_client_v2.clob_types")
     _ct.OrderArgsV2 = _OrderArgsV2
+    _ct.MarketOrderArgsV2 = _MarketOrderArgsV2
     _ct.PartialCreateOrderOptions = _PartialCreateOrderOptions
     _ct.BalanceAllowanceParams = _BalanceAllowanceParams
     _ct.AssetType = _AssetType
@@ -130,13 +136,16 @@ def _make_trader(tmp_path: Path, bankroll: float = 500.0) -> LiveTrader:
 def _make_mock_client(filled: float, price: float = 0.35, status: str = "filled") -> MagicMock:
     """Minimal ClobClient mock for execute_signal tests.
 
-    `filled` is the contract count; the real API reports size_matched in
-    6-decimal fixed-math, so the mock emits it that way (filled * 1e6).
+    The live path now uses create_and_post_market_order and reads the fill from
+    the response: for a BUY, takingAmount = shares received, makingAmount = USD
+    spent (both plain decimals). `filled` is the shares; usd = filled * price.
     """
     mock = MagicMock()
-    mock.create_and_post_order.return_value = {"orderID": "ord_mock"}
-    mock.get_order.return_value = {
-        "size_matched": filled * 1e6, "price": price, "status": status
+    mock.create_and_post_market_order.return_value = {
+        "orderID": "ord_mock",
+        "takingAmount": str(filled),
+        "makingAmount": str(round(filled * price, 2)),
+        "status": status,
     }
     return mock
 
@@ -246,13 +255,15 @@ class TestFillReconciliation:
         trader.execute_signal(_make_signal())
         trader.paper_trader.log_trade.assert_called_once()
 
-    def test_size_matched_fixed_math_is_normalized(self, tmp_path):
-        """Raw 6-decimal fixed-math size_matched must be divided down to contracts."""
+    def test_fill_read_from_response_no_scaling(self, tmp_path):
+        """Shares come straight from takingAmount; price from makingAmount/shares."""
         trader = _make_trader(tmp_path, bankroll=500.0)
         mock = MagicMock()
-        mock.create_and_post_order.return_value = {"orderID": "ord_mock"}
-        # Raw API shape: "5500000" == 5.5 contracts (not 5.5 million).
-        mock.get_order.return_value = {"size_matched": "5500000", "price": "0.36", "status": "partial"}
+        # 5.5 shares for $1.98 -> filled_price 0.36, no fixed-point scaling.
+        mock.create_and_post_market_order.return_value = {
+            "orderID": "ord_mock", "takingAmount": "5.5", "makingAmount": "1.98",
+            "status": "partial",
+        }
         trader._client = mock
 
         result = trader.execute_signal(_make_signal(market_p=0.35))
@@ -260,18 +271,21 @@ class TestFillReconciliation:
         assert result["filled"] == pytest.approx(5.5)
         rows = list(csv.DictReader(open(trader._log_path)))
         assert float(rows[0]["filled_size"]) == pytest.approx(5.5)
+        assert float(rows[0]["filled_price"]) == pytest.approx(0.36, abs=0.001)
 
-    def test_impossible_fill_trips_guard(self, tmp_path):
-        """A fill exceeding the order size signals a scaling/API regression — fail loud."""
+    def test_overspend_trips_guard(self, tmp_path):
+        """makingAmount above the requested USD amount signals an API regression."""
         trader = _make_trader(tmp_path)
-        trader.kelly_size_usd = lambda signal: 3.5  # ~10 contracts at ep 0.35
+        trader.kelly_size_usd = lambda signal: 3.5  # amount_usd ~ $3.50
         mock = MagicMock()
-        mock.create_and_post_order.return_value = {"orderID": "ord_mock"}
-        # 1e9 fixed-math == 1000 contracts, far above the ~10 ordered.
-        mock.get_order.return_value = {"size_matched": "1000000000", "price": "0.35", "status": "filled"}
+        # Reports spending $100 — far above the ~$3.50 requested.
+        mock.create_and_post_market_order.return_value = {
+            "orderID": "ord_mock", "takingAmount": "285.0", "makingAmount": "100.0",
+            "status": "filled",
+        }
         trader._client = mock
 
-        with pytest.raises(AssertionError, match="size_matched scaling"):
+        with pytest.raises(AssertionError, match="fill parsing"):
             trader.execute_signal(_make_signal(market_p=0.35))
 
 
@@ -294,28 +308,37 @@ class TestKellySizeUsd:
         assert trader.kelly_size_usd(signal) == 0.0
 
 
-class TestContractConversion:
-    def test_execute_signal_posts_contracts_not_usd(self, tmp_path):
-        """create_and_post_order must receive n_contracts = size_usd / entry_price, not raw USD."""
+class TestMarketOrderAmount:
+    def test_execute_signal_posts_usd_amount(self, tmp_path):
+        """Market BUY must receive a USD amount (2-dec), not a contract count."""
         trader = _make_trader(tmp_path, bankroll=500.0)
         trader._client = _make_mock_client(filled=15.0)
+        trader.kelly_size_usd = lambda signal: 10.0  # request $10
 
-        signal = _make_signal(market_p=0.35, model_p=0.65)
-        trader.execute_signal(signal)
+        trader.execute_signal(_make_signal(market_p=0.35, model_p=0.65))
 
-        assert trader._client.create_and_post_order.called
-        # First positional arg is the OrderArgsV2 instance
-        order_args = trader._client.create_and_post_order.call_args.args[0]
-        rows = list(csv.DictReader(open(trader._log_path)))
-        size_usd = float(rows[0]["size_usd"])
-        entry_price = float(rows[0]["entry_price"])
-        expected_contracts = round(size_usd / entry_price, 2)
-        assert order_args.size == pytest.approx(expected_contracts, abs=0.01)
+        assert trader._client.create_and_post_market_order.called
+        order_args = trader._client.create_and_post_market_order.call_args.args[0]
+        assert order_args.amount == pytest.approx(10.0, abs=0.01)  # USD, not contracts
+        assert order_args.side == "BUY"
+
+    def test_slippage_cap_applied(self, tmp_path):
+        """The market BUY carries a price cap above the entry (slippage guard)."""
+        from weather.config import MAX_SLIPPAGE
+        trader = _make_trader(tmp_path, bankroll=500.0)
+        trader._client = _make_mock_client(filled=15.0)
+        trader.kelly_size_usd = lambda signal: 10.0
+
+        trader.execute_signal(_make_signal(market_p=0.35, model_p=0.65))
+
+        order_args = trader._client.create_and_post_market_order.call_args.args[0]
+        # ep 0.35, tick 0.01 -> cap ~0.36 (0.35 * 1.03 rounded to tick)
+        assert 0.35 < order_args.price <= round(0.35 * (1 + MAX_SLIPPAGE) + 0.01, 4)
 
 
 class TestMinOrderSize:
     def test_bumps_up_to_min_order_size_within_cap(self, tmp_path):
-        """A sub-minimum order is bumped to the floor when the stake stays in cap."""
+        """A sub-minimum order is bumped to the floor (in USD) when within cap."""
         trader = _make_trader(tmp_path)
         trader._client = _make_mock_client(filled=15.0)
         # ep = market_p = 0.35; size_usd 3.5 → 10 contracts, below a min of 15.
@@ -324,8 +347,9 @@ class TestMinOrderSize:
 
         trader.execute_signal(signal)
 
-        order_args = trader._client.create_and_post_order.call_args.args[0]
-        assert order_args.size == pytest.approx(15.0, abs=0.01)
+        order_args = trader._client.create_and_post_market_order.call_args.args[0]
+        # bumped USD = min_size * ep = 15 * 0.35 = 5.25
+        assert order_args.amount == pytest.approx(5.25, abs=0.01)
 
     def test_skips_when_min_order_size_exceeds_cap(self, tmp_path):
         """If bumping to the floor would breach the per-trade cap, skip entirely."""
@@ -337,10 +361,10 @@ class TestMinOrderSize:
         result = trader.execute_signal(signal)
 
         assert result is None
-        trader._client.create_and_post_order.assert_not_called()
+        trader._client.create_and_post_market_order.assert_not_called()
 
     def test_no_bump_when_already_above_min(self, tmp_path):
-        """An order already at/above the floor is posted unchanged."""
+        """An order already at/above the floor keeps its USD amount."""
         trader = _make_trader(tmp_path)
         trader._client = _make_mock_client(filled=10.0)
         trader.kelly_size_usd = lambda signal: 3.5  # 10 contracts at ep 0.35
@@ -348,8 +372,8 @@ class TestMinOrderSize:
 
         trader.execute_signal(signal)
 
-        order_args = trader._client.create_and_post_order.call_args.args[0]
-        assert order_args.size == pytest.approx(10.0, abs=0.01)
+        order_args = trader._client.create_and_post_market_order.call_args.args[0]
+        assert order_args.amount == pytest.approx(3.5, abs=0.01)  # unchanged USD
 
 
 class TestNegRisk:
@@ -361,7 +385,7 @@ class TestNegRisk:
 
         trader.execute_signal(signal)
 
-        options = trader._client.create_and_post_order.call_args.kwargs["options"]
+        options = trader._client.create_and_post_market_order.call_args.kwargs["options"]
         assert options.neg_risk is True
 
 
@@ -373,7 +397,7 @@ class TestOrderType:
 
         trader.execute_signal(_make_signal(market_p=0.35, model_p=0.65))
 
-        order_type = trader._client.create_and_post_order.call_args.kwargs["order_type"]
+        order_type = trader._client.create_and_post_market_order.call_args.kwargs["order_type"]
         assert order_type == "FAK"
 
 
