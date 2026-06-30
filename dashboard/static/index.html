@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Weather Bot · Dashboard</title>
+  <link rel="stylesheet" href="/static/css/dashboard.css" />
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://esm.sh/three@0.170.0",
+      "three/addons/": "https://esm.sh/three@0.170.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+<div id="app">
+
+  <!-- Header -->
+  <header id="header">
+    <span class="logo">⬡ WEATHER BOT</span>
+    <span class="subtitle">ENSEMBLE FORECAST · PREDICTION MARKETS</span>
+    <div id="status-dot"></div>
+    <span id="status-label">IDLE</span>
+    <span id="last-scan-label">—</span>
+  </header>
+
+  <!-- Left: Signal Feed -->
+  <aside class="panel" id="left-panel">
+    <div class="panel-header">Live Signals</div>
+    <div class="panel-body" id="signal-feed">
+      <div class="empty-state">
+        <div style="font-size:22px">🌐</div>
+        <div>Run a scan to see signals</div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Center: Globe -->
+  <main id="globe-panel">
+    <canvas id="globe-canvas"></canvas>
+  </main>
+
+  <!-- Right: Performance + Controls -->
+  <aside class="panel" id="right-panel">
+    <div class="panel-header">Performance</div>
+    <div class="panel-body" id="perf-body">
+      <!-- performance.js renders here -->
+    </div>
+
+    <div class="panel-header" style="border-top: 1px solid var(--border);">Controls</div>
+    <div class="panel-body" id="ctrl-body">
+      <!-- controls.js renders here -->
+    </div>
+  </aside>
+
+</div>
+
+<!-- City detail popup -->
+<div id="city-detail" class="city-detail hidden">
+  <button id="city-detail-close">×</button>
+  <div id="city-detail-content"></div>
+</div>
+
+<!-- WS reconnect overlay -->
+<div id="reconnect-overlay">
+  <div class="spinner"></div>
+  <div>Reconnecting to server…</div>
+</div>
+
+<script type="module" src="/static/js/main.js"></script>
+</body>
+</html>

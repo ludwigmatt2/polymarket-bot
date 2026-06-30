@@ -216,17 +216,11 @@ def _execute_live_for_user(
         print(f"    ⛔ user {uid}: {reason}", file=sys.stderr)
         return
 
-    trader = LiveTrader(
+    trader = LiveTrader.from_creds(
+        creds,
         paper_trader=root_paper,  # global gate; per-user paper already mirrored
-        bankroll_usd=0.0,
         log_path=user_dir / "live_trades.csv",
         idempotency_path=user_dir / "live_idempotency.json",
-        private_key=creds["pk"],
-        funder_address=creds.get("funder_address"),
-        signature_type=creds.get("signature_type"),
-        clob_api_key=creds.get("clob_api_key"),
-        clob_secret=creds.get("clob_secret"),
-        clob_passphrase=creds.get("clob_passphrase"),
     )
     try:
         balance = trader.fetch_balance()
@@ -280,16 +274,11 @@ def fan_out_auto_resolve(client: WeatherClient) -> None:
         if live_csv.exists():
             try:
                 from weather.secrets import get_user_creds
-                _uc = get_user_creds(uid) or {}
-                user_live = LiveTrader(
+                user_live = LiveTrader.from_creds(
+                    get_user_creds(uid),
                     paper_trader=PaperTrader(log_path=trades_csv),
-                    bankroll_usd=0,
                     log_path=live_csv,
                     idempotency_path=user_dir / "live_idempotency.json",
-                    private_key=_uc.get("pk"), funder_address=_uc.get("funder_address"),
-                    signature_type=_uc.get("signature_type"),
-                    clob_api_key=_uc.get("clob_api_key"), clob_secret=_uc.get("clob_secret"),
-                    clob_passphrase=_uc.get("clob_passphrase"),
                 )
                 live_resolved, live_skipped = user_live.auto_resolve(client, model=None)
                 print(f"  User {uid} live: auto-resolved {live_resolved} trade(s).  "
@@ -297,6 +286,8 @@ def fan_out_auto_resolve(client: WeatherClient) -> None:
                 _claim = user_live.claim_winnings()
                 if _claim.get("claimed"):
                     print(f"  User {uid} live: claimed {_claim['claimed']} resolved position(s) → pUSD.")
+                elif _claim.get("error"):
+                    print(f"  User {uid} live: claim skipped ({_claim['error']})", file=sys.stderr)
             except Exception as e:
                 print(f"    ✗ live resolve failed for user {uid}: {e}", file=sys.stderr)
 
@@ -751,13 +742,9 @@ def main() -> None:
         if live_log.exists():
             from weather.secrets import get_user_creds
             _admin_uid = int(os.environ.get("ADMIN_ID", "0"))
-            _ac = (get_user_creds(_admin_uid) if _admin_uid else None) or {}
-            live_trader = LiveTrader(
-                paper_trader=paper, bankroll_usd=0, log_path=live_log,
-                private_key=_ac.get("pk"), funder_address=_ac.get("funder_address"),
-                signature_type=_ac.get("signature_type"),
-                clob_api_key=_ac.get("clob_api_key"), clob_secret=_ac.get("clob_secret"),
-                clob_passphrase=_ac.get("clob_passphrase"),
+            live_trader = LiveTrader.from_creds(
+                get_user_creds(_admin_uid) if _admin_uid else None,
+                paper_trader=paper, log_path=live_log,
             )
             live_resolved, live_skipped = live_trader.auto_resolve(client, model=model)
             print(f"  Live:  auto-resolved {live_resolved} trade(s).  {live_skipped} skipped.")
@@ -876,17 +863,12 @@ def main() -> None:
                     file=sys.stderr,
                 )
                 sys.exit(1)
-        live_trader = LiveTrader(
+        live_trader = LiveTrader.from_creds(
+            _creds,
             paper_trader=paper,
             bankroll_usd=args.bankroll,
             log_path=log_dir / "live_trades.csv",
             idempotency_path=log_dir / "live_idempotency.json",
-            private_key=_creds["pk"],
-            funder_address=_creds.get("funder_address"),
-            signature_type=_creds.get("signature_type"),
-            clob_api_key=_creds.get("clob_api_key"),
-            clob_secret=_creds.get("clob_secret"),
-            clob_passphrase=_creds.get("clob_passphrase"),
         )
         if not live_trader.is_unlocked():
             print("  Go-live gates not passed. Run: python weather_bot.py --mode stats", file=sys.stderr)

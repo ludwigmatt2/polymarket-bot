@@ -41,12 +41,9 @@ def run() -> None:
     tmp = Path(tempfile.mkdtemp(prefix="validate_live_"))
     paper = MagicMock()
     paper.compute_stats.return_value = MagicMock(ready_for_live=True)
-    trader = LiveTrader(
-        paper_trader=paper, bankroll_usd=100.0,
+    trader = LiveTrader.from_creds(
+        c, paper_trader=paper, bankroll_usd=100.0,
         log_path=tmp / "live_trades.csv", idempotency_path=tmp / "idem.json",
-        private_key=c["pk"], funder_address=c.get("funder_address"),
-        signature_type=c.get("signature_type"), clob_api_key=c.get("clob_api_key"),
-        clob_secret=c.get("clob_secret"), clob_passphrase=c.get("clob_passphrase"),
     )
 
     print("Finding a live token...")

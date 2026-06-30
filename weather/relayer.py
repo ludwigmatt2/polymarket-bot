@@ -45,16 +45,19 @@ def onchain_nonce(wallet: str) -> int:
     return int(r, 16) if r and r != "0x" else 0
 
 
-def pusd_balance(wallet: str) -> float:
-    r = _rpc("eth_call", [{"to": pm.PUSD,
-             "data": "0x70a08231" + wallet.lower().replace("0x", "").zfill(64)}, "latest"])
+def _erc20_balance(token: str, wallet: str) -> float:
+    """balanceOf(wallet) on a 6-decimal ERC-20, in dollars (0.0 on failure)."""
+    r = _rpc("eth_call", [{"to": token,
+             "data": pm.SEL_BALANCE_OF + wallet.lower().replace("0x", "").zfill(64)}, "latest"])
     return int(r, 16) / 10 ** pm.PUSD_DECIMALS if r and r != "0x" else 0.0
 
 
+def pusd_balance(wallet: str) -> float:
+    return _erc20_balance(pm.PUSD, wallet)
+
+
 def usdce_balance(wallet: str) -> float:
-    r = _rpc("eth_call", [{"to": pm.USDCE,
-             "data": "0x70a08231" + wallet.lower().replace("0x", "").zfill(64)}, "latest"])
-    return int(r, 16) / 1e6 if r and r != "0x" else 0.0
+    return _erc20_balance(pm.USDCE, wallet)
 
 
 def is_deployed(wallet: str) -> bool:

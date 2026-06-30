@@ -29,6 +29,7 @@ OFFRAMP = "0x2957922Eb93258b93368531d39fAcCA3B4dC5854"         # CollateralOffra
 DEPOSIT_WALLET_FACTORY = "0x00000000000Fb5C9ADea0298D729A0CB3823Cc07"
 
 # ── Function selectors (bytecode-verified) ───────────────────────────────────
+SEL_BALANCE_OF = "0x70a08231"          # balanceOf(address)
 SEL_APPROVE = "0x095ea7b3"             # approve(address,uint256)
 SEL_SET_APPROVAL_FOR_ALL = "0xa22cb465"  # setApprovalForAll(address,bool)
 SEL_WRAP = "0x62355638"                # CollateralOnramp.wrap(address,address,uint256)

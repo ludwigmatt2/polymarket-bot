@@ -413,8 +413,14 @@ async def on_proxy_paste(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
-async def _balance_reply(chat, uid: int) -> None:
+def _seed_ledger_if_first(uid: int, amount: float) -> None:
+    """Seed the per-user ROI ledger the first time real funds are seen."""
     tb = _tb()
+    if tb.wallet_stats(uid)["deposited"] == 0:
+        tb.append_wallet_transaction(uid, "deposit", amount, "onboarding funding detected")
+
+
+async def _balance_reply(chat, uid: int) -> None:
     creds = get_user_creds(uid) or {}
     wallet = creds.get("funder_address")
     # Deposit-wallet users (sig=3): show on-chain USDC.e (just-deposited, pre-wrap)
@@ -436,9 +442,7 @@ async def _balance_reply(chat, uid: int) -> None:
             return
         total = usdce + pusd
         if total > 0:
-            ws = tb.wallet_stats(uid)
-            if ws["deposited"] == 0:
-                tb.append_wallet_transaction(uid, "deposit", total, "onboarding funding detected")
+            _seed_ledger_if_first(uid, total)
             await chat.send_message(
                 f"💰 Deposit wallet:\n"
                 f"• USDC.e (just deposited): *${usdce:,.2f}*\n"
@@ -464,9 +468,7 @@ async def _balance_reply(chat, uid: int) -> None:
         )
         return
     if balance > 0:
-        ws = tb.wallet_stats(uid)
-        if ws["deposited"] == 0:
-            tb.append_wallet_transaction(uid, "deposit", balance, "onboarding funding detected")
+        _seed_ledger_if_first(uid, balance)
         await chat.send_message(f"💰 Balance: *${balance:,.2f} USDC*", parse_mode="Markdown")
     else:
         await chat.send_message("💰 Balance: $0.00 — no funds detected yet.")

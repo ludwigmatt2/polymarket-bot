@@ -878,22 +878,14 @@ async def cmd_deposit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
 
-def _is_eth_address(s: str) -> bool:
-    if not (s.startswith("0x") and len(s) == 42):
-        return False
-    try:
-        int(s, 16)
-        return True
-    except ValueError:
-        return False
-
-
 @require_auth()
 async def cmd_withdraw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Withdraw real pUSD off-chain as USDC.e to an external address (gasless via
     the relayer). Usage: /withdraw <amount|all> <0xADDRESS>"""
+    import asyncio
     from weather.secrets import get_user_creds
     from weather import relayer
+    from telegram_onboarding import is_eth_address
 
     uid = update.effective_user.id
     if len(ctx.args) < 2:
@@ -916,11 +908,11 @@ async def cmd_withdraw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     to = ctx.args[1]
-    if not _is_eth_address(to):
+    if not is_eth_address(to):
         await update.message.reply_text("❌ Invalid destination address (need 0x + 40 hex).")
         return
 
-    balance = relayer.pusd_balance(wallet)
+    balance = await asyncio.to_thread(relayer.pusd_balance, wallet)
     amt_str = ctx.args[0].lower()
     if amt_str == "all":
         amount = balance

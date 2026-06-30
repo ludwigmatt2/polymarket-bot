@@ -262,8 +262,7 @@ def enable_deposit_wallet(uid: int) -> dict:
     clob_ready = bool(creds.get("clob_api_key"))
     if not clob_ready:
         try:
-            l2 = derive_clob_creds(creds["pk"])
-            set_user_creds(uid, **l2)
+            derive_and_store_clob_creds(uid)  # single home for derive + store
             clob_ready = True
         except Exception:
             clob_ready = False  # best-effort; caller can retry derive_and_store_clob_creds
@@ -291,20 +290,25 @@ def prepare_for_live(uid: int) -> dict:
     wallet = creds["funder_address"]
     from . import relayer
     rc = relayer.RelayerClient(pk=creds["pk"])
+    deployed = relayer.is_deployed(wallet)
+    error = None
     try:
-        if not relayer.is_deployed(wallet):
+        if not deployed:
             rc.deploy_deposit_wallet(wallet)
+            deployed = True
         usdce = relayer.usdce_balance(wallet)
         if usdce > 0:
-            rc.wrap_usdce_to_pusd(wallet, int(usdce * 1_000_000))
+            rc.wrap_usdce_to_pusd(wallet, int(usdce * 1_000_000))  # floor: never over-wrap
         if not creds.get("exchanges_approved"):
             rc.approve_exchanges(wallet)
             set_user_creds(uid, exchanges_approved=True)
     except Exception as e:  # noqa: BLE001
-        return {"ready": False, "pusd": relayer.pusd_balance(wallet),
-                "deployed": relayer.is_deployed(wallet), "error": str(e)}
-    pusd = relayer.pusd_balance(wallet)
-    return {"ready": pusd > 0, "pusd": pusd, "deployed": True}
+        error = str(e)
+    pusd = relayer.pusd_balance(wallet)  # read once, shared by both outcomes
+    result = {"ready": error is None and pusd > 0, "pusd": pusd, "deployed": deployed}
+    if error:
+        result["error"] = error
+    return result
 
 
 # ── Backward-compat wrappers ──────────────────────────────────────────────────

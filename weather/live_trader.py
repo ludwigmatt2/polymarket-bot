@@ -221,6 +221,25 @@ class LiveTrader:
         self._clob_passphrase = clob_passphrase
         self._client: Any = None
 
+    @classmethod
+    def from_creds(cls, creds: dict | None, *, paper_trader, bankroll_usd: float = 0.0,
+                   log_path: Path = LIVE_TRADES_LOG,
+                   idempotency_path: Path = _IDEMPOTENCY_FILE,
+                   fill_poll_delay: float = 2.0) -> "LiveTrader":
+        """Build a LiveTrader from a stored creds dict (weather.secrets shape).
+        Single home for the pk/funder/signature_type/clob_* mapping so call sites
+        don't re-spread it."""
+        c = creds or {}
+        return cls(
+            paper_trader=paper_trader, bankroll_usd=bankroll_usd,
+            fill_poll_delay=fill_poll_delay, log_path=log_path,
+            idempotency_path=idempotency_path,
+            private_key=c.get("pk"), funder_address=c.get("funder_address"),
+            signature_type=c.get("signature_type"),
+            clob_api_key=c.get("clob_api_key"), clob_secret=c.get("clob_secret"),
+            clob_passphrase=c.get("clob_passphrase"),
+        )
+
     def is_unlocked(self) -> bool:
         return self.paper_trader.compute_stats().ready_for_live
 
