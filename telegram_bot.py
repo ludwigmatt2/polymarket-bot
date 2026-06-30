@@ -878,30 +878,81 @@ async def cmd_deposit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
 
+def _is_eth_address(s: str) -> bool:
+    if not (s.startswith("0x") and len(s) == 42):
+        return False
+    try:
+        int(s, 16)
+        return True
+    except ValueError:
+        return False
+
+
 @require_auth()
 async def cmd_withdraw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Record a withdrawal. Usage: /withdraw <amount> [note]"""
-    if not ctx.args:
+    """Withdraw real pUSD off-chain as USDC.e to an external address (gasless via
+    the relayer). Usage: /withdraw <amount|all> <0xADDRESS>"""
+    from weather.secrets import get_user_creds
+    from weather import relayer
+
+    uid = update.effective_user.id
+    if len(ctx.args) < 2:
         await update.message.reply_text(
-            "Usage: `/withdraw <amount> [note]`\nExample: `/withdraw 200 partial exit`",
+            "Usage: `/withdraw <amount|all> <0xADDRESS>`\n"
+            "Example: `/withdraw 5 0xYourWallet…`  ·  `/withdraw all 0x…`\n\n"
+            "Sends real USDC.e from your deposit wallet to the address.",
             parse_mode="Markdown",
         )
         return
-    try:
-        amount = float(ctx.args[0])
-    except ValueError:
-        await update.message.reply_text("❌ Invalid amount.")
+
+    creds = get_user_creds(uid) or {}
+    wallet = creds.get("funder_address")
+    if not wallet or not creds.get("pk") or creds.get("signature_type") != 3:
+        await update.message.reply_text(
+            "❌ No deposit wallet configured for on-chain withdrawal.\n"
+            "Set one up first (admin: `enable_deposit_wallet`).",
+            parse_mode="Markdown",
+        )
         return
+
+    to = ctx.args[1]
+    if not _is_eth_address(to):
+        await update.message.reply_text("❌ Invalid destination address (need 0x + 40 hex).")
+        return
+
+    balance = relayer.pusd_balance(wallet)
+    amt_str = ctx.args[0].lower()
+    if amt_str == "all":
+        amount = balance
+    else:
+        try:
+            amount = float(amt_str)
+        except ValueError:
+            await update.message.reply_text("❌ Invalid amount.")
+            return
     if amount <= 0 or not math.isfinite(amount):
         await update.message.reply_text("❌ Amount must be a positive finite number.")
         return
-    note = " ".join(ctx.args[1:]) if len(ctx.args) > 1 else ""
-    append_wallet_transaction(update.effective_user.id, "withdraw", amount, note)
-    ws = wallet_stats(update.effective_user.id)
+    if amount > balance + 1e-9:
+        await update.message.reply_text(
+            f"❌ Amount ${amount:,.2f} exceeds deposit-wallet balance ${balance:,.2f}."
+        )
+        return
+
+    token = os.urandom(6).hex()
+    ctx.user_data["withdraw_pending"] = {
+        "token": token, "amount": amount,
+        "amount_raw": int(round(amount * 1_000_000)), "to": to,
+    }
     await update.message.reply_text(
-        f"✅ *Withdrawal recorded:* -${amount:,.2f}\n"
-        f"Total withdrawn: ${ws['withdrawn']:,.2f}\n"
-        f"Wallet balance:  ${ws['wallet_balance']:,.2f}",
+        f"⚠️ *Confirm withdrawal*\n\n"
+        f"Send *${amount:,.2f}* (USDC.e) from your deposit wallet to:\n"
+        f"`{to}`\n\n"
+        f"Deposit-wallet balance: ${balance:,.2f}\nThis moves real funds.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Confirm withdrawal", callback_data=f"withdrawconfirm:{token}"),
+            InlineKeyboardButton("❌ Cancel", callback_data="status"),
+        ]]),
         parse_mode="Markdown",
     )
 
@@ -1234,6 +1285,42 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Switch back any time with `/mymode paper`.",
             reply_markup=main_kb(uid), parse_mode="Markdown",
         )
+    elif data.startswith("withdrawconfirm"):
+        token = data.split(":", 1)[1] if ":" in data else ""
+        pending = ctx.user_data.pop("withdraw_pending", None)
+        if not pending or token != pending.get("token"):
+            await q.edit_message_text(
+                "⌛ This withdrawal confirmation expired — run /withdraw again.",
+                reply_markup=main_kb(uid),
+            )
+            return
+        from weather.secrets import get_user_creds
+        from weather import relayer
+        creds = get_user_creds(uid) or {}
+        wallet = creds.get("funder_address")
+        if not wallet or not creds.get("pk"):
+            await q.edit_message_text("🔴 No deposit wallet — cannot withdraw.", reply_markup=main_kb(uid))
+            return
+        await q.edit_message_text("⏳ Submitting on-chain withdrawal…")
+        try:
+            import asyncio
+            rc = relayer.RelayerClient(pk=creds["pk"])
+            result = await asyncio.to_thread(
+                rc.unwrap_pusd_to_usdce, wallet, pending["amount_raw"], pending["to"]
+            )
+            txh = ""
+            if isinstance(result, dict):
+                txh = result.get("transactionHash", "")
+            append_wallet_transaction(uid, "withdraw", pending["amount"],
+                                      f"on-chain USDC.e to {pending['to']}")
+            msg = (f"✅ *Withdrawal sent:* ${pending['amount']:,.2f} USDC.e → `{pending['to']}`")
+            if txh:
+                msg += f"\ntx: `{txh}`"
+            await q.edit_message_text(msg, reply_markup=main_kb(uid), parse_mode="Markdown")
+        except Exception as e:
+            await q.edit_message_text(
+                f"🔴 Withdrawal failed: {str(e)[:200]}", reply_markup=main_kb(uid)
+            )
     elif data.startswith("why:"):
         trades_csv = _trades_csv_path(uid)
         rows: list[dict] = []
@@ -1437,7 +1524,7 @@ _USER_COMMANDS = [
     ("scanreport",  "🔬 Scan funnel: fetched → gates → taken"),
     ("losses",      "❌ Losing trades with causes"),
     ("deposit",     "💰 Record a deposit"),
-    ("withdraw",    "💸 Record a withdrawal"),
+    ("withdraw",    "💸 Withdraw real USDC.e to an address"),
     ("scan",        "🔍 Trigger a market scan"),
     ("resolve",     "✅ Auto-resolve pending trades"),
     ("mymode",      "🔄 View or change trading mode (paper/live)"),
