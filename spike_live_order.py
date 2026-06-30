@@ -65,7 +65,7 @@ def _find_liquid_token(client):
 def run() -> None:
     from py_clob_client_v2 import ClobClient
     from py_clob_client_v2.clob_types import (
-        ApiCreds, OrderArgsV2, OrderType, PartialCreateOrderOptions, OrderPayload,
+        ApiCreds, MarketOrderArgsV2, OrderType, PartialCreateOrderOptions, OrderPayload,
     )
     from py_clob_client_v2.order_builder.constants import BUY
 
@@ -96,15 +96,15 @@ def run() -> None:
     if not mk:
         print("      ❌ no liquid token found for a $1 fill"); return
     ask = mk["ask"]
-    # Cross the spread to guarantee a fill: bid at the ask (FAK fills at/inside).
-    size = round(SPEND_USD / ask, 2)
+    spend = round(SPEND_USD, 2)  # USD to spend — market-buy amount, 2-decimal clean
     print(f"      token={mk['token_id'][:18]}…  outcome={mk['outcome']}  ask={ask:.3f}  "
           f"tick={mk['tick_size']}  neg_risk={mk['neg_risk']}")
-    print(f"      buying {size} @ {ask:.3f}  (~${size*ask:.2f}), FAK")
+    print(f"      market BUY ${spend:.2f} (FAK)")
 
-    print("\n[2/2] Posting marketable BUY (FAK)...")
-    result = client.create_and_post_order(
-        OrderArgsV2(token_id=mk["token_id"], price=ask, size=size, side=BUY),
+    print("\n[2/2] Posting market BUY (FAK)...")
+    result = client.create_and_post_market_order(
+        MarketOrderArgsV2(token_id=mk["token_id"], amount=spend, side=BUY,
+                          order_type=OrderType.FAK),
         options=PartialCreateOrderOptions(tick_size=mk["tick_size"], neg_risk=mk["neg_risk"]),
         order_type=OrderType.FAK,
     )
