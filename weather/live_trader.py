@@ -513,6 +513,48 @@ class LiveTrader:
         claimable (redeemable=True). Use to drive post-resolution settlement."""
         return [p for p in (self.fetch_positions() or []) if p.get("redeemable")]
 
+    def claim_winnings(self) -> dict:
+        """Redeem resolved (redeemable) on-chain positions back to pUSD in the
+        deposit wallet, gaslessly via the relayer. Routes CTF (binary) vs
+        NegRiskAdapter (neg-risk) per position. Driven by the data-api redeemable
+        flag (which lags weather resolution), so it self-heals across resolve
+        loops until each market settles on-chain. Idempotent — redeemed positions
+        vanish from the next snapshot.
+
+        No-ops (returns {"claimed": 0}) without a funder/key, without redeemable
+        positions, or if builder creds for the relayer are missing. Never raises —
+        a claim failure must not break the resolve loop.
+        """
+        if not self._funder_address or not self._private_key:
+            return {"claimed": 0}
+        redeemable = self.redeemable_positions()
+        if not redeemable:
+            return {"claimed": 0}
+
+        groups: dict[str, dict] = {}
+        for p in redeemable:
+            cond = p.get("conditionId")
+            if not cond:
+                continue
+            g = groups.setdefault(cond, {
+                "condition_id": cond,
+                # data-api uses "negRisk"; some endpoints "negativeRisk" — accept both.
+                "neg_risk": bool(p.get("negativeRisk") or p.get("negRisk")),
+                "amounts": [0, 0],  # [YES (indexSet 1), NO (indexSet 2)], raw 6-dec
+            })
+            idx = 0 if str(p.get("outcome", "")).upper() == "YES" else 1
+            g["amounts"][idx] += int(round(float(p.get("size", 0) or 0) * 1e6))
+        if not groups:
+            return {"claimed": 0}
+
+        try:
+            from .relayer import RelayerClient
+            rc = RelayerClient(pk=self._private_key)
+            result = rc.redeem_positions(self._funder_address, list(groups.values()))
+            return {"claimed": len(groups), "conditions": list(groups.keys()), "result": result}
+        except Exception as e:  # noqa: BLE001 — never break the resolve loop
+            return {"claimed": 0, "error": str(e)}
+
     def reconcile_positions(self) -> list[dict]:
         """Compare local open live trades against actual on-chain positions.
 

@@ -279,15 +279,24 @@ def fan_out_auto_resolve(client: WeatherClient) -> None:
         live_csv = user_dir / "live_trades.csv"
         if live_csv.exists():
             try:
+                from weather.secrets import get_user_creds
+                _uc = get_user_creds(uid) or {}
                 user_live = LiveTrader(
                     paper_trader=PaperTrader(log_path=trades_csv),
                     bankroll_usd=0,
                     log_path=live_csv,
                     idempotency_path=user_dir / "live_idempotency.json",
+                    private_key=_uc.get("pk"), funder_address=_uc.get("funder_address"),
+                    signature_type=_uc.get("signature_type"),
+                    clob_api_key=_uc.get("clob_api_key"), clob_secret=_uc.get("clob_secret"),
+                    clob_passphrase=_uc.get("clob_passphrase"),
                 )
                 live_resolved, live_skipped = user_live.auto_resolve(client, model=None)
                 print(f"  User {uid} live: auto-resolved {live_resolved} trade(s).  "
                       f"{live_skipped} skipped.")
+                _claim = user_live.claim_winnings()
+                if _claim.get("claimed"):
+                    print(f"  User {uid} live: claimed {_claim['claimed']} resolved position(s) → pUSD.")
             except Exception as e:
                 print(f"    ✗ live resolve failed for user {uid}: {e}", file=sys.stderr)
 
@@ -740,9 +749,23 @@ def main() -> None:
 
         live_log = log_dir / "live_trades.csv"
         if live_log.exists():
-            live_trader = LiveTrader(paper_trader=paper, bankroll_usd=0, log_path=live_log)
+            from weather.secrets import get_user_creds
+            _admin_uid = int(os.environ.get("ADMIN_ID", "0"))
+            _ac = (get_user_creds(_admin_uid) if _admin_uid else None) or {}
+            live_trader = LiveTrader(
+                paper_trader=paper, bankroll_usd=0, log_path=live_log,
+                private_key=_ac.get("pk"), funder_address=_ac.get("funder_address"),
+                signature_type=_ac.get("signature_type"),
+                clob_api_key=_ac.get("clob_api_key"), clob_secret=_ac.get("clob_secret"),
+                clob_passphrase=_ac.get("clob_passphrase"),
+            )
             live_resolved, live_skipped = live_trader.auto_resolve(client, model=model)
             print(f"  Live:  auto-resolved {live_resolved} trade(s).  {live_skipped} skipped.")
+            _claim = live_trader.claim_winnings()
+            if _claim.get("claimed"):
+                print(f"  Live:  claimed {_claim['claimed']} resolved position(s) → pUSD.")
+            elif _claim.get("error"):
+                print(f"  Live:  claim skipped ({_claim['error']})", file=sys.stderr)
 
         if args.all_users:
             fan_out_auto_resolve(client)

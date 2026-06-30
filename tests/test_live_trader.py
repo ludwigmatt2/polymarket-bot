@@ -602,6 +602,67 @@ class TestPositionsReconciliation:
         redeemable = trader.redeemable_positions()
         assert [p["conditionId"] for p in redeemable] == ["0xa", "0xc"]
 
+
+class TestClaimWinnings:
+    def _trader(self, tmp_path):
+        t = _make_trader(tmp_path)
+        t._funder_address = "0xdeposit"
+        t._private_key = "0xkey"
+        return t
+
+    def test_noop_without_funder(self, tmp_path):
+        t = _make_trader(tmp_path)  # no funder
+        assert t.claim_winnings() == {"claimed": 0}
+
+    def test_noop_without_redeemable(self, tmp_path):
+        t = self._trader(tmp_path)
+        t.redeemable_positions = lambda: []
+        assert t.claim_winnings() == {"claimed": 0}
+
+    def test_routes_and_groups(self, tmp_path, monkeypatch):
+        t = self._trader(tmp_path)
+        t.redeemable_positions = lambda: [
+            {"conditionId": "0xbin", "outcome": "Yes", "size": 7.0, "negRisk": False, "redeemable": True},
+            {"conditionId": "0xneg", "outcome": "No", "size": 3.0, "negRisk": True, "redeemable": True},
+        ]
+        captured = {}
+
+        class FakeRC:
+            def __init__(self, pk=None): captured["pk"] = pk
+            def redeem_positions(self, wallet, grouped):
+                captured["wallet"] = wallet
+                captured["grouped"] = grouped
+                return {"ok": True}
+
+        import weather.relayer as rl
+        monkeypatch.setattr(rl, "RelayerClient", FakeRC)
+
+        res = t.claim_winnings()
+        assert res["claimed"] == 2
+        assert captured["wallet"] == "0xdeposit"
+        g = {x["condition_id"]: x for x in captured["grouped"]}
+        # binary: neg_risk False; neg: neg_risk True, NO -> amounts[1] = 3 * 1e6
+        assert g["0xbin"]["neg_risk"] is False
+        assert g["0xneg"]["neg_risk"] is True
+        assert g["0xneg"]["amounts"] == [0, 3_000_000]
+        assert g["0xbin"]["amounts"] == [7_000_000, 0]
+
+    def test_relayer_error_is_swallowed(self, tmp_path, monkeypatch):
+        t = self._trader(tmp_path)
+        t.redeemable_positions = lambda: [
+            {"conditionId": "0xa", "outcome": "Yes", "size": 1.0, "redeemable": True},
+        ]
+
+        class BoomRC:
+            def __init__(self, pk=None): pass
+            def redeem_positions(self, *a): raise RuntimeError("relayer down")
+
+        import weather.relayer as rl
+        monkeypatch.setattr(rl, "RelayerClient", BoomRC)
+
+        res = t.claim_winnings()
+        assert res["claimed"] == 0 and "relayer down" in res["error"]
+
     def test_reconcile_flags_missing_on_chain(self, tmp_path):
         """An open local trade with no matching on-chain position is flagged."""
         trader = _make_trader(tmp_path)
