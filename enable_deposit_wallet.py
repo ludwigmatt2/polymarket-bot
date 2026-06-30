@@ -35,6 +35,7 @@ def main() -> None:
     print(f"   funder_address : {res['funder_address']}")
     print(f"   signature_type : {res['signature_type']} (POLY_1271)")
     print(f"   deployed       : {'yes' if res['deployed'] else 'NO — deploy + fund + approve before live'}")
+    print(f"   clob L2 creds  : {'ready' if res.get('clob_ready') else 'NOT derived — run derive_and_store_clob_creds'}")
 
 
 if __name__ == "__main__":

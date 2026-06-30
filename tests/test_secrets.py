@@ -105,19 +105,24 @@ class TestEnableDepositWallet:
             import weather.secrets as sec
             reload(sec)
             sec.set_user_key(55, self._TEST_PK)
-            # Mock the on-chain derivation/deploy check (no RPC in tests)
+            # Mock the on-chain derivation/deploy + L2 derivation (no network in tests)
             import weather.relayer as rl
             monkeypatch.setattr(rl, "derive_deposit_wallet",
                                 lambda eoa: "0xDEAD00000000000000000000000000000000bEEF")
             monkeypatch.setattr(rl, "is_deployed", lambda w: True)
+            monkeypatch.setattr(sec, "derive_clob_creds",
+                                lambda pk: {"clob_api_key": "k", "clob_secret": "s",
+                                            "clob_passphrase": "p"})
             res = sec.enable_deposit_wallet(55)
             assert res["signature_type"] == 3
             assert res["funder_address"] == "0xDEAD00000000000000000000000000000000bEEF"
             assert res["deployed"] is True
+            assert res["clob_ready"] is True
             creds = sec.get_user_creds(55)
             assert creds["signature_type"] == 3
             assert creds["funder_address"] == "0xDEAD00000000000000000000000000000000bEEF"
             assert creds["pk"] == self._TEST_PK  # pk preserved
+            assert creds["clob_api_key"] == "k"  # L2 creds derived + stored
 
     def test_enable_raises_without_pk(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)

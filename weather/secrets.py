@@ -256,10 +256,23 @@ def enable_deposit_wallet(uid: int) -> dict:
     if not wallet:
         raise RuntimeError("Could not derive deposit wallet (factory unreachable)")
     set_user_creds(uid, funder_address=wallet, signature_type=3)
+
+    # Ensure L2 CLOB creds exist (EOA-derived, sig-independent) — without them
+    # every authenticated call fails and live trading is silently skipped.
+    clob_ready = bool(creds.get("clob_api_key"))
+    if not clob_ready:
+        try:
+            l2 = derive_clob_creds(creds["pk"])
+            set_user_creds(uid, **l2)
+            clob_ready = True
+        except Exception:
+            clob_ready = False  # best-effort; caller can retry derive_and_store_clob_creds
+
     return {
         "funder_address": wallet,
         "signature_type": 3,
         "deployed": relayer.is_deployed(wallet),
+        "clob_ready": clob_ready,
     }
 
 
