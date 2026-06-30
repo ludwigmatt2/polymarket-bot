@@ -32,6 +32,22 @@ RPCS = ["https://polygon.llamarpc.com", "https://1rpc.io/matic",
         "https://polygon-bor-rpc.publicnode.com", "https://rpc.ankr.com/polygon"]
 
 
+def _onchain_nonce(wallet: str) -> int:
+    """Deposit wallet's current on-chain nonce() (selector 0xaffed0e0)."""
+    for ep in RPCS:
+        try:
+            req = urllib.request.Request(ep, data=json.dumps({"jsonrpc": "2.0", "id": 1,
+                "method": "eth_call", "params": [{"to": wallet, "data": "0xaffed0e0"}, "latest"]}).encode(),
+                headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=12) as r:
+                res = json.loads(r.read()).get("result")
+            if res and res != "0x":
+                return int(res, 16)
+        except Exception:
+            pass
+    return 0
+
+
 def _bal(token: str, holder: str) -> int:
     data = "0x70a08231" + holder.lower().replace("0x", "").zfill(64)
     for ep in RPCS:
@@ -96,9 +112,11 @@ def run() -> None:
                           data=_wrap_calldata(USDCE, wallet, usdce)),
     ]
     print(f"\nWrapping ${usdce/1e6:.4f} USDC.e -> pUSD into the deposit wallet...")
+    nonce = os.getenv("DEPOSIT_WALLET_NONCE") or str(_onchain_nonce(wallet))
+    print(f"Using deposit-wallet nonce {nonce}")
     resp = client.execute_deposit_wallet_batch(
         calls=calls, wallet_address=wallet,
-        nonce=os.getenv("DEPOSIT_WALLET_NONCE", "0"),
+        nonce=nonce,
         deadline=os.getenv("DEPOSIT_WALLET_DEADLINE", str(int(time.time()) + 240)))
     print(f"  submitted: {resp}")
     try:

@@ -12,14 +12,36 @@ Run:
 
 from __future__ import annotations
 
+import json
 import os
 import time
+import urllib.request
 
 from dotenv import load_dotenv
 from eth_abi import encode
 from eth_utils import keccak, to_checksum_address
 
 load_dotenv()
+
+_RPCS = ["https://polygon.llamarpc.com", "https://1rpc.io/matic",
+         "https://polygon-bor-rpc.publicnode.com", "https://rpc.ankr.com/polygon"]
+
+
+def _onchain_nonce(wallet: str) -> int:
+    """Deposit wallet's current on-chain nonce() (selector 0xaffed0e0). The
+    relayer rejects a batch whose nonce != this, so never hardcode 0."""
+    for ep in _RPCS:
+        try:
+            req = urllib.request.Request(ep, data=json.dumps({"jsonrpc": "2.0", "id": 1,
+                "method": "eth_call", "params": [{"to": wallet, "data": "0xaffed0e0"}, "latest"]}).encode(),
+                headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=12) as r:
+                res = json.loads(r.read()).get("result")
+            if res and res != "0x":
+                return int(res, 16)
+        except Exception:
+            pass
+    return 0
 
 DEPOSIT_WALLET = "0xCeE18163EEb650177161a7174b760cf71D45bc8a"
 PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"           # Polymarket USD (collateral, ERC-20)
@@ -80,10 +102,12 @@ def run() -> None:
     print("Approving pUSD (buy) + CTF setApprovalForAll (sell) for exchange_v2,")
     print("neg_risk_exchange_v2, neg_risk_adapter — 6 calls in one batch...")
 
+    nonce = os.getenv("DEPOSIT_WALLET_NONCE") or str(_onchain_nonce(wallet))
+    print(f"Using deposit-wallet nonce {nonce}")
     resp = client.execute_deposit_wallet_batch(
         calls=calls,
         wallet_address=wallet,
-        nonce=os.getenv("DEPOSIT_WALLET_NONCE", "0"),
+        nonce=nonce,
         deadline=os.getenv("DEPOSIT_WALLET_DEADLINE", str(int(time.time()) + 240)),
     )
     print(f"  submitted: {resp}")
