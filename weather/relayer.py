@@ -56,6 +56,18 @@ def is_deployed(wallet: str) -> bool:
     return code not in ("0x", "0x0")
 
 
+def derive_deposit_wallet(eoa: str) -> str | None:
+    """The deterministic V2 deposit-wallet address for an owner EOA, via the
+    factory's predictWalletAddress(bytes32) read fn (authoritative — equals the
+    CREATE2 result). Pure RPC, no builder creds. Returns checksum-less lower hex."""
+    wallet_id = eoa.lower().replace("0x", "").zfill(64)
+    r = _rpc("eth_call", [{"to": pm.DEPOSIT_WALLET_FACTORY,
+             "data": pm.SEL_PREDICT_WALLET + wallet_id}, "latest"])
+    if not r or r == "0x" or int(r, 16) == 0:
+        return None
+    return "0x" + r[-40:]
+
+
 # ── calldata builders ────────────────────────────────────────────────────────
 def _approve(spender: str, amount: int) -> str:
     return pm.SEL_APPROVE + encode(["address", "uint256"],

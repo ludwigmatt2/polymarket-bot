@@ -237,6 +237,32 @@ def derive_and_store_clob_creds(uid: int) -> dict:
     return l2
 
 
+def enable_deposit_wallet(uid: int) -> dict:
+    """Switch uid to the V2 deposit-wallet flow: derive the deterministic deposit
+    wallet from the stored pk's EOA, store it as funder_address, and set
+    signature_type=3 (POLY_1271). Idempotent. Returns
+    {"funder_address","signature_type","deployed"}.
+
+    The deposit wallet must be DEPLOYED on-chain (via the relayer) before live
+    orders fill — this only wires the creds. `deployed` flags current state.
+    """
+    creds = get_user_creds(uid)
+    if not creds or not creds.get("pk"):
+        raise RuntimeError(f"No private key stored for uid={uid}")
+    from eth_account import Account
+    from . import relayer
+    eoa = Account.from_key(creds["pk"]).address
+    wallet = relayer.derive_deposit_wallet(eoa)
+    if not wallet:
+        raise RuntimeError("Could not derive deposit wallet (factory unreachable)")
+    set_user_creds(uid, funder_address=wallet, signature_type=3)
+    return {
+        "funder_address": wallet,
+        "signature_type": 3,
+        "deployed": relayer.is_deployed(wallet),
+    }
+
+
 # ── Backward-compat wrappers ──────────────────────────────────────────────────
 
 def set_user_key(uid: int, pk: str) -> None:

@@ -86,3 +86,47 @@ class TestSecretsFernet:
             reload(sec)
             with pytest.raises(RuntimeError, match="No encrypted key storage"):
                 sec.set_user_key(1, "pk")
+
+
+class TestEnableDepositWallet:
+    """Phase 2 — wiring a user onto the V2 deposit-wallet flow."""
+
+    # A throwaway hardhat test key (well-known, no funds) — Account.from_key works offline.
+    _TEST_PK = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+
+    def test_enable_stores_funder_and_sig3(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "config").mkdir()
+        from cryptography.fernet import Fernet
+        monkeypatch.setenv("POLYMARKET_SECRETS_KEY", Fernet.generate_key().decode())
+
+        with patch.dict("sys.modules", {"keyring": None}):
+            from importlib import reload
+            import weather.secrets as sec
+            reload(sec)
+            sec.set_user_key(55, self._TEST_PK)
+            # Mock the on-chain derivation/deploy check (no RPC in tests)
+            import weather.relayer as rl
+            monkeypatch.setattr(rl, "derive_deposit_wallet",
+                                lambda eoa: "0xDEAD00000000000000000000000000000000bEEF")
+            monkeypatch.setattr(rl, "is_deployed", lambda w: True)
+            res = sec.enable_deposit_wallet(55)
+            assert res["signature_type"] == 3
+            assert res["funder_address"] == "0xDEAD00000000000000000000000000000000bEEF"
+            assert res["deployed"] is True
+            creds = sec.get_user_creds(55)
+            assert creds["signature_type"] == 3
+            assert creds["funder_address"] == "0xDEAD00000000000000000000000000000000bEEF"
+            assert creds["pk"] == self._TEST_PK  # pk preserved
+
+    def test_enable_raises_without_pk(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "config").mkdir()
+        from cryptography.fernet import Fernet
+        monkeypatch.setenv("POLYMARKET_SECRETS_KEY", Fernet.generate_key().decode())
+        with patch.dict("sys.modules", {"keyring": None}):
+            from importlib import reload
+            import weather.secrets as sec
+            reload(sec)
+            with pytest.raises(RuntimeError, match="No private key"):
+                sec.enable_deposit_wallet(999)
