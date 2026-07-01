@@ -32,7 +32,7 @@ SPEND = float(os.environ.get("SPEND_USD", "1.10"))
 
 
 def run() -> None:
-    uid = int(os.environ["ADMIN_ID"])
+    uid = int(os.environ.get("TELEGRAM_ADMIN_ID") or os.environ["ADMIN_ID"])
     c = get_user_creds(uid)
     if not c:
         print("❌ no admin creds"); return

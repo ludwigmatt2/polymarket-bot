@@ -22,7 +22,7 @@ load_dotenv()
 
 
 def main() -> None:
-    uid = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.environ.get("ADMIN_ID", "0"))
+    uid = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.environ.get("TELEGRAM_ADMIN_ID") or os.environ.get("ADMIN_ID") or "0")
     if not uid:
         print("❌ No uid given and ADMIN_ID not set."); return
 
