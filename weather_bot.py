@@ -743,7 +743,7 @@ def main() -> None:
         live_log = log_dir / "live_trades.csv"
         if live_log.exists():
             from weather.secrets import get_user_creds
-            _admin_uid = int(os.environ.get("ADMIN_ID", "0"))
+            _admin_uid = int(os.environ.get("TELEGRAM_ADMIN_ID") or os.environ.get("ADMIN_ID") or "0")
             live_trader = LiveTrader.from_creds(
                 get_user_creds(_admin_uid) if _admin_uid else None,
                 paper_trader=paper, log_path=live_log,
@@ -824,7 +824,7 @@ def main() -> None:
     live_trader = None
     if args.mode == "live":
         from weather.secrets import get_user_creds, set_user_creds
-        admin_uid = int(os.environ.get("ADMIN_ID", "0"))
+        admin_uid = int(os.environ.get("TELEGRAM_ADMIN_ID") or os.environ.get("ADMIN_ID") or "0")
         _creds = get_user_creds(admin_uid) if admin_uid else None
         # Auto-derive L2 creds if missing (first run after key was stored)
         if _creds and _creds.get("pk") and not _creds.get("clob_api_key"):

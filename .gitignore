@@ -1,8 +1,10 @@
 # ── Secrets ────────────────────────────────────────────────────────────────────
 .env
+.env.bak*
 *.key
 *.pem
-# Per-user Polymarket credentials (plaintext private keys) live in config/users.json
+# Per-user Polymarket credentials live Fernet-encrypted in config/user_keys.enc.json
+# (roles/metadata in config/users.json — never plaintext keys). Never commit config/.
 config/
 
 # ── Python ─────────────────────────────────────────────────────────────────────
