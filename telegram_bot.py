@@ -47,6 +47,7 @@ load_dotenv()
 ROOT          = Path(__file__).parent
 from weather.paths import DATA_DIR
 from weather import permissions as perms
+from weather import withdrawal_policy as wpol
 USERS_FILE    = DATA_DIR / "config" / "users.json"
 WALLET_FILE   = DATA_DIR / "logs" / "wallet.json"
 
@@ -325,6 +326,70 @@ def wallet_stats(uid: int) -> dict:
         "resolved_count": len(resolved),
         "pending_count":  len(pending),
     }
+
+
+# ── Withdrawal hardening (audit C-Phase; SECURITY_PLAN Phase C) ────────────────
+
+def get_withdraw_allowlist(uid: int) -> list[dict]:
+    return _load_users().get(uid, {}).get("withdraw_allowlist") or []
+
+def add_allowlist_entry(uid: int, address: str, label: str = "") -> None:
+    """Add (or refresh the cooling-off clock of) an allowlisted destination."""
+    canon = wpol.normalize_address(address)
+    with _users_transaction() as users:
+        u = users.setdefault(uid, {})
+        entries = [e for e in (u.get("withdraw_allowlist") or [])
+                   if wpol.normalize_address(e.get("address", "")) != canon]
+        entries.append({
+            "address": canon,
+            "label": label,
+            "added_at": datetime.utcnow().isoformat(),
+        })
+        u["withdraw_allowlist"] = entries
+
+def remove_allowlist_entry(uid: int, address: str) -> bool:
+    canon = wpol.normalize_address(address)
+    removed = False
+    with _users_transaction() as users:
+        u = users.get(uid)
+        if not u:
+            return False
+        before = u.get("withdraw_allowlist") or []
+        after = [e for e in before if wpol.normalize_address(e.get("address", "")) != canon]
+        removed = len(after) != len(before)
+        u["withdraw_allowlist"] = after
+    return removed
+
+def get_withdraw_cap(uid: int) -> float:
+    from weather.config import WITHDRAW_DAILY_CAP_USD
+    cap = _load_users().get(uid, {}).get("withdraw_cap_usd")
+    return float(cap) if cap is not None else WITHDRAW_DAILY_CAP_USD
+
+def set_withdraw_cap(uid: int, usd: float) -> None:
+    with _users_transaction() as users:
+        users.setdefault(uid, {})["withdraw_cap_usd"] = float(usd)
+
+def withdrawn_today(uid: int) -> float:
+    """Sum of the user's ledger withdrawals dated today (UTC)."""
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    total = 0.0
+    for t in read_wallet(uid).get("transactions", []):
+        if t.get("type") == "withdraw" and str(t.get("timestamp", ""))[:10] == today:
+            total += float(t.get("amount") or 0)
+    return total
+
+
+# Rate limiter — per-uid withdrawal attempt timestamps (monotonic seconds).
+_withdraw_attempts: dict[int, list[float]] = {}
+
+def withdraw_rate_limited(uid: int) -> bool:
+    """Record an attempt; True if the user is over the hourly attempt budget."""
+    from weather.config import WITHDRAW_MAX_ATTEMPTS_PER_HR
+    now = _time.monotonic()
+    recent = [t for t in _withdraw_attempts.get(uid, []) if now - t < 3600]
+    recent.append(now)
+    _withdraw_attempts[uid] = recent
+    return len(recent) > WITHDRAW_MAX_ATTEMPTS_PER_HR
 
 
 # ── Stats ─────────────────────────────────────────────────────────────────────
@@ -772,9 +837,12 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/why <trade_id> — full reasoning behind a trade",
         "/scanreport — scan funnel: what was fetched, rejected, taken",
         "/losses [n] — losing trades with causes\n",
-        "*Wallet tracking*",
+        "*Wallet & withdrawals*",
         "/deposit <amount> [note] — record a deposit",
-        "/withdraw <amount> [note] — record a withdrawal\n",
+        "/withdraw <amount|all> <0xaddr> — withdraw to an allowlisted address",
+        "/allowlist — view allowlist & daily cap",
+        "/allowlist\\_add <0xaddr> [label] — allowlist an address (24h cooling-off)",
+        "/allowlist\\_remove <0xaddr> — remove an address\n",
         "*Bot control*",
         "/scan — trigger a market scan",
         "/resolve — auto-resolve pending paper trades",
@@ -790,6 +858,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "/setrole <id> <role> — change a user's role",
             "/suspend <id> · /unsuspend <id> — block / restore access",
             "/users — list users",
+            "/setwithdrawcap <id> <usd> — set a user's daily withdrawal cap",
             "/setmaxbet <usd> — set global max bet per trade",
             "/setup <key> [proxy] — save credentials (legacy)",
         ]
@@ -929,6 +998,7 @@ async def cmd_withdraw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     import asyncio
     from weather.secrets import get_user_creds
     from weather import relayer
+    from weather.config import WITHDRAW_LARGE_USD
     from telegram_onboarding import is_eth_address
 
     uid = update.effective_user.id
@@ -936,8 +1006,15 @@ async def cmd_withdraw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Usage: `/withdraw <amount|all> <0xADDRESS>`\n"
             "Example: `/withdraw 5 0xYourWallet…`  ·  `/withdraw all 0x…`\n\n"
-            "Sends real USDC.e from your deposit wallet to the address.",
+            "The destination must be *allowlisted* (`/allowlist_add`) and past its "
+            "cooling-off window. Sends real USDC.e from your deposit wallet.",
             parse_mode="Markdown",
+        )
+        return
+
+    if withdraw_rate_limited(uid):
+        await update.message.reply_text(
+            "⏳ Too many withdrawal attempts recently — try again later."
         )
         return
 
@@ -975,6 +1052,43 @@ async def cmd_withdraw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ── Phase C policy: allowlist + cooling-off + daily cap + large-withdrawal code ──
+    code_arg = ctx.args[2] if len(ctx.args) > 2 else None
+    staged = ctx.user_data.get("withdraw_code")
+    code_ok = bool(
+        staged and code_arg
+        and code_arg == staged.get("code")
+        and abs(float(staged.get("amount", 0)) - amount) < 1e-9
+        and wpol.normalize_address(staged.get("to", "")) == wpol.normalize_address(to)
+    )
+    decision = wpol.evaluate_withdrawal(
+        amount, to, get_withdraw_allowlist(uid),
+        withdrawn_today(uid), get_withdraw_cap(uid), code_ok=code_ok,
+    )
+    if not decision.allowed:
+        if decision.requires_code:
+            code = f"{int.from_bytes(os.urandom(3), 'big') % 1_000_000:06d}"
+            ctx.user_data["withdraw_code"] = {"code": code, "amount": amount, "to": to}
+            if uid != ADMIN_ID:  # owner oversight / audit trail on large withdrawals
+                try:
+                    await ctx.bot.send_message(
+                        ADMIN_ID,
+                        f"🔔 Large withdrawal requested\nuser `{uid}` · ${amount:,.2f} → `{to}`",
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
+            await update.message.reply_text(
+                f"🔐 *Large withdrawal* (≥ ${WITHDRAW_LARGE_USD:,.0f}) needs a code.\n"
+                f"Confirmation code: `{code}`\n\n"
+                f"Re-run to proceed:\n`/withdraw {amt_str} {to} {code}`",
+                parse_mode="Markdown",
+            )
+            return
+        await update.message.reply_text(f"🚫 {decision.reason}")
+        return
+
+    ctx.user_data.pop("withdraw_code", None)
     token = os.urandom(6).hex()
     ctx.user_data["withdraw_pending"] = {
         "token": token, "amount": amount,
@@ -993,6 +1107,90 @@ async def cmd_withdraw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ]]),
         parse_mode="Markdown",
     )
+
+@require_perm(perms.WITHDRAW_OWN)
+async def cmd_allowlist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show the user's withdrawal allowlist + daily-cap status."""
+    from weather.config import WITHDRAW_COOLING_OFF_HOURS
+    uid = update.effective_user.id
+    entries = get_withdraw_allowlist(uid)
+    now = datetime.now(timezone.utc)
+    cap = get_withdraw_cap(uid)
+    spent = withdrawn_today(uid)
+    lines = [
+        "*💸 Withdrawal allowlist*",
+        f"Daily cap ${cap:,.0f} · today ${spent:,.2f} · left ${max(0.0, cap - spent):,.2f}\n",
+    ]
+    if not entries:
+        lines.append("_No addresses yet._ Add one with `/allowlist_add 0x…`")
+    else:
+        for e in entries:
+            state = wpol.allowlist_state(entries, e["address"], now)
+            icon = {"active": "✅", "cooling": "⏳"}.get(state, "❓")
+            lbl = f" — {e['label']}" if e.get("label") else ""
+            extra = ""
+            if state == "cooling":
+                added = wpol._parse_ts(e.get("added_at", ""))
+                if added:
+                    ready = added + timedelta(hours=WITHDRAW_COOLING_OFF_HOURS)
+                    hrs = max(0.0, (ready - now).total_seconds() / 3600)
+                    extra = f" (ready in {hrs:.0f}h)"
+            lines.append(f"{icon} `{e['address']}`{lbl}{extra}")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+@require_perm(perms.WITHDRAW_OWN)
+async def cmd_allowlist_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    from weather.config import WITHDRAW_COOLING_OFF_HOURS
+    uid = update.effective_user.id
+    if not ctx.args:
+        await update.message.reply_text("Usage: `/allowlist_add <0xADDRESS> [label]`", parse_mode="Markdown")
+        return
+    addr = wpol.normalize_address(ctx.args[0])
+    if not addr:
+        await update.message.reply_text("❌ Invalid address (need 0x + 40 hex).")
+        return
+    label = " ".join(ctx.args[1:])[:40]
+    add_allowlist_entry(uid, addr, label)
+    await update.message.reply_text(
+        f"✅ Allowlisted `{addr}`.\n"
+        f"⏳ Usable for withdrawals in {WITHDRAW_COOLING_OFF_HOURS:.0f}h "
+        "(cooling-off protects against a compromised session).",
+        parse_mode="Markdown",
+    )
+
+
+@require_perm(perms.WITHDRAW_OWN)
+async def cmd_allowlist_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not ctx.args:
+        await update.message.reply_text("Usage: `/allowlist_remove <0xADDRESS>`", parse_mode="Markdown")
+        return
+    if remove_allowlist_entry(uid, ctx.args[0]):
+        await update.message.reply_text("✅ Removed from your allowlist.")
+    else:
+        await update.message.reply_text("Address not found in your allowlist.")
+
+
+@require_perm(perms.MANAGE_USERS)
+async def cmd_setwithdrawcap(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if len(ctx.args) < 2:
+        await update.message.reply_text("Usage: `/setwithdrawcap <telegram_id> <usd>`", parse_mode="Markdown")
+        return
+    try:
+        target = int(ctx.args[0])
+        usd = float(ctx.args[1])
+    except ValueError:
+        await update.message.reply_text("❌ Need `<telegram_id> <usd>`.", parse_mode="Markdown")
+        return
+    if not (0 <= usd <= 100_000):
+        await update.message.reply_text("❌ Cap must be between $0 and $100,000.")
+        return
+    set_withdraw_cap(target, usd)
+    await update.message.reply_text(
+        f"✅ Daily withdrawal cap for `{target}` set to *${usd:,.0f}*.", parse_mode="Markdown"
+    )
+
 
 @require_perm(perms.SET_MAXBET)
 async def cmd_setmaxbet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1488,6 +1686,15 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 reply_markup=main_kb(uid),
             )
             return
+        # Re-check policy at confirm time — allowlist or daily-cap state may have
+        # changed since the prompt (code gate already satisfied, so code_ok=True).
+        recheck = wpol.evaluate_withdrawal(
+            pending["amount"], pending["to"], get_withdraw_allowlist(uid),
+            withdrawn_today(uid), get_withdraw_cap(uid), code_ok=True,
+        )
+        if not recheck.allowed:
+            await q.edit_message_text(f"🚫 {recheck.reason}", reply_markup=main_kb(uid))
+            return
         from weather.secrets import get_user_creds
         from weather import relayer
         creds = get_user_creds(uid) or {}
@@ -1718,7 +1925,10 @@ _USER_COMMANDS = [
     ("scanreport",  "🔬 Scan funnel: fetched → gates → taken"),
     ("losses",      "❌ Losing trades with causes"),
     ("deposit",     "💰 Record a deposit"),
-    ("withdraw",    "💸 Withdraw real USDC.e to an address"),
+    ("withdraw",    "💸 Withdraw real USDC.e to an allowlisted address"),
+    ("allowlist",   "🔐 View withdrawal allowlist & daily cap"),
+    ("allowlist_add",    "➕ Allowlist a withdrawal address"),
+    ("allowlist_remove", "➖ Remove a withdrawal address"),
     ("scan",        "🔍 Trigger a market scan"),
     ("resolve",     "✅ Auto-resolve pending trades"),
     ("mymode",      "🔄 View or change trading mode (paper/live)"),
@@ -1733,6 +1943,7 @@ _ADMIN_COMMANDS = _USER_COMMANDS + [
     ("suspend",     "🚫 Suspend a user"),
     ("unsuspend",   "✅ Restore a suspended user"),
     ("users",       "👥 List all registered users"),
+    ("setwithdrawcap", "🔐 Set a user's daily withdrawal cap"),
     ("setup",       "⚙️ Save credentials (legacy)"),
     ("setmaxbet",   "💰 Set max bet size per trade (e.g. /setmaxbet 50)"),
 ]
@@ -1848,12 +2059,16 @@ async def _run() -> None:
         ("mymode",      cmd_mymode),
         ("deposit",     cmd_deposit),
         ("withdraw",    cmd_withdraw),
+        ("allowlist",        cmd_allowlist),
+        ("allowlist_add",    cmd_allowlist_add),
+        ("allowlist_remove", cmd_allowlist_remove),
         ("users",       cmd_users),
         ("adduser",     cmd_adduser),
         ("removeuser",  cmd_removeuser),
         ("setrole",     cmd_setrole),
         ("suspend",     cmd_suspend),
         ("unsuspend",   cmd_unsuspend),
+        ("setwithdrawcap", cmd_setwithdrawcap),
         ("setmaxbet",   cmd_setmaxbet),
     ]:
         app.add_handler(CommandHandler(cmd, handler))
