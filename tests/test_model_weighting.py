@@ -7,6 +7,7 @@ import pytest
 
 from weather.probability_model import ProbabilityModel, _fraction_satisfying, _apply_kde
 from weather.models import EnsembleForecast
+from weather.config import MODEL_WEIGHTS
 from model_skill_tracker import parse_breakdown, score_models, suggest_weights
 
 
@@ -55,7 +56,12 @@ def test_prior_amplifies_ecmwf(tmp_path):
     eq = m_eq.compute_probability(_forecast(), 25.0, "above").raw_p
     pr = m_pr.compute_probability(_forecast(), 25.0, "above").raw_p
     assert pr > eq  # up-weighting the (above) ECMWF raises P(above)
-    assert pr == pytest.approx(0.5, abs=0.02)  # 50*1.5/150
+    # Expected = weighted ECMWF member share under the default MODEL_WEIGHTS prior.
+    # Derived from config so this survives future weight tuning. ECMWF's 50 members
+    # are "above"; GFS(31)+ICON(40) are "below".
+    above = 50 * MODEL_WEIGHTS["ecmwf_ifs025"]
+    below = 31 * MODEL_WEIGHTS["gfs_seamless"] + 40 * MODEL_WEIGHTS["icon_seamless"]
+    assert pr == pytest.approx(above / (above + below), abs=0.02)
 
 
 # ── model_skill_tracker ──────────────────────────────────────────────────────────
