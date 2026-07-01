@@ -171,3 +171,14 @@ WEATHER_SEARCH_TERMS = [
 # "snow"       → Edward Snowden
 # "weather"    → Space Weather events
 # "tornado", "wind speed", "storm surge", "rainfall" → too few/irrelevant results
+
+# ── Withdrawal hardening (SECURITY_PLAN Phase C) ───────────────────────────────
+# The only irreversible money-loss path. Withdrawals may only go to an address the
+# user has explicitly allowlisted, and only after a cooling-off window (defeats a
+# smash-and-grab if the bot/session is briefly compromised). Daily total is capped;
+# large single withdrawals need a re-entered confirmation code; attempts are rate
+# limited. All overrideable via env.
+WITHDRAW_COOLING_OFF_HOURS   = float(os.environ.get("WITHDRAW_COOLING_OFF_HOURS", "24"))
+WITHDRAW_DAILY_CAP_USD       = float(os.environ.get("WITHDRAW_DAILY_CAP_USD", "500"))
+WITHDRAW_LARGE_USD           = float(os.environ.get("WITHDRAW_LARGE_USD", "250"))
+WITHDRAW_MAX_ATTEMPTS_PER_HR = int(os.environ.get("WITHDRAW_MAX_ATTEMPTS_PER_HR", "5"))

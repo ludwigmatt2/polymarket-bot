@@ -50,17 +50,20 @@ _Status: proposed (2026-07-01). Bot runs paper 24/7 on Hetzner Helsinki VPS. No 
 
 ---
 
-## Phase C — Withdrawal hardening (money-loss surface)
+## Phase C — Withdrawal hardening (money-loss surface) ✅ COMPLETE (2026-07-01)
 
 **Goal:** make theft-by-withdrawal require more than a leaked bot token.
 
-- [ ] C1. **Per-user withdrawal address allowlist.** First withdrawal to a new address requires an explicit `/allowlist_add <addr>` + confirmation; store allowlisted addresses per uid in `users.json`. Withdrawals to non-allowlisted addresses are rejected. (Wire into the `withdrawconfirm` branch, `telegram_bot.py:1299`.)
-- [ ] C2. **Per-user daily withdrawal cap** (e.g. default $X/day, admin-configurable via `/setwithdrawcap`). Sum today's `withdraw` txns from the ledger (`read_wallet`) and block over-cap.
-- [ ] C3. **Cooling-off for new allowlist entries** — an address added <24h ago can't be withdrawn to (defeats a smash-and-grab if the bot is briefly compromised).
-- [ ] C4. **Large-withdrawal second factor** — above a threshold, require a 6-digit code the bot DMs, or `owner` approval.
-- [ ] C5. Keep the existing one-time token flow; add rate-limit (max N withdraw attempts / hour / uid).
+Pure decision logic in `weather/withdrawal_policy.py` (`evaluate_withdrawal`), config
+in `weather/config.py`, storage + rate-limit + commands in `telegram_bot.py`.
 
-**Acceptance:** a withdrawal to a fresh attacker address is impossible without a ≥24h-old allowlist entry; daily loss is bounded by the cap even in full-compromise.
+- [x] C1. **Per-user withdrawal allowlist** in `users.json` (`withdraw_allowlist`). `/allowlist_add`, `/allowlist_remove`, `/allowlist` (view). Non-allowlisted destinations are rejected in both `cmd_withdraw` and the `withdrawconfirm` re-check.
+- [x] C2. **Per-user daily cap** (`WITHDRAW_DAILY_CAP_USD` default, per-user override via admin `/setwithdrawcap`); `withdrawn_today()` sums today's ledger withdrawals; over-cap blocked (and re-checked at confirm).
+- [x] C3. **24h cooling-off** (`WITHDRAW_COOLING_OFF_HOURS`) — a freshly allowlisted address is `cooling` (unusable) until the window elapses; `/allowlist` shows "ready in Nh".
+- [x] C4. **Large-withdrawal code** (`WITHDRAW_LARGE_USD`) — single withdrawals ≥ threshold require a re-entered 6-digit code (`/withdraw <amt> <addr> <code>`); the owner is alerted on any non-owner large withdrawal. _(Note: the code shares the Telegram channel, so it's friction + audit, not true out-of-band 2FA — real 2FA/owner-approval-gate deferred.)_
+- [x] C5. Existing one-time confirm token kept; added per-uid hourly attempt rate limit (`WITHDRAW_MAX_ATTEMPTS_PER_HR`).
+
+**Acceptance:** ✅ a withdrawal to a fresh attacker address is impossible without a ≥24h-old allowlist entry; daily loss is bounded by the cap even in full compromise. Tests: `tests/test_withdrawal_policy.py` (25) + `tests/test_withdrawal_bot.py` (6).
 
 ---
 
