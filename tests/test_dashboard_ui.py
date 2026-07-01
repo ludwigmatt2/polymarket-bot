@@ -6,9 +6,6 @@ Run:
   pytest tests/test_dashboard_ui.py -v            # headless
 """
 
-import socket
-from urllib.parse import urlparse
-
 import pytest
 
 # E2E deps are optional (see requirements.txt). Skip the whole module cleanly
@@ -21,18 +18,13 @@ from playwright.sync_api import Page, expect  # noqa: E402
 BASE = "http://localhost:8765"
 
 
-def _server_up(url: str) -> bool:
-    p = urlparse(url)
-    try:
-        with socket.create_connection((p.hostname, p.port or 80), timeout=0.5):
-            return True
-    except OSError:
-        return False
+@pytest.fixture(autouse=True)
+def _ensure_dashboard(dashboard_server):
+    """Start (or reuse) a dashboard server for every test in this module.
 
-
-# Live-browser E2E: without the dashboard running these can't pass, so skip.
-if not _server_up(BASE):
-    pytest.skip(f"dashboard server not running at {BASE}", allow_module_level=True)
+    Uses the session-scoped fixture in conftest.py; a fresh server means clean
+    scan-counter state, and tests self-skip if E2E deps or the server are absent."""
+    return dashboard_server
 
 
 @pytest.fixture(scope="session")
@@ -93,7 +85,9 @@ def test_controls_render(page: Page):
     expect(page.locator("#ctrl-scan")).to_be_visible()
     expect(page.locator("#ctrl-toggle")).to_be_visible()
     expect(page.locator("#ctrl-interval")).to_be_visible()
-    expect(page.locator("#ctrl-scan-counter")).to_contain_text("Scans: 0")
+    # Counter renders; don't assert an absolute value (scan_count is server-global
+    # and accumulates across the server's lifetime).
+    expect(page.locator("#ctrl-scan-counter")).to_contain_text("Scans:")
 
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────
@@ -136,13 +130,25 @@ def test_scan_now_button_triggers_scan(page: Page):
     assert any("/api/scan" in u for u in scan_fired), "POST /api/scan was not called"
 
 
+def _scan_count(page: Page) -> int:
+    return int(page.locator("#ctrl-scan-counter").inner_text().split(":")[1].strip())
+
+
 def test_scan_counter_increments(page: Page):
-    """After a scan, the scan counter should show Scans: 1."""
+    """Triggering a scan bumps the server-side scan counter by one.
+
+    The counter increments synchronously when the scan is triggered (before the
+    scan itself runs), so we assert the delta after a reload — which rehydrates
+    the counter from the server's on-connect status. This is robust to scan
+    duration and to the scan_count being server-global/accumulating."""
     page.goto(BASE)
     page.wait_for_timeout(500)
+    before = _scan_count(page)
     page.locator("#ctrl-scan").click()
-    # Wait for WS scan_started message to update counter
-    expect(page.locator("#ctrl-scan-counter")).to_have_text("Scans: 1", timeout=5000)
+    page.wait_for_timeout(1500)  # let POST /api/scan reach the server (count bumps immediately)
+    page.reload()
+    page.wait_for_timeout(500)
+    assert _scan_count(page) == before + 1
 
 
 # ── API endpoints (lightweight smoke) ────────────────────────────────────────
