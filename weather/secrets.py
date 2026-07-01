@@ -3,7 +3,8 @@ Encrypted-at-rest storage for per-user Polymarket credentials.
 
 Backend priority:
   1. keyring  — OS keychain (macOS Keychain, GNOME Keyring, Windows Credential Locker)
-  2. fernet   — AES-128 symmetric encryption; key read from POLYMARKET_SECRETS_KEY in .env
+  2. fernet   — AES-128 symmetric encryption; master key from a systemd
+                LoadCredential ($CREDENTIALS_DIRECTORY) if present, else POLYMARKET_SECRETS_KEY
      Blobs stored in config/user_keys.enc.json
 
 Each user's creds are stored as an encrypted JSON object:
@@ -59,11 +60,32 @@ def _migrate_legacy_creds(creds: dict) -> dict:
     return creds
 
 
+def _secrets_key() -> str:
+    """Return the master Fernet key.
+
+    Priority (SECURITY_PLAN Phase E):
+      1. systemd LoadCredential — read from $CREDENTIALS_DIRECTORY/polymarket_secrets_key.
+         Keeps the key out of the app's .env and off the app dir; systemd exposes it
+         to this service only, via a private tmpfs.
+      2. POLYMARKET_SECRETS_KEY env var (bootstrap / non-systemd environments).
+    Read fresh (not cached) so a rotation via service restart is picked up.
+    """
+    cred_dir = os.environ.get("CREDENTIALS_DIRECTORY")
+    if cred_dir:
+        try:
+            val = (Path(cred_dir) / "polymarket_secrets_key").read_text().strip()
+            if val:
+                return val
+        except OSError:
+            pass
+    return os.environ.get("POLYMARKET_SECRETS_KEY", "").strip()
+
+
 @functools.lru_cache(maxsize=1)
 def _get_keyring():
     # Skip keyring when a Fernet key is configured — Fernet is portable across
-    # all environments (including headless Linux containers on Railway).
-    if os.environ.get("POLYMARKET_SECRETS_KEY"):
+    # all environments (including headless Linux containers / systemd services).
+    if _secrets_key():
         return None
     try:
         import keyring as _kr
@@ -80,7 +102,7 @@ def _get_keyring():
 
 @functools.lru_cache(maxsize=1)
 def _get_fernet():
-    key = os.environ.get("POLYMARKET_SECRETS_KEY", "").strip()
+    key = _secrets_key()
     if not key:
         return None
     try:
