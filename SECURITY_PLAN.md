@@ -107,16 +107,38 @@ master key.
 
 ---
 
-## Phase E — VPS / infra hardening
+## Phase E — VPS / infra hardening ✅ MOSTLY COMPLETE (2026-07-01)
 
-- [ ] E1. Confirm/enable full-disk encryption (LUKS) on the VPS. If not possible post-install, at minimum encrypt the `data/` volume.
-- [ ] E2. SSH: key-only auth (`PasswordAuthentication no`), non-root login, `fail2ban`.
-- [ ] E3. `ufw` firewall — outbound only what's needed; no inbound except SSH.
-- [ ] E4. `unattended-upgrades` for security patches; pin Python deps + enable Dependabot/`pip-audit` in the repo.
-- [ ] E5. Run the bot as non-root `bot` user (already the case per `polymarket-bot.service`) — verify no writable paths outside `data/`.
-- [ ] E6. Move `POLYMARKET_SECRETS_KEY` out of `.env` into **systemd `LoadCredential=`** (or `sops`/`age`/a KMS), so reading `.env` alone doesn't yield the master key. Update `secrets.py` to read from the credential path if present, falling back to env.
+- [~] E1. **Disk encryption — NOT enabled** (assessed: no LUKS devices; the Hetzner VPS
+  disk is unencrypted). Full-disk encryption can't be added to a running instance —
+  it needs a reprovision (Hetzner: install with LUKS, or use an encrypted-image/rescue
+  flow). **Deferred**; the mitigation meanwhile is that the master key is not on the
+  app volume in `.env` (E6) and backups are encrypted (D4). RECOMMEND reprovisioning
+  with disk encryption before holding material funds.
+- [x] E2. **SSH already key-only** — `PasswordAuthentication no`, `KbdInteractive no`,
+  `PubkeyAuthentication yes`. Root login is `prohibit-password` (key-only). NOT disabling
+  root login: it's the *only* SSH access path (no other sudo user) — disabling it with no
+  console fallback risks lockout. Added **fail2ban** (sshd jail active — 115 IPs banned).
+  RECOMMEND (manual, careful): create a non-root sudo user with a key, verify, then set
+  `PermitRootLogin no`.
+- [x] E3. **ufw active** — default deny incoming / allow outgoing; only OpenSSH allowed
+  inbound (verified). Nothing else listens externally (bot has no inbound; dashboard is
+  local-only).
+- [x] E4. **unattended-upgrades** enabled (auto security patches) + **fail2ban** enabled.
+  Deps pinned; ran **pip-audit** → found `cryptography 48.0.0` (the Fernet/master-key
+  cipher) vulnerable to GHSA-537c-gmf6-5ccf → upgraded to **48.0.1** (VPS + requirements.txt);
+  re-audit clean (0 vulns).
+- [x] E5. Runs as non-root **`bot`**; added systemd sandboxing (`NoNewPrivileges`,
+  `PrivateTmp`, `ProtectHome`, `ProtectSystem=full`, `ProtectKernelTunables`,
+  `ProtectControlGroups`, `RestrictSUIDSGID`); data dir stays writable, bot verified healthy.
+- [x] E6. **Master key moved to systemd `LoadCredential`** — `secrets.py` reads
+  `$CREDENTIALS_DIRECTORY/polymarket_secrets_key` first, falls back to env. Key file at
+  `/etc/polymarket-bot/secrets_key` (root-only 600); `POLYMARKET_SECRETS_KEY` **removed
+  from `.env`**. Verified: store decrypts credential-only (no env var).
 
-**Acceptance:** master key not recoverable from `.env` alone; disk encrypted; SSH hardened; automated patching on.
+**Acceptance:** ✅ master key not recoverable from `.env` (E6); SSH key-only + fail2ban +
+ufw (E2/E3); automated patching on and the one known dep vuln patched (E4); service
+sandboxed + non-root (E5). ⚠️ disk encryption deferred to a reprovision (E1).
 
 ---
 

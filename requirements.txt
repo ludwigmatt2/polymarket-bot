@@ -15,7 +15,7 @@ fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 aiofiles>=24.1.0
 keyring==25.7.0
-cryptography==48.0.0
+cryptography==48.0.1  # 48.0.1 patches GHSA-537c-gmf6-5ccf (Fernet/master-key cipher)
 eth-account>=0.13
 # Deposit-wallet (V2) relayer ops — gasless deploy/wrap/approve/redeem/withdraw
 py-builder-relayer-client
