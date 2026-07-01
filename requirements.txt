@@ -7,6 +7,10 @@ scipy==1.17.1
 scikit-learn==1.8.0
 pytest>=8.0.0
 pytest-mock>=3.12.0
+# Dashboard E2E tests (optional). After install run: playwright install chromium
+# Tests self-skip if these are absent or the dashboard isn't running.
+playwright>=1.48.0
+pytest-playwright>=0.5.0
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 aiofiles>=24.1.0

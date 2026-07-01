@@ -6,10 +6,32 @@ Run:
   pytest tests/test_globe_upgrade.py -v -s --headed   # visible browser
 """
 
+import socket
+from urllib.parse import urlparse
+
 import pytest
-from playwright.sync_api import Page, expect
+
+# E2E deps are optional (see requirements.txt). Skip the whole module cleanly
+# rather than erroring at collection when they're absent.
+pytest.importorskip("pytest_playwright", reason="E2E deps not installed")
+pytest.importorskip("playwright.sync_api", reason="E2E deps not installed")
+from playwright.sync_api import Page, expect  # noqa: E402
 
 BASE = "http://localhost:8765"
+
+
+def _server_up(url: str) -> bool:
+    p = urlparse(url)
+    try:
+        with socket.create_connection((p.hostname, p.port or 80), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+# Live-browser E2E: without the dashboard running these can't pass, so skip.
+if not _server_up(BASE):
+    pytest.skip(f"dashboard server not running at {BASE}", allow_module_level=True)
 
 FAKE_SIGNAL = {
     "city": "Tokyo",
