@@ -46,6 +46,7 @@ load_dotenv()
 
 ROOT          = Path(__file__).parent
 from weather.paths import DATA_DIR
+from weather import permissions as perms
 USERS_FILE    = DATA_DIR / "config" / "users.json"
 WALLET_FILE   = DATA_DIR / "logs" / "wallet.json"
 
@@ -137,17 +138,24 @@ def _seed_volume_data() -> None:
 
 
 def _seed_admin() -> None:
+    """Ensure the primary admin (TELEGRAM_ADMIN_ID) exists and is always `owner`.
+
+    Owner is the only role that can mint other admins/owners, so the bootstrap
+    account must hold it — including upgrading a legacy `admin` seed in place."""
     with _users_lock:
         users = _load_users()
         if ADMIN_ID not in users:
             users[ADMIN_ID] = {
-                "role": "admin",
+                "role": perms.OWNER,
                 "username": "owner",
                 "added_at": datetime.utcnow().isoformat(),
                 "private_key": None,
                 "proxy_address": None,
                 "mode": "paper",
             }
+            _save_users(users)
+        elif users[ADMIN_ID].get("role") != perms.OWNER:
+            users[ADMIN_ID]["role"] = perms.OWNER  # migrate legacy admin → owner
             _save_users(users)
 
 
@@ -179,17 +187,28 @@ def get_user_private_key(uid: int) -> Optional[str]:
 def get_role(user_id: int) -> Optional[str]:
     return _load_users().get(user_id, {}).get("role")
 
+def get_permission_overrides(user_id: int) -> list[str]:
+    """Per-user extra capabilities granted beyond their role (see users.json)."""
+    return _load_users().get(user_id, {}).get("permissions_override") or []
+
 def is_admin(user_id: int) -> bool:
-    return get_role(user_id) == "admin"
+    return get_role(user_id) in perms.ADMIN_ROLES
 
 def is_authorized(user_id: int) -> bool:
-    return get_role(user_id) in ("admin", "viewer")
+    return get_role(user_id) in perms.AUTHORIZED_ROLES
+
+def has_permission(user_id: int, capability: str) -> bool:
+    """True if the user's role grants `capability`, or it's in their per-user
+    permissions_override list. Suspended/unknown users have no capabilities."""
+    if perms.role_has(get_role(user_id), capability):
+        return True
+    return capability in get_permission_overrides(user_id)
 
 def all_user_ids() -> list[int]:
     return list(_load_users().keys())
 
 
-# ── Auth decorator ────────────────────────────────────────────────────────────
+# ── Auth decorators ────────────────────────────────────────────────────────────
 
 def require_auth(admin_only: bool = False):
     def decorator(fn):
@@ -202,6 +221,27 @@ def require_auth(admin_only: bool = False):
                 return
             if admin_only and not is_admin(uid):
                 await update.effective_message.reply_text("🚫 Admin only.")
+                return
+            return await fn(update, ctx)
+        return wrapper
+    return decorator
+
+
+def require_perm(capability: str):
+    """Gate a handler on a single RBAC capability. Authorized-but-lacking → a
+    friendly refusal; unauthorized/suspended → the standard not-authorized notice."""
+    def decorator(fn):
+        async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+            uid = update.effective_user.id
+            if not is_authorized(uid):
+                await update.effective_message.reply_text(
+                    "🚫 Not authorized. Ask an admin to add you with /adduser."
+                )
+                return
+            if not has_permission(uid, capability):
+                await update.effective_message.reply_text(
+                    "🚫 You don't have permission to do that."
+                )
                 return
             return await fn(update, ctx)
         return wrapper
@@ -657,11 +697,12 @@ def main_kb(uid: int) -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton("📋 Trades",       callback_data="trades")],
     ]
-    if is_admin(uid):
+    if has_permission(uid, perms.TRIGGER_SCAN):
         rows.append([
             InlineKeyboardButton("🔍 Scan",    callback_data="scan"),
             InlineKeyboardButton("✅ Resolve", callback_data="resolve"),
         ])
+    if has_permission(uid, perms.MANAGE_USERS):
         rows.append([InlineKeyboardButton("👥 Users", callback_data="users")])
     return InlineKeyboardMarkup(rows)
 
@@ -743,10 +784,13 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if is_admin(uid):
         lines += [
             "\n*Admin*",
-            "/invite [admin|viewer] — create an invite link",
-            "/adduser <id> [admin|viewer] — add user",
+            "/invite [admin|trader|viewer] — create an invite link",
+            "/adduser <id> [admin|trader|viewer] — add user",
             "/removeuser <id> — remove user",
+            "/setrole <id> <role> — change a user's role",
+            "/suspend <id> · /unsuspend <id> — block / restore access",
             "/users — list users",
+            "/setmaxbet <usd> — set global max bet per trade",
             "/setup <key> [proxy] — save credentials (legacy)",
         ]
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
@@ -851,7 +895,7 @@ async def cmd_losses(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         telegram_views.fmt_losses(rows, n), reply_markup=main_kb(uid), parse_mode="Markdown",
     )
 
-@require_auth()
+@require_perm(perms.DEPOSIT_OWN)
 async def cmd_deposit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Record a deposit. Usage: /deposit <amount> [note]"""
     if not ctx.args:
@@ -878,7 +922,7 @@ async def cmd_deposit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
 
-@require_auth()
+@require_perm(perms.WITHDRAW_OWN)
 async def cmd_withdraw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Withdraw real pUSD off-chain as USDC.e to an external address (gasless via
     the relayer). Usage: /withdraw <amount|all> <0xADDRESS>"""
@@ -950,7 +994,7 @@ async def cmd_withdraw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
 
-@require_auth(admin_only=True)
+@require_perm(perms.SET_MAXBET)
 async def cmd_setmaxbet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     from weather.config import MAX_LIVE_TRADE_USD
     from weather.live_trader import _RUNTIME_CONFIG
@@ -996,7 +1040,7 @@ async def cmd_setmaxbet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 @require_auth()
 async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not is_admin(uid):
+    if not has_permission(uid, perms.BYPASS_SCAN_COOLDOWN):
         wait = _scan_cooldown_remaining(uid)
         if wait > 0:
             await update.effective_message.reply_text(
@@ -1033,7 +1077,7 @@ async def cmd_resolve(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         summary = next((l for l in stdout.splitlines() if "Auto-resolved" in l), "Done.")
         await msg.edit_text(f"✅ {summary.strip()}", reply_markup=main_kb(uid))
 
-@require_auth(admin_only=True)
+@require_perm(perms.USE_LEGACY_SETUP)
 async def cmd_setup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not ctx.args:
@@ -1131,7 +1175,13 @@ async def cmd_mymode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Mode set to 🟡 PAPER", parse_mode="Markdown")
         return
 
-    # live: global model gate + own credentials + explicit risk confirmation
+    # live: capability + global model gate + own credentials + explicit risk confirmation
+    if not has_permission(uid, perms.GO_LIVE):
+        await update.message.reply_text(
+            "🚫 Your role can't switch to live trading. Ask an admin for `trader` access.",
+            parse_mode="Markdown",
+        )
+        return
     if not (get_user_key(uid) or get_user_private_key(uid)):
         await update.message.reply_text(
             "❌ No wallet connected yet — run /wallet\\_setup first.", parse_mode="Markdown"
@@ -1160,7 +1210,7 @@ async def cmd_mymode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
 
-@require_auth(admin_only=True)
+@require_perm(perms.VIEW_USERS)
 async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     users = _load_users()
     lines = ["*👥 Registered Users*\n"]
@@ -1168,19 +1218,29 @@ async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"`{uid}` — {info['role']} (@{info.get('username') or '?'})")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-@require_auth(admin_only=True)
+@require_perm(perms.MANAGE_USERS)
 async def cmd_adduser(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    actor = update.effective_user.id
+    grantable = sorted(perms.assignable_roles(get_role(actor)) - {perms.SUSPENDED})
     if not ctx.args:
-        await update.message.reply_text("Usage: /adduser <telegram_id> [admin|viewer]")
+        await update.message.reply_text(
+            f"Usage: /adduser <telegram_id> [{'|'.join(grantable)}]"
+        )
         return
     try:
         new_id = int(ctx.args[0])
     except ValueError:
         await update.message.reply_text("❌ Invalid ID — must be a number.")
         return
-    role = "viewer"
-    if len(ctx.args) > 1 and ctx.args[1] in ("admin", "viewer"):
-        role = ctx.args[1]
+    role = perms.VIEWER
+    if len(ctx.args) > 1:
+        role = ctx.args[1].lower()
+    if not perms.can_assign_role(get_role(actor), role):
+        await update.message.reply_text(
+            f"🚫 You can't assign role `{role}`. Allowed: {', '.join(grantable)}.",
+            parse_mode="Markdown",
+        )
+        return
     with _users_transaction() as users:
         users[new_id] = {
             "role": role, "username": "", "added_at": datetime.utcnow().isoformat(),
@@ -1190,7 +1250,7 @@ async def cmd_adduser(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"✅ Added `{new_id}` as `{role}`.", parse_mode="Markdown"
     )
 
-@require_auth(admin_only=True)
+@require_perm(perms.MANAGE_USERS)
 async def cmd_removeuser(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         await update.message.reply_text("Usage: /removeuser <telegram_id>")
@@ -1200,8 +1260,12 @@ async def cmd_removeuser(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("❌ Invalid ID.")
         return
-    if rm_id == ADMIN_ID:
-        await update.message.reply_text("❌ Cannot remove the primary admin.")
+    if rm_id == ADMIN_ID or get_role(rm_id) == perms.OWNER:
+        await update.message.reply_text("❌ Cannot remove the owner.")
+        return
+    # Only the owner may remove another admin.
+    if get_role(rm_id) == perms.ADMIN and get_role(update.effective_user.id) != perms.OWNER:
+        await update.message.reply_text("🚫 Only the owner can remove an admin.")
         return
     with _users_lock:
         users = _load_users()
@@ -1213,6 +1277,119 @@ async def cmd_removeuser(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("User not found.")
         return
     await update.message.reply_text(f"✅ Removed `{rm_id}`.", parse_mode="Markdown")
+
+
+def _parse_target_uid(ctx) -> "int | None":
+    try:
+        return int(ctx.args[0])
+    except (IndexError, ValueError):
+        return None
+
+
+@require_perm(perms.MANAGE_ROLES)
+async def cmd_setrole(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    actor = update.effective_user.id
+    actor_role = get_role(actor)
+    assignable = sorted(perms.assignable_roles(actor_role))
+    if len(ctx.args) < 2:
+        await update.message.reply_text(
+            f"Usage: /setrole <telegram_id> <{'|'.join(assignable)}>"
+        )
+        return
+    target = _parse_target_uid(ctx)
+    if target is None:
+        await update.message.reply_text("❌ Invalid ID — must be a number.")
+        return
+    new_role = ctx.args[1].lower()
+
+    if target == actor:
+        await update.message.reply_text("🚫 You can't change your own role.")
+        return
+    if target == ADMIN_ID or get_role(target) == perms.OWNER:
+        await update.message.reply_text("❌ The owner's role is fixed.")
+        return
+    if get_role(target) is None:
+        await update.message.reply_text("User not found. Add them first with /adduser.")
+        return
+    # Touching an existing admin (promote away or demote) is owner-only.
+    if get_role(target) == perms.ADMIN and actor_role != perms.OWNER:
+        await update.message.reply_text("🚫 Only the owner can change an admin's role.")
+        return
+    if not perms.can_assign_role(actor_role, new_role):
+        await update.message.reply_text(
+            f"🚫 You can't assign `{new_role}`. Allowed: {', '.join(assignable)}.",
+            parse_mode="Markdown",
+        )
+        return
+    with _users_transaction() as users:
+        users.setdefault(target, {})["role"] = new_role
+        users[target].pop("role_before_suspend", None)
+    await update.message.reply_text(
+        f"✅ `{target}` is now `{new_role}`.", parse_mode="Markdown"
+    )
+
+
+def _guard_target_manageable(actor: int, target: "int | None") -> "str | None":
+    """Shared guard for suspend/unsuspend. Returns an error string, or None if OK."""
+    if target is None:
+        return "❌ Invalid ID — must be a number."
+    if target == actor:
+        return "🚫 You can't do that to yourself."
+    if target == ADMIN_ID or get_role(target) == perms.OWNER:
+        return "❌ The owner cannot be suspended."
+    if get_role(target) is None:
+        return "User not found."
+    if get_role(target) == perms.ADMIN and get_role(actor) != perms.OWNER:
+        return "🚫 Only the owner can suspend an admin."
+    return None
+
+
+@require_perm(perms.MANAGE_USERS)
+async def cmd_suspend(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    actor = update.effective_user.id
+    target = _parse_target_uid(ctx)
+    if not ctx.args:
+        await update.message.reply_text("Usage: /suspend <telegram_id>")
+        return
+    err = _guard_target_manageable(actor, target)
+    if err:
+        await update.message.reply_text(err)
+        return
+    if get_role(target) == perms.SUSPENDED:
+        await update.message.reply_text("Already suspended.")
+        return
+    with _users_transaction() as users:
+        prev = users[target].get("role", perms.VIEWER)
+        users[target]["role_before_suspend"] = prev
+        users[target]["role"] = perms.SUSPENDED
+    await update.message.reply_text(
+        f"🚫 `{target}` suspended (was `{prev}`). Restore with /unsuspend.",
+        parse_mode="Markdown",
+    )
+
+
+@require_perm(perms.MANAGE_USERS)
+async def cmd_unsuspend(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    actor = update.effective_user.id
+    target = _parse_target_uid(ctx)
+    if not ctx.args:
+        await update.message.reply_text("Usage: /unsuspend <telegram_id>")
+        return
+    if target is None:
+        await update.message.reply_text("❌ Invalid ID — must be a number.")
+        return
+    if get_role(target) != perms.SUSPENDED:
+        await update.message.reply_text("User is not suspended.")
+        return
+    with _users_transaction() as users:
+        prev = users[target].pop("role_before_suspend", perms.VIEWER)
+        # Restoring an elevated role is owner-only; admins restore to viewer.
+        if prev in perms.ADMIN_ROLES and get_role(actor) != perms.OWNER:
+            prev = perms.VIEWER
+        users[target]["role"] = prev
+    await update.message.reply_text(
+        f"✅ `{target}` restored to `{prev}`.", parse_mode="Markdown"
+    )
 
 
 # ── Callback handler (inline buttons) ─────────────────────────────────────────
@@ -1245,6 +1422,9 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             fmt_trades(uid), reply_markup=why_kb(uid) or main_kb(uid), parse_mode="Markdown"
         )
     elif data.startswith("liveconfirm"):
+        if not has_permission(uid, perms.GO_LIVE):
+            await q.edit_message_text("🚫 Your role can't switch to live trading.", reply_markup=main_kb(uid))
+            return
         # One-time token: rejects a stale confirm button from an earlier prompt
         # (or one left over across a bot restart) so it can't flip mode to live.
         token    = data.split(":", 1)[1] if ":" in data else ""
@@ -1297,6 +1477,9 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=main_kb(uid), parse_mode="Markdown",
         )
     elif data.startswith("withdrawconfirm"):
+        if not has_permission(uid, perms.WITHDRAW_OWN):
+            await q.edit_message_text("🚫 Your role can't withdraw.", reply_markup=main_kb(uid))
+            return
         token = data.split(":", 1)[1] if ":" in data else ""
         pending = ctx.user_data.pop("withdraw_pending", None)
         if not pending or token != pending.get("token"):
@@ -1345,13 +1528,13 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(
                 telegram_views.fmt_why(row), reply_markup=back_kb(), parse_mode="Markdown"
             )
-    elif data == "scan" and is_admin(uid):
+    elif data == "scan" and has_permission(uid, perms.TRIGGER_SCAN):
         await q.edit_message_text(
             "🔍 *Trigger scan?*\nFetches live forecasts and evaluates all markets (~2–3 min).",
             reply_markup=confirm_kb("scan", "Run scan"),
             parse_mode="Markdown",
         )
-    elif data == "scan_confirm" and is_admin(uid):
+    elif data == "scan_confirm" and has_permission(uid, perms.TRIGGER_SCAN):
         await q.edit_message_text("🔍 Scanning Polymarket...")
         stdout, stderr, rc = await run_bot_async("paper", uid)
         if rc == -2:
@@ -1364,13 +1547,13 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             summary = next((l for l in stdout.splitlines() if "evaluated" in l), "Scan complete.")
             await q.edit_message_text(f"✅ {summary.strip()}", reply_markup=main_kb(uid))
-    elif data == "resolve" and is_admin(uid):
+    elif data == "resolve" and has_permission(uid, perms.TRIGGER_SCAN):
         await q.edit_message_text(
             "✅ *Trigger auto-resolve?*\nResolves all pending paper trades that are due.",
             reply_markup=confirm_kb("resolve", "Run resolve"),
             parse_mode="Markdown",
         )
-    elif data == "resolve_confirm" and is_admin(uid):
+    elif data == "resolve_confirm" and has_permission(uid, perms.TRIGGER_SCAN):
         await q.edit_message_text("⏳ Running auto-resolve...")
         stdout, stderr, rc = await run_bot_async("auto-resolve", uid)
         if rc == -2:
@@ -1383,7 +1566,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             summary = next((l for l in stdout.splitlines() if "Auto-resolved" in l), "Done.")
             await q.edit_message_text(f"✅ {summary.strip()}", reply_markup=main_kb(uid))
-    elif data == "users" and is_admin(uid):
+    elif data == "users" and has_permission(uid, perms.MANAGE_USERS):
         users = _load_users()
         lines = ["*👥 Registered Users*\n"]
         for u_id, info in users.items():
@@ -1546,10 +1729,18 @@ _ADMIN_COMMANDS = _USER_COMMANDS + [
     ("invite",      "🎟 Generate an invite link"),
     ("adduser",     "➕ Add a user by Telegram ID"),
     ("removeuser",  "➖ Remove a user"),
+    ("setrole",     "🎚 Change a user's role"),
+    ("suspend",     "🚫 Suspend a user"),
+    ("unsuspend",   "✅ Restore a suspended user"),
     ("users",       "👥 List all registered users"),
     ("setup",       "⚙️ Save credentials (legacy)"),
     ("setmaxbet",   "💰 Set max bet size per trade (e.g. /setmaxbet 50)"),
 ]
+
+def _commands_for_role(role: str | None) -> list[tuple[str, str]]:
+    """Command menu shown to a user, by role. Admins/owner see the admin set;
+    everyone else sees the base user set."""
+    return _ADMIN_COMMANDS if role in perms.ADMIN_ROLES else _USER_COMMANDS
 
 async def handle_admin_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Admin sends a data file as Telegram document → saved to DATA_DIR/logs/."""
@@ -1610,13 +1801,19 @@ async def _auto_resolve(ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _register_commands(app) -> None:
     from telegram import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeChat
-    user_cmds  = [BotCommand(c, d) for c, d in _USER_COMMANDS]
-    admin_cmds = [BotCommand(c, d) for c, d in _ADMIN_COMMANDS]
+    # Default menu (unknown / new chats) = base user commands.
+    user_cmds = [BotCommand(c, d) for c, d in _USER_COMMANDS]
     await app.bot.set_my_commands(user_cmds, scope=BotCommandScopeAllPrivateChats())
-    try:
-        await app.bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(ADMIN_ID))
-    except Exception:
-        pass  # admin not yet started the chat — will update on next restart
+    # Per-user override: owner/admin get the admin menu in their own chat.
+    # (Non-admins keep the default base menu, so no per-user call needed.)
+    for uid in all_user_ids():
+        if get_role(uid) not in perms.ADMIN_ROLES:
+            continue
+        cmds = [BotCommand(c, d) for c, d in _commands_for_role(get_role(uid))]
+        try:
+            await app.bot.set_my_commands(cmds, scope=BotCommandScopeChat(uid))
+        except Exception:
+            pass  # user hasn't started the chat yet — updates on next restart
 
 
 async def _run() -> None:
@@ -1654,6 +1851,9 @@ async def _run() -> None:
         ("users",       cmd_users),
         ("adduser",     cmd_adduser),
         ("removeuser",  cmd_removeuser),
+        ("setrole",     cmd_setrole),
+        ("suspend",     cmd_suspend),
+        ("unsuspend",   cmd_unsuspend),
         ("setmaxbet",   cmd_setmaxbet),
     ]:
         app.add_handler(CommandHandler(cmd, handler))

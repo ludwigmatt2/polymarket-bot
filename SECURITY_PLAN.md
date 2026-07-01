@@ -19,39 +19,34 @@ _Status: proposed (2026-07-01). Bot runs paper 24/7 on Hetzner Helsinki VPS. No 
 
 ---
 
-## Phase A — `.env` cleanup & secret hygiene
+## Phase A — `.env` cleanup & secret hygiene ✅ COMPLETE (2026-07-01)
 
 **Goal:** remove per-user/legacy secrets from `.env`, lock down file perms, single source of truth for each value.
 
-- [ ] A1. Verify admin creds are in the encrypted store: `get_user_creds(ADMIN_ID)` returns a dict with `pk`. (One-off check on VPS.)
-- [ ] A2. Once A1 passes, **remove** `POLYMARKET_PRIVATE_KEY` and `POLYMARKET_FUNDER_ADDRESS` from VPS `.env`. Confirm bot still boots + reads creds from the store (they're only read by `_seed_admin_creds()` bootstrap, `telegram_bot.py:165`, and a fallback in `weather_bot.py:840` — audit that fallback path and route it through `get_user_creds` instead).
-- [ ] A3. Consolidate `ADMIN_ID` → `TELEGRAM_ADMIN_ID`. `weather_bot.py:746,827` read `ADMIN_ID`; `telegram_bot.py:79` reads `TELEGRAM_ADMIN_ID`. Pick one (`TELEGRAM_ADMIN_ID`), update `weather_bot.py`, delete the duplicate.
-- [ ] A4. `chmod 600 /opt/polymarket-bot/.env` and `chmod 600 data/config/*.json` (currently `644`). Ensure owned by `bot`. Add a startup assertion in `secrets.py` that warns if `user_keys.enc.json` is group/other-readable.
-- [ ] A5. Confirm `.env`, `data/`, `config/` are all git-ignored (`.gitignore` audit) — nothing secret ever committed.
-- [ ] A6. Document the final env contract in `README`/`.env.example` (names only): infra keys + `POLYMARKET_SECRETS_KEY` (master) + `BUILDER_*` (operator relayer). Mark which are required vs optional.
+- [x] A1. Verified admin creds in the encrypted store: `get_user_creds(admin)` returns pk + funder + sig=3 + L2 CLOB creds.
+- [x] A2. Removed `POLYMARKET_PRIVATE_KEY` + `POLYMARKET_FUNDER_ADDRESS` from VPS `.env`; bot boots + serves creds from the store. (The `weather_bot.py` env fallback only fires when the store is empty — verified it does not fire; left as a harmless one-time migration path for a brand-new admin.)
+- [x] A3. Consolidated `ADMIN_ID` → `TELEGRAM_ADMIN_ID` in `weather_bot.py` (×2), `validate_live_order.py`, `enable_deposit_wallet.py` (backward-compatible fallback); deployed via PR #2; removed `ADMIN_ID` from VPS `.env`.
+- [x] A4. `chmod 600` on `.env` + `data/config/*.json` (were `644`), owned by `bot`. _(Startup readability assertion in `secrets.py` folded into Phase F3.)_
+- [x] A5. `.env` + `config/` git-ignored, no secret files tracked; fixed stale `.gitignore` comment; added `.env.bak*`.
+- [x] A6. Rewrote `.env.example` to the real contract: documents `POLYMARKET_SECRETS_KEY` (master) + `BUILDER_*` (operator relayer); removed raw per-user key vars.
 
-**Acceptance:** `.env` contains zero per-user private keys; only infra + master key + builder creds. Bot boots and trades (paper) with keys served exclusively from the encrypted store. All secret files `600`.
+**Acceptance:** ✅ `.env` contains zero per-user private keys; only infra + master key + builder creds. Bot boots and paper-trades with keys served exclusively from the encrypted store. All secret files `600`. Service verified `active`, online, 0 poller conflicts post-change.
 
 ---
 
-## Phase B — Graded permissions (RBAC)
+## Phase B — Graded permissions (RBAC) ✅ COMPLETE (2026-07-01)
 
 **Goal:** replace binary admin/viewer with capability-based roles, managed at runtime (not env).
 
-- [ ] B1. Define roles → capabilities in code (new `weather/permissions.py`, version-controlled):
-  - `owner` — all caps incl. `manage_users`, `withdraw_any`, `set_global_config`
-  - `admin` — `manage_users`, `view_all`, `trigger_scan`; **not** `withdraw_any`
-  - `trader` — `go_live`, `deposit_own`, `withdraw_own`, `set_own_maxbet`
-  - `viewer` — read-only, paper only
-  - `suspended` — no caps (hard block)
-- [ ] B2. Add `has_permission(uid, cap) -> bool` and `require_perm(cap)` decorator. Keep `require_auth`/`is_admin` as thin shims over the new system during migration.
-- [ ] B3. Migrate handlers: replace the ~8 `admin_only=True` gates + inline `is_admin()` checks (`telegram_bot.py:660,743,999,1203,1348`) with explicit caps.
-- [ ] B4. Role lives in `users.json` (field already exists). Add per-user optional `permissions_override` list for exceptions.
-- [ ] B5. New admin commands: `/setrole <uid> <role>`, `/suspend <uid>`, `/unsuspend <uid>`. Guard: only `owner` can create another `admin`/`owner`; nobody can change their own role; `removeuser`/role-change on `ADMIN_ID`/owner is blocked (extend existing `telegram_bot.py:1203` guard).
-- [ ] B6. Invites already carry a role (`create_invite(role=…)`, `telegram_onboarding.py:71`) — expose role choice in `/invite` and validate it against allowed set.
-- [ ] B7. Command menu per role: `_register_commands` should show only the commands a user's role can run (extend `_ADMIN_COMMANDS`/`_USER_COMMANDS` into a role→commands map).
+- [x] B1. `weather/permissions.py` (pure, no telegram imports) defines roles `owner/admin/trader/viewer/suspended` → capability frozensets. `owner`=all incl. `withdraw_any`; `admin`=all except `withdraw_any`; `trader`=view/go_live/deposit_own/withdraw_own; `viewer`=view; `suspended`=∅.
+- [x] B2. `has_permission(uid, cap)` + `require_perm(cap)` decorator in telegram_bot.py; `is_admin`/`is_authorized` now derive from the role model (owner counts as admin). Primary admin auto-seeded/migrated to `owner`.
+- [x] B3. Migrated all gates: `@require_perm(...)` on setmaxbet/setup/users/adduser/removeuser/deposit/withdraw; inline `has_permission` on scan cooldown, main_kb buttons, on_button scan/resolve/users, and the live/withdraw confirm branches; `go_live` check added to `/mymode live`.
+- [x] B4. Per-user `permissions_override` list in users.json honored by `has_permission`.
+- [x] B5. `/setrole`, `/suspend`, `/unsuspend` with guards: owner-only to mint/alter admin/owner, no self-changes, owner/ADMIN_ID protected; suspend preserves prior role for restore.
+- [x] B6. `/invite` and `/adduser` validate the requested role via `can_assign_role` (admins can't mint admin/owner); accept `trader`.
+- [x] B7. Per-role command menu: `_register_commands` sets the admin menu per owner/admin chat, base menu as the default.
 
-**Acceptance:** a `viewer` cannot go live or withdraw; a `trader` can act only on their own funds; only `owner` can mint admins; suspended users are hard-blocked at the decorator. Unit tests for `has_permission` cover every role×cap.
+**Acceptance:** ✅ viewer can't go live/withdraw; trader acts only on own funds; only owner mints admins; suspended hard-blocked at the decorator. `tests/test_permissions.py` — 17 tests, full role×cap matrix + guards + override + wiring — all pass.
 
 ---
 
