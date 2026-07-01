@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from weather.config import MAX_ENSEMBLE_SPREAD, MIN_NET_EV_PP, ROUND_TRIP_FEE
+from weather.config import MAX_ENSEMBLE_SPREAD, MAX_ENTRY_DAYS_AHEAD, MIN_NET_EV_PP, ROUND_TRIP_FEE
 from weather.models import EnsembleForecast, Location, RawProbabilityResult, WeatherMarket
 from weather.signal_generator import SignalGenerator
 
@@ -187,7 +187,8 @@ class TestQualityGates:
     # Gate 1 — entry timing window
     def test_rejects_too_early(self):
         gen = _make_generator(model_p=0.80)
-        signal = gen.evaluate(_make_market(yes_price=0.30, days_out=7))  # > MAX_ENTRY_DAYS_AHEAD=5
+        too_far = MAX_ENTRY_DAYS_AHEAD + 2  # comfortably beyond the entry-timing gate
+        signal = gen.evaluate(_make_market(yes_price=0.30, days_out=too_far))
         assert signal.quality_gate_passed is False
         assert "gate1_too_early" in signal.rejection_reason
 
