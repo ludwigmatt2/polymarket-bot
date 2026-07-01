@@ -39,3 +39,6 @@ CLAUDE.md
 
 # ── macOS ──────────────────────────────────────────────────────────────────────
 .DS_Store
+
+# Local secret backups (Phase D) — never commit
+backups/

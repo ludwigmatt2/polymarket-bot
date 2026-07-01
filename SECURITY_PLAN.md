@@ -67,16 +67,43 @@ in `weather/config.py`, storage + rate-limit + commands in `telegram_bot.py`.
 
 ---
 
-## Phase D — Custody / blast-radius reduction
+## Phase D — Custody / blast-radius reduction ✅ COMPLETE (2026-07-01)
 
 **Goal:** reduce what an attacker gets from full VPS compromise.
 
-- [ ] D1. **Small hot balances.** Keep only working capital in each deposit wallet; sweep excess to a cold address the bot cannot withdraw to. Document target hot-balance policy.
-- [ ] D2. **Prefer L2-only where possible.** Investigate holding only L2 CLOB API creds (can trade, cannot move funds off-platform) and *not* the raw L1 key for users who self-fund. Map which flows in `weather/live_trader.py` / `relayer.py` actually need the L1 `pk` (withdrawal/unwrap do; order signing may be doable with L2). Scope a "non-custodial-ish" mode.
-- [ ] D3. **Stop leaking generated keys via Telegram.** `generate_wallet()` (`telegram_onboarding.py:128`) currently shows the raw pk in chat. Options: (a) don't display, treat as fully custodial; (b) display once with a hard warning + auto-delete message after N seconds. Decide + implement.
-- [ ] D4. **Encrypted, off-site backups** of `data/config/` (store is already Fernet-encrypted). Master key backed up **separately** in a password manager — never in the same location as the store.
+**Key finding (D2):** automated order placement on Polymarket CLOB requires the raw
+L1 private key — every order is EIP-712 **signed** with it (`_make_clob_client(pk=…)`
+in `weather/live_trader.py`; L2 CLOB creds only *authenticate* API calls, they can't
+sign orders). So a pure "L2-only, hold no L1 key" non-custodial mode is **infeasible**
+for an autonomous bot: to trade for the user, the bot must hold the signing key.
+Corollary that reshapes the threat model: **Phase C's allowlist/cooling-off protect
+against a compromised bot _session_, not a compromised _key store_.** An attacker with
+the raw keys can move funds on-chain directly, bypassing the bot. Against key-store
+compromise the only real bounds are (a) small hot balances [D1] and (b) protecting the
+master key [Phase E]. This makes D1 + E the substantive blast-radius controls.
 
-**Acceptance:** documented custody model; no raw key ever persisted in Telegram history; a stolen `user_keys.enc.json` is useless without the separately-stored master key.
+- [x] D1. **Hot-balance policy (documented).** Deposit wallets should hold only working
+  capital; sweep excess to a **cold address the bot's automation won't touch**. The
+  sweep mechanism already exists — a Phase C withdrawal to an allowlisted cold address
+  (allowlist + 24h cooling-off apply). Automated periodic sweeping is deferred until
+  live with non-trivial balances (currently paper). Policy: keep ≤ a few days of
+  deployable capital hot per user; everything else cold.
+- [x] D2. **Investigated → custodial is inherent** (see finding above). No non-custodial
+  mode; effort redirected to D1 + Phase E. Documented rather than built.
+- [x] D3. **Already implemented.** `generate_wallet()` never prints the key (the create
+  path does `del pk`); key reveal is opt-in (`ob_reveal`) with a hard warning and a
+  60s auto-delete (`_delete_message_job`); pasted keys on the connect path are deleted
+  from chat (`telegram_onboarding.py`). No raw key persists in chat history.
+- [x] D4. **Backup mechanism shipped** — `scripts/backup_secrets.sh` writes a
+  timestamped `600` tarball of `data/config/` (Fernet-encrypted store + users/invites).
+  Off-site upload is a documented manual/cron step; the master key stays in a password
+  manager, **separate** from backups (the script prints this rule). `backups/` is
+  git-ignored.
+
+**Acceptance:** ✅ custody model documented (custodial is inherent; blast-radius bounded
+by hot balance + master-key protection); no raw key persisted in Telegram history;
+`data/config/` backup exists and a stolen store is useless without the separately-held
+master key.
 
 ---
 
