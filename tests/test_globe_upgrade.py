@@ -6,9 +6,6 @@ Run:
   pytest tests/test_globe_upgrade.py -v -s --headed   # visible browser
 """
 
-import socket
-from urllib.parse import urlparse
-
 import pytest
 
 # E2E deps are optional (see requirements.txt). Skip the whole module cleanly
@@ -20,18 +17,10 @@ from playwright.sync_api import Page, expect  # noqa: E402
 BASE = "http://localhost:8765"
 
 
-def _server_up(url: str) -> bool:
-    p = urlparse(url)
-    try:
-        with socket.create_connection((p.hostname, p.port or 80), timeout=0.5):
-            return True
-    except OSError:
-        return False
-
-
-# Live-browser E2E: without the dashboard running these can't pass, so skip.
-if not _server_up(BASE):
-    pytest.skip(f"dashboard server not running at {BASE}", allow_module_level=True)
+@pytest.fixture(autouse=True)
+def _ensure_dashboard(dashboard_server):
+    """Start (or reuse) a dashboard server for every test in this module (see conftest)."""
+    return dashboard_server
 
 FAKE_SIGNAL = {
     "city": "Tokyo",
