@@ -529,14 +529,22 @@ async def on_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 # ── /invite (admin command, lives outside the conversation) ──────────────────
 
 async def cmd_invite(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    from weather import permissions as perms
     tb = _tb()
     uid = update.effective_user.id
-    if not tb.is_admin(uid):
+    if not tb.has_permission(uid, perms.MANAGE_USERS):
         await update.message.reply_text("🚫 Admin only.")
         return
-    role = "viewer"
-    if ctx.args and ctx.args[0] in ("admin", "viewer"):
-        role = ctx.args[0]
+    assignable = sorted(perms.assignable_roles(tb.get_role(uid)) - {perms.SUSPENDED})
+    role = perms.VIEWER
+    if ctx.args:
+        role = ctx.args[0].lower()
+    if not perms.can_assign_role(tb.get_role(uid), role):
+        await update.message.reply_text(
+            f"🚫 You can't invite role `{role}`. Allowed: {', '.join(assignable)}.",
+            parse_mode="Markdown",
+        )
+        return
     code = create_invite(created_by=uid, role=role)
     bot_username = (await ctx.bot.get_me()).username
     await update.message.reply_text(
