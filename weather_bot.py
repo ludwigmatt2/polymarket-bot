@@ -38,6 +38,7 @@ from weather.backtest import (
 from weather.live_backtest import LiveSignalBacktester
 from weather.market_scanner import WeatherMarketScanner
 from weather.city_bias import CityBiasCorrector
+from weather.paths import DATA_DIR
 from weather.models import Signal
 from weather.live_trader import LiveTrader, check_geoblock
 from weather.paper_trader import PaperTrader
@@ -47,12 +48,18 @@ from weather.probability_model import ProbabilityModel
 from weather.signal_generator import SignalGenerator
 from weather.weather_client import WeatherClient
 
+# All logs live under the persistent data dir (RAILWAY_VOLUME_MOUNT_PATH on the VPS,
+# repo root locally). Keep every writer here in sync with telegram_bot.py's readers,
+# which resolve the same DATA_DIR / "logs" — otherwise scans write one place and the
+# bot reads another (the cause of silent notifications + stale /status).
+DEFAULT_LOG_DIR = DATA_DIR / "logs"
+
 
 def run_scan(
     scanner: WeatherMarketScanner,
     generator: SignalGenerator,
     paper: PaperTrader | None,
-    log_dir: Path = Path("logs"),
+    log_dir: Path = DEFAULT_LOG_DIR,
     monitor: PositionMonitor | None = None,
     live_trader: "LiveTrader | None" = None,
     all_users: bool = False,
@@ -125,11 +132,11 @@ def run_scan(
     return signals
 
 
-USERS_FILE = Path(__file__).parent / "config" / "users.json"
+USERS_FILE = DATA_DIR / "config" / "users.json"
 
 
 def _load_registered_users() -> dict[int, dict]:
-    """Read config/users.json directly (no telegram import — runs under launchd)."""
+    """Read users.json directly (no telegram import — runs as a subprocess/launchd)."""
     import json
     import os
     if not USERS_FILE.exists():
@@ -156,9 +163,9 @@ def fan_out_to_users(actionable: list[Signal], funnel: dict | None = None) -> No
     if not users:
         return
     print(f"  Fan-out: mirroring {len(actionable)} signal(s) to {len(users)} user(s)...")
-    root_paper = PaperTrader()  # global gate: one model, one track record
+    root_paper = PaperTrader(log_path=DEFAULT_LOG_DIR / "paper_trades.csv")  # global gate: one model, one track record
     for uid, user in users.items():
-        user_dir = Path("logs") / "users" / str(uid)
+        user_dir = DEFAULT_LOG_DIR / "users" / str(uid)
         try:
             user_dir.mkdir(parents=True, exist_ok=True)
             user_paper = PaperTrader(log_path=user_dir / "paper_trades.csv")
@@ -260,7 +267,7 @@ def fan_out_auto_resolve(client: WeatherClient) -> None:
     """
     users = _load_registered_users()
     for uid in users:
-        user_dir = Path("logs") / "users" / str(uid)
+        user_dir = DEFAULT_LOG_DIR / "users" / str(uid)
         trades_csv = user_dir / "paper_trades.csv"
         if trades_csv.exists():
             try:
@@ -323,7 +330,7 @@ def _build_funnel(
 
 
 def _write_signals_file(
-    actionable: list[Signal], log_dir: Path = Path("logs"), funnel: dict | None = None,
+    actionable: list[Signal], log_dir: Path = DEFAULT_LOG_DIR, funnel: dict | None = None,
 ) -> None:
     import json
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -347,7 +354,7 @@ def _write_signals_file(
     out.write_text(json.dumps(payload))
 
 
-def _write_resolved_file(paper: "PaperTrader", resolved_count: int, log_dir: Path = Path("logs")) -> None:
+def _write_resolved_file(paper: "PaperTrader", resolved_count: int, log_dir: Path = DEFAULT_LOG_DIR) -> None:
     import csv as _csv
     import json
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -704,7 +711,7 @@ def main() -> None:
                         help="Live trading bankroll in USD for Kelly sizing (default: 500)")
     parser.add_argument("--city", type=str, default=None,
                         help="Filter markets by city name (debug mode only)")
-    parser.add_argument("--log-dir", type=Path, default=Path("logs"),
+    parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR,
                         help="Directory for trade logs and signal files (default: logs/)")
     parser.add_argument("--all-users", action="store_true",
                         help="After the root scan/resolve, mirror results to every "
