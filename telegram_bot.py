@@ -48,6 +48,7 @@ ROOT          = Path(__file__).parent
 from weather.paths import DATA_DIR
 from weather import permissions as perms
 from weather import withdrawal_policy as wpol
+from weather.audit import audit_log, read_audit
 USERS_FILE    = DATA_DIR / "config" / "users.json"
 WALLET_FILE   = DATA_DIR / "logs" / "wallet.json"
 
@@ -209,6 +210,35 @@ def all_user_ids() -> list[int]:
     return list(_load_users().keys())
 
 
+# ── Owner notifications (audit F2) ─────────────────────────────────────────────
+
+async def notify_owner(bot, text: str) -> None:
+    """Best-effort Telegram DM to the owner (ADMIN_ID). Never raises."""
+    try:
+        await bot.send_message(ADMIN_ID, text, parse_mode="Markdown")
+    except Exception:
+        pass
+
+# Throttle repeated alerts of the same kind per uid (seconds since last send).
+_alert_last: dict[tuple, float] = {}
+
+def _alert_throttled(key: tuple, window: float = 3600.0) -> bool:
+    """True if an alert with this key fired within `window` (and should be skipped)."""
+    now = _time.monotonic()
+    last = _alert_last.get(key, 0.0)
+    if now - last < window:
+        return True
+    _alert_last[key] = now
+    return False
+
+
+async def _maybe_alert_suspended(update, ctx) -> None:
+    uid = update.effective_user.id
+    if get_role(uid) == perms.SUSPENDED and not _alert_throttled(("suspended", uid)):
+        audit_log("suspended_access_attempt", actor=uid)
+        await notify_owner(ctx.bot, f"⚠️ Suspended user `{uid}` attempted an action.")
+
+
 # ── Auth decorators ────────────────────────────────────────────────────────────
 
 def require_auth(admin_only: bool = False):
@@ -216,6 +246,7 @@ def require_auth(admin_only: bool = False):
         async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             uid = update.effective_user.id
             if not is_authorized(uid):
+                await _maybe_alert_suspended(update, ctx)
                 await update.effective_message.reply_text(
                     "🚫 Not authorized. Ask an admin to add you with /adduser."
                 )
@@ -235,6 +266,7 @@ def require_perm(capability: str):
         async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             uid = update.effective_user.id
             if not is_authorized(uid):
+                await _maybe_alert_suspended(update, ctx)
                 await update.effective_message.reply_text(
                     "🚫 Not authorized. Ask an admin to add you with /adduser."
                 )
@@ -858,6 +890,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "/setrole <id> <role> — change a user's role",
             "/suspend <id> · /unsuspend <id> — block / restore access",
             "/users — list users",
+            "/audit [n] — recent audit log",
             "/setwithdrawcap <id> <usd> — set a user's daily withdrawal cap",
             "/setmaxbet <usd> — set global max bet per trade",
             "/setup <key> [proxy] — save credentials (legacy)",
@@ -1069,6 +1102,7 @@ async def cmd_withdraw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if decision.requires_code:
             code = f"{int.from_bytes(os.urandom(3), 'big') % 1_000_000:06d}"
             ctx.user_data["withdraw_code"] = {"code": code, "amount": amount, "to": to}
+            audit_log("withdrawal_large_requested", actor=uid, amount=amount, to=to)
             if uid != ADMIN_ID:  # owner oversight / audit trail on large withdrawals
                 try:
                     await ctx.bot.send_message(
@@ -1152,6 +1186,7 @@ async def cmd_allowlist_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     label = " ".join(ctx.args[1:])[:40]
     add_allowlist_entry(uid, addr, label)
+    audit_log("allowlist_add", actor=uid, address=addr, label=label or None)
     await update.message.reply_text(
         f"✅ Allowlisted `{addr}`.\n"
         f"⏳ Usable for withdrawals in {WITHDRAW_COOLING_OFF_HOURS:.0f}h "
@@ -1167,6 +1202,7 @@ async def cmd_allowlist_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: `/allowlist_remove <0xADDRESS>`", parse_mode="Markdown")
         return
     if remove_allowlist_entry(uid, ctx.args[0]):
+        audit_log("allowlist_remove", actor=uid, address=wpol.normalize_address(ctx.args[0]))
         await update.message.reply_text("✅ Removed from your allowlist.")
     else:
         await update.message.reply_text("Address not found in your allowlist.")
@@ -1187,6 +1223,7 @@ async def cmd_setwithdrawcap(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Cap must be between $0 and $100,000.")
         return
     set_withdraw_cap(target, usd)
+    audit_log("withdraw_cap_set", actor=update.effective_user.id, target=target, cap=usd)
     await update.message.reply_text(
         f"✅ Daily withdrawal cap for `{target}` set to *${usd:,.0f}*.", parse_mode="Markdown"
     )
@@ -1349,6 +1386,58 @@ def _log_startup() -> None:
     print(f"[startup] PYTHON_BIN  : {PYTHON}", flush=True)
 
 
+def _security_self_check() -> list[str]:
+    """Advisory boot-time checks (audit F3). Returns human-readable issue strings."""
+    from weather.secrets import get_user_creds
+    issues: list[str] = []
+
+    # 1. Sensitive files must not be group/other-accessible.
+    for label, p in (
+        (".env", ROOT / ".env"),
+        ("key store", USERS_FILE.parent / "user_keys.enc.json"),
+        ("users.json", USERS_FILE),
+    ):
+        try:
+            mode = p.stat().st_mode & 0o777
+            if mode & 0o077:
+                issues.append(f"{label} is group/other-accessible ({oct(mode)})")
+        except OSError:
+            pass
+
+    # 2. Master key should come from a systemd credential, not the env var.
+    if os.environ.get("POLYMARKET_SECRETS_KEY") and not os.environ.get("CREDENTIALS_DIRECTORY"):
+        issues.append("master key is in POLYMARKET_SECRETS_KEY env (prefer systemd LoadCredential)")
+
+    # 3. The owner should have stored credentials.
+    if not (get_user_creds(ADMIN_ID) or {}).get("pk"):
+        issues.append(f"owner {ADMIN_ID} has no stored key")
+
+    return issues
+
+
+async def _run_self_check(app) -> None:
+    try:
+        issues = _security_self_check()
+    except Exception:
+        return
+    audit_log("startup_selfcheck", issues=len(issues))
+    if issues:
+        body = "\n".join(f"  • {i}" for i in issues)
+        await notify_owner(app.bot, f"🛡 *Security self-check* found {len(issues)} issue(s):\n{body}")
+
+
+async def _on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Alert the owner on a getUpdates Conflict (duplicate poller) — throttled."""
+    from telegram.error import Conflict
+    if isinstance(ctx.error, Conflict):
+        if not _alert_throttled(("conflict",)):
+            await notify_owner(
+                ctx.bot,
+                "⚠️ Telegram *getUpdates Conflict* — another bot instance may be "
+                "polling the same token. Only one instance should run.",
+            )
+
+
 def _global_gate_check() -> tuple[bool, list[str]]:
     """One model, one track record: live unlocks on the ROOT paper log's gates."""
     from weather.paper_trader import PaperTrader as _PT
@@ -1416,6 +1505,37 @@ async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"`{uid}` — {info['role']} (@{info.get('username') or '?'})")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
+
+@require_perm(perms.MANAGE_USERS)
+async def cmd_audit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show recent audit-log entries (money moves, role/user changes, live flips)."""
+    n = 20
+    if ctx.args:
+        try:
+            n = min(100, max(1, int(ctx.args[0])))
+        except ValueError:
+            pass
+    recs = read_audit(n)
+    if not recs:
+        await update.message.reply_text("No audit entries yet.")
+        return
+    lines = [f"*🧾 Audit — last {len(recs)}*"]
+    for r in recs:
+        ts = str(r.get("ts", ""))[:19].replace("T", " ")
+        act = r.get("action", "?")
+        who = r.get("actor", "")
+        extra = ""
+        if "target" in r:
+            extra += f" → {r['target']}"
+        if r.get("new_role"):
+            extra += f" ({r['new_role']})"
+        if r.get("amount") is not None:
+            extra += f" ${r['amount']}"
+        if r.get("to"):
+            extra += f" → {r['to']}"
+        lines.append(f"`{ts}` {act} `{who}`{extra}")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
 @require_perm(perms.MANAGE_USERS)
 async def cmd_adduser(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     actor = update.effective_user.id
@@ -1444,6 +1564,9 @@ async def cmd_adduser(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "role": role, "username": "", "added_at": datetime.utcnow().isoformat(),
             "private_key": None, "proxy_address": None, "mode": "paper",
         }
+    audit_log("user_added", actor=actor, target=new_id, role=role)
+    if role in perms.ADMIN_ROLES:
+        await notify_owner(ctx.bot, f"➕ New *{role}* added: `{new_id}` by `{actor}`.")
     await update.message.reply_text(
         f"✅ Added `{new_id}` as `{role}`.", parse_mode="Markdown"
     )
@@ -1474,6 +1597,7 @@ async def cmd_removeuser(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not found:
         await update.message.reply_text("User not found.")
         return
+    audit_log("user_removed", actor=update.effective_user.id, target=rm_id)
     await update.message.reply_text(f"✅ Removed `{rm_id}`.", parse_mode="Markdown")
 
 
@@ -1522,6 +1646,9 @@ async def cmd_setrole(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     with _users_transaction() as users:
         users.setdefault(target, {})["role"] = new_role
         users[target].pop("role_before_suspend", None)
+    audit_log("role_change", actor=actor, target=target, new_role=new_role)
+    if new_role in perms.ADMIN_ROLES:
+        await notify_owner(ctx.bot, f"🎚 `{target}` set to *{new_role}* by `{actor}`.")
     await update.message.reply_text(
         f"✅ `{target}` is now `{new_role}`.", parse_mode="Markdown"
     )
@@ -1560,6 +1687,7 @@ async def cmd_suspend(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         prev = users[target].get("role", perms.VIEWER)
         users[target]["role_before_suspend"] = prev
         users[target]["role"] = perms.SUSPENDED
+    audit_log("suspend", actor=actor, target=target, prev_role=prev)
     await update.message.reply_text(
         f"🚫 `{target}` suspended (was `{prev}`). Restore with /unsuspend.",
         parse_mode="Markdown",
@@ -1585,6 +1713,7 @@ async def cmd_unsuspend(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if prev in perms.ADMIN_ROLES and get_role(actor) != perms.OWNER:
             prev = perms.VIEWER
         users[target]["role"] = prev
+    audit_log("unsuspend", actor=actor, target=target, restored_role=prev)
     await update.message.reply_text(
         f"✅ `{target}` restored to `{prev}`.", parse_mode="Markdown"
     )
@@ -1669,6 +1798,9 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         with _users_transaction() as users:
             users[uid]["mode"] = "live"
             users[uid]["live_confirmed_at"] = datetime.utcnow().isoformat()
+        audit_log("mode_live", actor=uid)
+        if uid != ADMIN_ID:
+            await notify_owner(ctx.bot, f"🟢 User `{uid}` switched to LIVE trading.")
         await q.edit_message_text(
             "🟢 *Mode set to LIVE.* Orders execute on the next scheduled scan.\n"
             "Switch back any time with `/mymode paper`." + prep_note,
@@ -1714,6 +1846,13 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 txh = result.get("transactionHash", "")
             append_wallet_transaction(uid, "withdraw", pending["amount"],
                                       f"on-chain USDC.e to {pending['to']}")
+            audit_log("withdrawal", actor=uid, amount=pending["amount"],
+                      to=pending["to"], tx=txh or None)
+            await notify_owner(
+                ctx.bot,
+                f"💸 Withdrawal executed\nuser `{uid}` · ${pending['amount']:,.2f} → `{pending['to']}`"
+                + (f"\ntx `{txh}`" if txh else ""),
+            )
             msg = (f"✅ *Withdrawal sent:* ${pending['amount']:,.2f} USDC.e → `{pending['to']}`")
             if txh:
                 msg += f"\ntx: `{txh}`"
@@ -1943,6 +2082,7 @@ _ADMIN_COMMANDS = _USER_COMMANDS + [
     ("suspend",     "🚫 Suspend a user"),
     ("unsuspend",   "✅ Restore a suspended user"),
     ("users",       "👥 List all registered users"),
+    ("audit",       "🧾 Recent audit log (money/role/live events)"),
     ("setwithdrawcap", "🔐 Set a user's daily withdrawal cap"),
     ("setup",       "⚙️ Save credentials (legacy)"),
     ("setmaxbet",   "💰 Set max bet size per trade (e.g. /setmaxbet 50)"),
@@ -2063,6 +2203,7 @@ async def _run() -> None:
         ("allowlist_add",    cmd_allowlist_add),
         ("allowlist_remove", cmd_allowlist_remove),
         ("users",       cmd_users),
+        ("audit",       cmd_audit),
         ("adduser",     cmd_adduser),
         ("removeuser",  cmd_removeuser),
         ("setrole",     cmd_setrole),
@@ -2078,10 +2219,12 @@ async def _run() -> None:
         handle_admin_upload,
     ))
     app.add_handler(CallbackQueryHandler(on_button))
+    app.add_error_handler(_on_error)
 
     async with app:
         await app.start()
         await _register_commands(app)
+        await _run_self_check(app)
         app.job_queue.run_repeating(check_alerts, interval=120, first=10)
 
         # Automatic scan + resolve — replace launchd on Railway.
