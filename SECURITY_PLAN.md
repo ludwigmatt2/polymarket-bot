@@ -115,12 +115,12 @@ master key.
   flow). **Deferred**; the mitigation meanwhile is that the master key is not on the
   app volume in `.env` (E6) and backups are encrypted (D4). RECOMMEND reprovisioning
   with disk encryption before holding material funds.
-- [x] E2. **SSH already key-only** — `PasswordAuthentication no`, `KbdInteractive no`,
-  `PubkeyAuthentication yes`. Root login is `prohibit-password` (key-only). NOT disabling
-  root login: it's the *only* SSH access path (no other sudo user) — disabling it with no
-  console fallback risks lockout. Added **fail2ban** (sshd jail active — 115 IPs banned).
-  RECOMMEND (manual, careful): create a non-root sudo user with a key, verify, then set
-  `PermitRootLogin no`.
+- [x] E2. **SSH fully hardened (2026-07-02).** `PasswordAuthentication no`, `KbdInteractive no`,
+  `PubkeyAuthentication yes`, **`PermitRootLogin no`**. Created non-root sudo user **`ludo`**
+  with its *own* dedicated key (`~/.ssh/pmbot_ludo`; NOPASSWD sudo); verified login + sudo,
+  then disabled root login (via a systemd auto-revert safety net). **fail2ban** sshd jail
+  active. Recovery path if `ludo`'s key is ever lost: Hetzner console → re-enable root login
+  (root's key is still present on the box). Local alias `pmbot` → `ludo`.
 - [x] E3. **ufw active** — default deny incoming / allow outgoing; only OpenSSH allowed
   inbound (verified). Nothing else listens externally (bot has no inbound; dashboard is
   local-only).
