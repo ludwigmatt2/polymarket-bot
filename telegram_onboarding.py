@@ -65,7 +65,7 @@ def _load_invites() -> dict:
 
 def _save_invites(invites: dict) -> None:
     INVITES_FILE.parent.mkdir(exist_ok=True)
-    atomic_write_text(INVITES_FILE, json.dumps(invites, indent=2))
+    atomic_write_text(INVITES_FILE, json.dumps(invites, indent=2), mode=0o600)
 
 
 def create_invite(created_by: int, role: str = "viewer") -> str:
