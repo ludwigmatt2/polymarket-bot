@@ -13,14 +13,16 @@ import os
 from pathlib import Path
 
 
-def atomic_write_text(path: Path, content: str) -> None:
+def atomic_write_text(path: Path, content: str, *, mode: int | None = None) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(content, encoding="utf-8")
+    if mode is not None:
+        os.chmod(tmp, mode)  # set perms before rename so the final file is never lax
     os.replace(tmp, path)
 
 
-def atomic_write_json(path: Path, data: object) -> None:
-    atomic_write_text(path, json.dumps(data, indent=2))
+def atomic_write_json(path: Path, data: object, *, mode: int | None = None) -> None:
+    atomic_write_text(path, json.dumps(data, indent=2), mode=mode)
 
 
 def atomic_write_csv(path: Path, headers: list[str], rows: list[dict]) -> None:

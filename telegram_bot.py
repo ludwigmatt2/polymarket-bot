@@ -102,7 +102,7 @@ def _load_users() -> dict[int, dict]:
 def _save_users(users: dict[int, dict]) -> None:
     global _users_cache
     USERS_FILE.parent.mkdir(exist_ok=True)
-    atomic_write_text(USERS_FILE, json.dumps({str(k): v for k, v in users.items()}, indent=2))
+    atomic_write_text(USERS_FILE, json.dumps({str(k): v for k, v in users.items()}, indent=2), mode=0o600)
     _users_cache = users
 
 @contextmanager

@@ -184,7 +184,7 @@ def set_user_creds(uid: int, **fields) -> None:
             pass
     existing.update({k: v for k, v in fields.items() if v is not None})
     store[uid_str] = _encode(f, existing)
-    atomic_write_json(_ENC_KEYS_FILE, store)
+    atomic_write_json(_ENC_KEYS_FILE, store, mode=0o600)
 
 
 def get_user_creds(uid: int) -> dict | None:
