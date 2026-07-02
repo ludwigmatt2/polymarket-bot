@@ -1395,7 +1395,14 @@ def _security_self_check() -> list[str]:
         try:
             mode = p.stat().st_mode & 0o777
             if mode & 0o077:
-                issues.append(f"{label} is group/other-accessible ({oct(mode)})")
+                # Auto-remediate: tighten to 0600 so a drift (deploy, manual edit)
+                # can't leave a sensitive file readable. Still report it so the
+                # owner knows a drift happened and was corrected.
+                try:
+                    os.chmod(p, 0o600)
+                    issues.append(f"{label} was group/other-accessible ({oct(mode)}) — auto-fixed to 0600")
+                except OSError:
+                    issues.append(f"{label} is group/other-accessible ({oct(mode)}) — auto-fix failed")
         except OSError:
             pass
 
@@ -1993,9 +2000,10 @@ async def check_alerts(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception:
                 pass
 
-        # New signals alert
+        # New signals alert. The admin gets the richer _auto_scan heartbeat instead,
+        # so skip them here to avoid a double notification (mtime still advances below).
         sig_new = _read_json_if_new(signals_file, _seen_signals_mtimes, uid)
-        if sig_new is not None:
+        if sig_new is not None and uid != ADMIN_ID:
             signals = [s for s in sig_new[0].get("signals", []) if s.get("edge_pp", 0) >= 0.30]
             if signals:
                 text = (
@@ -2115,10 +2123,25 @@ async def handle_admin_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     )
 
 
+def _count_trades(uid: int) -> int:
+    """Row count of a user's paper-trades CSV (excludes the header)."""
+    p = _trades_csv_path(uid)
+    if not p.exists():
+        return 0
+    try:
+        with p.open() as f:
+            return max(0, sum(1 for _ in f) - 1)
+    except OSError:
+        return 0
+
+
 async def _auto_scan(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Scheduled job: paper scan + fan-out to all users. Runs every AUTO_SCAN_INTERVAL seconds."""
+    before = _count_trades(ADMIN_ID)
     stdout, stderr, rc = await run_bot_async("paper", ADMIN_ID)
-    if rc not in (0, -2):
+    if rc == -2:
+        return  # a scan/resolve was already running — skip silently
+    if rc != 0:
         try:
             await ctx.bot.send_message(
                 ADMIN_ID,
@@ -2127,6 +2150,26 @@ async def _auto_scan(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             )
         except Exception:
             pass
+        return
+
+    # Success → heartbeat summary so every scheduled scan is visible, even quiet ones.
+    new_trades = max(0, _count_trades(ADMIN_ID) - before)
+    meta       = read_last_scan_meta(ADMIN_ID)
+    try:
+        funnel = json.loads(_signals_path(ADMIN_ID).read_text()).get("funnel", {})
+    except Exception:
+        funnel = {}
+    header = [f"🔍 *Scan complete* · _{meta.get('scanned_at', '')}_"]
+    if funnel.get("evaluated") is not None:
+        header.append(f"Evaluated: {funnel['evaluated']} · Actionable: {funnel.get('actionable', 0)}")
+    header.append(f"New paper trades: *{new_trades}*")
+    body = fmt_signals(read_last_signals(ADMIN_ID), ADMIN_ID)
+    try:
+        await ctx.bot.send_message(
+            ADMIN_ID, "\n".join(header) + "\n\n" + body, parse_mode="Markdown",
+        )
+    except Exception:
+        pass
 
 
 async def _auto_resolve(ctx: ContextTypes.DEFAULT_TYPE) -> None:

@@ -71,7 +71,9 @@ def fanout_env(tmp_path, monkeypatch):
     }))
     monkeypatch.setattr(weather_bot, "USERS_FILE", users_file)
     monkeypatch.setenv("TELEGRAM_ADMIN_ID", ADMIN_ID)
-    monkeypatch.chdir(tmp_path)  # fan-out writes to logs/users/<uid>/ relative to cwd
+    # Logs are anchored to DEFAULT_LOG_DIR (= DATA_DIR/logs in production), not cwd.
+    monkeypatch.setattr(weather_bot, "DEFAULT_LOG_DIR", tmp_path / "logs")
+    monkeypatch.chdir(tmp_path)
     # Don't let the live-path geoblock pre-check hit the network or depend on the
     # machine's real location; treat as "not blocked" so execution-logic tests run.
     monkeypatch.setattr(weather_bot, "check_geoblock", lambda *a, **k: None)
