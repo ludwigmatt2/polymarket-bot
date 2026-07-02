@@ -15,6 +15,7 @@ Defense model (assume the bot/session may be briefly compromised):
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -112,7 +113,7 @@ def evaluate_withdrawal(
 
     if normalize_address(to_address) is None:
         return Decision(False, "Invalid destination address.")
-    if not (amount > 0) or amount != amount or amount in (float("inf"), float("-inf")):
+    if not math.isfinite(amount) or amount <= 0:
         return Decision(False, "Amount must be a positive finite number.")
 
     state = allowlist_state(allowlist, to_address, now, cooling_hours)

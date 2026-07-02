@@ -36,19 +36,15 @@ from cryptography.fernet import Fernet, InvalidToken
 
 sys.path.insert(0, str(Path(__file__).parent))
 from weather.paths import DATA_DIR  # noqa: E402
+from weather._io import atomic_write_json  # noqa: E402
+from weather.secrets import _secrets_key  # noqa: E402  (single source of truth for key resolution)
 
 DEFAULT_STORE = DATA_DIR / "config" / "user_keys.enc.json"
 
 
 def resolve_old_key(arg: str | None) -> str:
-    if arg:
-        return arg.strip()
-    cred = os.environ.get("CREDENTIALS_DIRECTORY")
-    if cred:
-        p = Path(cred) / "polymarket_secrets_key"
-        if p.exists():
-            return p.read_text().strip()
-    return os.environ.get("POLYMARKET_SECRETS_KEY", "").strip()
+    # Same precedence as the running bot: systemd credential → env var.
+    return arg.strip() if arg else _secrets_key()
 
 
 def main() -> None:
@@ -84,10 +80,7 @@ def main() -> None:
     shutil.copy2(store_path, backup)
     os.chmod(backup, 0o600)
 
-    tmp = store_path.with_suffix(store_path.suffix + ".tmp")
-    tmp.write_text(json.dumps(out, indent=2))
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, store_path)
+    atomic_write_json(store_path, out, mode=0o600)
 
     print(f"✅ Rotated {len(out)} blob(s). Backup: {backup}")
     print("NEW MASTER KEY — store it securely, install as the systemd credential, then destroy the old key:")
