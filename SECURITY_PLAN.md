@@ -1,6 +1,9 @@
 # Security & Multi-User Hardening Plan
 
-_Status: proposed (2026-07-01). Bot runs paper 24/7 on Hetzner Helsinki VPS. No real user funds live yet — this plan is to be executed **before** go-live. Key rotation (Phase G) happens at go-live._
+_Status (2026-07-02): Phases A–F + E2 **executed & deployed**. E1 (disk encryption) and G
+(key rotation) are **execute-at-go-live** — tooling ready (`rotate_secrets_key.py`) and
+steps captured in `GO_LIVE_RUNBOOK.md`. Bot runs paper 24/7 on Hetzner Helsinki VPS; no
+real user funds yet._
 
 ## Current state (baseline)
 
@@ -165,15 +168,27 @@ conflicts. Tests: `tests/test_audit.py` (6) + `tests/test_selfcheck.py` (4).
 
 ## Phase G — Key rotation runbook (execute AT go-live)
 
-_You said you'll roll the important keys at go-live. This is the checklist._
+_Tooling ready; execution happens at go-live. Full step-by-step in **`GO_LIVE_RUNBOOK.md`** §3._
 
-- [ ] G1. **`POLYMARKET_SECRETS_KEY`** — write a `rotate_secrets_key.py`: load store with old key, re-encrypt every blob with a freshly generated Fernet key, atomic-swap the file, update the key in its store (systemd cred/KMS). Keep old key until verified.
-- [ ] G2. **`POLYMARKET_BOT_TOKEN`** — regenerate via BotFather, update `.env`/cred store, restart service. (Invalidates the old token immediately — good.)
-- [ ] G3. **`BUILDER_API_KEY/SECRET/PASS_PHRASE`** — rotate via Polymarket if they were ever exposed.
-- [ ] G4. **Admin L1 key** — if the admin wallet key was ever in plaintext env/history, generate a new EOA, move funds, update the encrypted store, retire the old key.
-- [ ] G5. Post-rotation: grep git history + logs to confirm no secret was ever committed; if any was, treat it as compromised and rotate regardless.
+- [x] G1. **`rotate_secrets_key.py` written + tested** — re-encrypts every store blob from
+  the old master key to a fresh one (handles JSON + legacy blobs), backs up to
+  `*.pre-rotate-<ts>`, writes `0600`, prints the new key. Ready to run at go-live.
+- [~] G2. **`POLYMARKET_BOT_TOKEN`** — runbook step: BotFather `/revoke` → new token → `.env` → restart.
+- [~] G3. **`BUILDER_API_KEY/SECRET/PASS_PHRASE`** — runbook step: reissue if ever exposed.
+- [~] G4. **Admin L1 key** — runbook step: fresh EOA + move funds (allowlist cold addr 24h ahead).
+- [~] G5. **Leak check** — runbook step: `git log -p | grep` for any committed secret.
 
-**Acceptance:** every secret in use at go-live is one that has never touched plaintext git/history/chat; old values invalidated.
+**Status:** the rotation tool is built and verified; G2–G5 are one-time actions performed
+during go-live per `GO_LIVE_RUNBOOK.md`. **Acceptance (at go-live):** every secret in use
+has never touched plaintext git/history/chat; old values invalidated.
+
+## Phase E1 — Disk encryption (execute AT go-live)
+
+- [~] Deferred to go-live by design — full-disk LUKS + `dropbear-initramfs` remote unlock
+  requires a VPS rebuild (can't be added live). Step-by-step in **`GO_LIVE_RUNBOOK.md`** §4,
+  with the reboot-unlock tradeoff and a Path B "accept residual risk + compensating controls"
+  alternative. Compensating controls already live: master key off-`.env` (systemd credential),
+  Fernet store, `600` perms, encrypted off-site backups.
 
 ---
 
