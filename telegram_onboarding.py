@@ -497,6 +497,8 @@ async def on_funding_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> i
         if not pk:
             await update.effective_chat.send_message("❌ No key stored.")
             return FUNDING
+        from weather.audit import audit_log
+        audit_log("private_key_revealed", actor=uid)
         msg = await update.effective_chat.send_message(
             f"🔑 *Your private key* (auto-deletes in 60s — back it up NOW):\n`{pk}`",
             parse_mode="Markdown",

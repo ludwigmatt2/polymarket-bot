@@ -142,14 +142,24 @@ sandboxed + non-root (E5). ⚠️ disk encryption deferred to a reprovision (E1)
 
 ---
 
-## Phase F — Audit logging & monitoring
+## Phase F — Audit logging & monitoring ✅ COMPLETE (2026-07-02)
 
-- [ ] F1. Append-only audit log (`data/logs/audit.jsonl`): every live order, withdrawal, role change, cred access, mode flip → `{ts, uid, action, details}`.
-- [ ] F2. Admin alerts on sensitive events: any withdrawal, any new admin/owner, any suspended-user access attempt → Telegram DM to owner.
-- [ ] F3. Startup self-check that reports (to owner) if any config file is world-readable, master key is env-only, or a user has a role but no creds.
-- [ ] F4. Reuse the existing dedup-poller detection (see `dup_poller_gotcha` memory) — alert instead of silently conflicting.
+- [x] F1. Append-only audit log `data/logs/audit.jsonl` (`weather/audit.py`): withdrawal
+  (+ large-request), mode→live, role change / user add / remove / suspend / unsuspend,
+  allowlist add/remove, withdraw-cap set, private-key reveal, startup self-check. One JSON
+  object per line `{ts, action, actor, …details}`. `/audit [n]` command to view.
+- [x] F2. Owner (`ADMIN_ID`) DM alerts via `notify_owner`: any withdrawal executed, any
+  new admin/owner (adduser/setrole), any live-mode flip by a non-owner, and suspended-user
+  access attempts (throttled 1/hr per key).
+- [x] F3. Boot self-check (`_security_self_check` → `_run_self_check`) DMs the owner on:
+  group/other-readable `.env`/key-store/`users.json`, master key in env instead of a
+  systemd credential, or owner missing stored creds. Result count is audited.
+- [x] F4. `_on_error` handler alerts the owner on a getUpdates `Conflict` (duplicate
+  poller) instead of only logging — throttled 1/hr.
 
-**Acceptance:** every privileged action is reconstructable from the audit log; owner is notified in real time of money-movement and permission changes.
+**Acceptance:** ✅ every privileged action is reconstructable from `audit.jsonl`; owner is
+DM'd in real time on money movement, permission changes, suspended attempts, and poller
+conflicts. Tests: `tests/test_audit.py` (6) + `tests/test_selfcheck.py` (4).
 
 ---
 
