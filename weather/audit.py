@@ -12,6 +12,7 @@ Example line:
 from __future__ import annotations
 
 import json
+from collections import deque
 from datetime import datetime, timezone
 
 from .paths import DATA_DIR
@@ -34,13 +35,17 @@ def audit_log(action: str, actor: int | None = None, **details) -> None:
 
 
 def read_audit(n: int = 50) -> list[dict]:
-    """Return the last `n` audit records (oldest→newest). Empty if none."""
+    """Return the last `n` audit records (oldest→newest). Empty if none.
+
+    Tails the file with a bounded deque so memory stays O(n) regardless of how
+    large the append-only log grows."""
     try:
-        lines = AUDIT_LOG.read_text().splitlines()
+        with AUDIT_LOG.open() as f:
+            lines = deque(f, maxlen=n)
     except OSError:
         return []
     out: list[dict] = []
-    for line in lines[-n:]:
+    for line in lines:
         try:
             out.append(json.loads(line))
         except json.JSONDecodeError:

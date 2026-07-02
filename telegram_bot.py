@@ -49,6 +49,12 @@ from weather.paths import DATA_DIR
 from weather import permissions as perms
 from weather import withdrawal_policy as wpol
 from weather.audit import audit_log, read_audit
+from weather.config import (
+    WITHDRAW_COOLING_OFF_HOURS,
+    WITHDRAW_DAILY_CAP_USD,
+    WITHDRAW_LARGE_USD,
+    WITHDRAW_MAX_ATTEMPTS_PER_HR,
+)
 USERS_FILE    = DATA_DIR / "config" / "users.json"
 WALLET_FILE   = DATA_DIR / "logs" / "wallet.json"
 
@@ -241,18 +247,22 @@ async def _maybe_alert_suspended(update, ctx) -> None:
 
 # ── Auth decorators ────────────────────────────────────────────────────────────
 
-def require_auth(admin_only: bool = False):
+async def _ensure_authorized(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Shared gate: True if the user may use the bot at all; else alerts on a
+    suspended attempt, replies with the not-authorized notice, and returns False."""
+    if is_authorized(update.effective_user.id):
+        return True
+    await _maybe_alert_suspended(update, ctx)
+    await update.effective_message.reply_text(
+        "🚫 Not authorized. Ask an admin to add you with /adduser."
+    )
+    return False
+
+
+def require_auth():
     def decorator(fn):
         async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-            uid = update.effective_user.id
-            if not is_authorized(uid):
-                await _maybe_alert_suspended(update, ctx)
-                await update.effective_message.reply_text(
-                    "🚫 Not authorized. Ask an admin to add you with /adduser."
-                )
-                return
-            if admin_only and not is_admin(uid):
-                await update.effective_message.reply_text("🚫 Admin only.")
+            if not await _ensure_authorized(update, ctx):
                 return
             return await fn(update, ctx)
         return wrapper
@@ -264,14 +274,9 @@ def require_perm(capability: str):
     friendly refusal; unauthorized/suspended → the standard not-authorized notice."""
     def decorator(fn):
         async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-            uid = update.effective_user.id
-            if not is_authorized(uid):
-                await _maybe_alert_suspended(update, ctx)
-                await update.effective_message.reply_text(
-                    "🚫 Not authorized. Ask an admin to add you with /adduser."
-                )
+            if not await _ensure_authorized(update, ctx):
                 return
-            if not has_permission(uid, capability):
+            if not has_permission(update.effective_user.id, capability):
                 await update.effective_message.reply_text(
                     "🚫 You don't have permission to do that."
                 )
@@ -310,7 +315,7 @@ def append_wallet_transaction(uid: int, tx_type: str, amount: float, note: str =
     })
     f = user_wallet_file(uid)
     f.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(f, json.dumps(data, indent=2))
+    atomic_write_text(f, json.dumps(data, indent=2), mode=0o600)
 
 def wallet_stats(uid: int) -> dict:
     txns = read_wallet(uid).get("transactions", [])
@@ -393,7 +398,6 @@ def remove_allowlist_entry(uid: int, address: str) -> bool:
     return removed
 
 def get_withdraw_cap(uid: int) -> float:
-    from weather.config import WITHDRAW_DAILY_CAP_USD
     cap = _load_users().get(uid, {}).get("withdraw_cap_usd")
     return float(cap) if cap is not None else WITHDRAW_DAILY_CAP_USD
 
@@ -416,7 +420,6 @@ _withdraw_attempts: dict[int, list[float]] = {}
 
 def withdraw_rate_limited(uid: int) -> bool:
     """Record an attempt; True if the user is over the hourly attempt budget."""
-    from weather.config import WITHDRAW_MAX_ATTEMPTS_PER_HR
     now = _time.monotonic()
     recent = [t for t in _withdraw_attempts.get(uid, []) if now - t < 3600]
     recent.append(now)
@@ -1031,8 +1034,6 @@ async def cmd_withdraw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     import asyncio
     from weather.secrets import get_user_creds
     from weather import relayer
-    from weather.config import WITHDRAW_LARGE_USD
-    from telegram_onboarding import is_eth_address
 
     uid = update.effective_user.id
     if len(ctx.args) < 2:
@@ -1062,7 +1063,7 @@ async def cmd_withdraw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     to = ctx.args[1]
-    if not is_eth_address(to):
+    if wpol.normalize_address(to) is None:
         await update.message.reply_text("❌ Invalid destination address (need 0x + 40 hex).")
         return
 
@@ -1104,14 +1105,10 @@ async def cmd_withdraw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx.user_data["withdraw_code"] = {"code": code, "amount": amount, "to": to}
             audit_log("withdrawal_large_requested", actor=uid, amount=amount, to=to)
             if uid != ADMIN_ID:  # owner oversight / audit trail on large withdrawals
-                try:
-                    await ctx.bot.send_message(
-                        ADMIN_ID,
-                        f"🔔 Large withdrawal requested\nuser `{uid}` · ${amount:,.2f} → `{to}`",
-                        parse_mode="Markdown",
-                    )
-                except Exception:
-                    pass
+                await notify_owner(
+                    ctx.bot,
+                    f"🔔 Large withdrawal requested\nuser `{uid}` · ${amount:,.2f} → `{to}`",
+                )
             await update.message.reply_text(
                 f"🔐 *Large withdrawal* (≥ ${WITHDRAW_LARGE_USD:,.0f}) needs a code.\n"
                 f"Confirmation code: `{code}`\n\n"
@@ -1145,7 +1142,6 @@ async def cmd_withdraw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 @require_perm(perms.WITHDRAW_OWN)
 async def cmd_allowlist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Show the user's withdrawal allowlist + daily-cap status."""
-    from weather.config import WITHDRAW_COOLING_OFF_HOURS
     uid = update.effective_user.id
     entries = get_withdraw_allowlist(uid)
     now = datetime.now(timezone.utc)
@@ -1175,7 +1171,6 @@ async def cmd_allowlist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @require_perm(perms.WITHDRAW_OWN)
 async def cmd_allowlist_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    from weather.config import WITHDRAW_COOLING_OFF_HOURS
     uid = update.effective_user.id
     if not ctx.args:
         await update.message.reply_text("Usage: `/allowlist_add <0xADDRESS> [label]`", parse_mode="Markdown")
@@ -1388,13 +1383,13 @@ def _log_startup() -> None:
 
 def _security_self_check() -> list[str]:
     """Advisory boot-time checks (audit F3). Returns human-readable issue strings."""
-    from weather.secrets import get_user_creds
+    from weather.secrets import get_user_creds, _ENC_KEYS_FILE
     issues: list[str] = []
 
     # 1. Sensitive files must not be group/other-accessible.
     for label, p in (
         (".env", ROOT / ".env"),
-        ("key store", USERS_FILE.parent / "user_keys.enc.json"),
+        ("key store", _ENC_KEYS_FILE),
         ("users.json", USERS_FILE),
     ):
         try:
@@ -1545,9 +1540,8 @@ async def cmd_adduser(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Usage: /adduser <telegram_id> [{'|'.join(grantable)}]"
         )
         return
-    try:
-        new_id = int(ctx.args[0])
-    except ValueError:
+    new_id = _parse_target_uid(ctx)
+    if new_id is None:
         await update.message.reply_text("❌ Invalid ID — must be a number.")
         return
     role = perms.VIEWER
@@ -1576,9 +1570,8 @@ async def cmd_removeuser(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         await update.message.reply_text("Usage: /removeuser <telegram_id>")
         return
-    try:
-        rm_id = int(ctx.args[0])
-    except ValueError:
+    rm_id = _parse_target_uid(ctx)
+    if rm_id is None:
         await update.message.reply_text("❌ Invalid ID.")
         return
     if rm_id == ADMIN_ID or get_role(rm_id) == perms.OWNER:
