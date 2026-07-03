@@ -291,6 +291,12 @@ def require_perm(capability: str):
 def user_wallet_file(uid: int) -> Path:
     return user_log_dir(uid) / "wallet.json"
 
+def _live_wallet_file(uid: int) -> Path:
+    """Real on-chain deposit ledger — admin at the root, others in their dir
+    (mirrors _trades_csv_path so it sits beside the matching live_trades.csv)."""
+    base = DATA_DIR / "logs" if uid == ADMIN_ID else user_log_dir(uid)
+    return base / "live_wallet.json"
+
 def _migrate_global_wallet() -> None:
     """One-time: move the legacy global ledger to the admin's per-user file."""
     admin_wallet = user_wallet_file(ADMIN_ID)
@@ -1000,12 +1006,71 @@ async def cmd_losses(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         telegram_views.fmt_losses(rows, n), reply_markup=main_kb(uid), parse_mode="Markdown",
     )
 
+def _deposit_refresh_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Check balance", callback_data="deposit_refresh")]])
+
+
+async def _live_deposit_reply(target, uid: int) -> None:
+    """Live-mode /deposit: show the on-chain deposit wallet + live balance, and
+    record any newly-arrived USDC.e as a real deposit. The bot cannot pull funds —
+    the user pushes USDC.e (Polygon) to this address themselves."""
+    from weather.secrets import get_user_creds
+    creds  = get_user_creds(uid) or {}
+    wallet = creds.get("funder_address")
+    if not wallet or creds.get("signature_type") != 3:
+        await target.reply_text(
+            "⚠️ No deposit wallet configured yet. Run /wallet\\_setup first, then "
+            "come back to fund it.",
+            parse_mode="Markdown",
+        )
+        return
+    try:
+        from weather import relayer, live_ledger
+        usdce, pusd = await asyncio.wait_for(
+            asyncio.to_thread(lambda: (relayer.usdce_balance(wallet),
+                                       relayer.pusd_balance(wallet))),
+            timeout=30,
+        )
+    except Exception as exc:  # noqa: BLE001
+        await target.reply_text(
+            f"⚠️ Couldn't read the on-chain balance ({type(exc).__name__}). "
+            "Funds may still be in transit — try again shortly.",
+        )
+        return
+    detected = live_ledger.reconcile_deposit(_live_wallet_file(uid), usdce)
+    net = live_ledger.net_deposited(_live_wallet_file(uid))
+    got = (f"\n✅ *New deposit detected: +${detected:,.2f}* USDC.e — it wraps to "
+           f"tradeable pUSD automatically at go-live." if detected > 0 else "")
+    await target.reply_text(
+        "🟢 *LIVE — fund your wallet*\n\n"
+        "Send *USDC.e on the Polygon network* to:\n"
+        f"`{wallet}`\n\n"
+        "• Polygon network, *USDC.e* (bridged) — not native USDC\n"
+        "• Include a little *POL* (~0.2) for gas\n\n"
+        f"On-chain now:\n• USDC.e (just deposited): *${usdce:,.2f}*\n"
+        f"• pUSD (tradeable): *${pusd:,.2f}*\n"
+        f"Total real deposits recorded: *${net:,.2f}*"
+        + got,
+        reply_markup=_deposit_refresh_kb(),
+        parse_mode="Markdown",
+    )
+
+
 @require_perm(perms.DEPOSIT_OWN)
 async def cmd_deposit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Record a deposit. Usage: /deposit <amount> [note]"""
+    """Fund your wallet. Paper mode records simulated capital; live mode shows the
+    on-chain deposit address + balance. Usage (paper): /deposit <amount> [note]"""
+    uid = update.effective_user.id
+    if get_user_mode(uid) == "live":
+        await _live_deposit_reply(update.message, uid)
+        return
+    # Paper mode — simulated capital for tracking paper ROI. No real money moves.
     if not ctx.args:
         await update.message.reply_text(
-            "Usage: `/deposit <amount> [note]`\nExample: `/deposit 500 initial load`",
+            "📝 *Paper mode* — `/deposit <amount>` records *simulated* capital to "
+            "track paper ROI. No real money moves.\n"
+            "Example: `/deposit 500 initial load`\n\n"
+            "_Switch to live (`/mymode live`) to fund a real wallet._",
             parse_mode="Markdown",
         )
         return
@@ -1018,12 +1083,12 @@ async def cmd_deposit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Amount must be a positive finite number.")
         return
     note = " ".join(ctx.args[1:]) if len(ctx.args) > 1 else ""
-    append_wallet_transaction(update.effective_user.id, "deposit", amount, note)
-    ws = wallet_stats(update.effective_user.id)
+    append_wallet_transaction(uid, "deposit", amount, note)
+    ws = wallet_stats(uid)
     await update.message.reply_text(
-        f"✅ *Deposit recorded:* +${amount:,.2f}\n"
-        f"Total deposited: ${ws['deposited']:,.2f}\n"
-        f"Wallet balance:  ${ws['wallet_balance']:,.2f}",
+        f"📝 *PAPER deposit recorded:* +${amount:,.2f} _(simulated — no real money)_\n"
+        f"Total simulated: ${ws['deposited']:,.2f}\n"
+        f"Paper balance:   ${ws['wallet_balance']:,.2f}",
         parse_mode="Markdown",
     )
 
@@ -1762,6 +1827,8 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(
             fmt_trades(uid), reply_markup=why_kb(uid) or main_kb(uid), parse_mode="Markdown"
         )
+    elif data == "deposit_refresh" and has_permission(uid, perms.DEPOSIT_OWN):
+        await _live_deposit_reply(q.message, uid)
     elif data.startswith("liveconfirm"):
         if not has_permission(uid, perms.GO_LIVE):
             await q.edit_message_text("🚫 Your role can't switch to live trading.", reply_markup=main_kb(uid))
