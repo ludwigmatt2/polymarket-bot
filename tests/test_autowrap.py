@@ -69,3 +69,25 @@ def test_surfaces_prep_error_and_isolates_failures(monkeypatch):
     res = {r["uid"]: r for r in tb._wrap_pending_live_deposits()}
     assert res[10]["error"] == "wallet busy" and res[10]["fresh"] is True
     assert "boom" in res[30]["error"]   # per-user failure captured, not raised
+
+
+def test_record_and_prepare_resets_watermark_so_next_deposit_counts_full(monkeypatch, tmp_path):
+    """After wrapping drops USDC.e→0, the ledger watermark must reset to the post-wrap
+    balance — else the NEXT deposit is measured from this deposit's level and
+    under-counted. Uses the REAL ledger (not mocked) to exercise the watermark."""
+    from weather import live_ledger as ll
+    import weather.secrets as sec
+    import weather.relayer as rl
+    ledger = tmp_path / "lw.json"
+    monkeypatch.setattr(tb, "_live_wallet_file", lambda uid: ledger)
+    monkeypatch.setattr(sec, "prepare_for_live", lambda uid: {"ready": True, "pusd": 50.0})
+    monkeypatch.setattr(rl, "usdce_balance", lambda w: 0.0)  # post-wrap balance ≈ 0
+
+    res = tb._record_and_prepare(99, "0xFUND", 50.0)          # $50 lands, then wraps
+    assert res["detected"] == 50.0
+    assert ll.net_deposited(ledger) == 50.0
+    assert ll.read_ledger(ledger)["last_usdce"] == 0.0        # watermark reset
+
+    res2 = tb._record_and_prepare(99, "0xFUND", 30.0)         # a smaller 2nd deposit
+    assert res2["detected"] == 30.0
+    assert ll.net_deposited(ledger) == 80.0  # 50+30 in full — NOT missed as a "decrease"
