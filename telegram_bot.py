@@ -2067,7 +2067,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             # return) — _record_and_prepare enforces that reconcile-before-wrap order.
             from weather import relayer
             _usdce = await asyncio.to_thread(relayer.usdce_balance, _c["funder_address"])
-            prep = await asyncio.to_thread(_record_and_prepare, uid, _usdce)
+            prep = await asyncio.to_thread(_record_and_prepare, uid, _c["funder_address"], _usdce)
             # Provisioning MUST succeed before we flip. A half-live state (mode=live
             # but wallet unwrapped/unapproved) silently fails every order — the exact
             # trap this replaces. Stay in paper and surface the reason as PLAIN text
@@ -2431,7 +2431,7 @@ def _count_trades(uid: int) -> int:
         return 0
 
 
-def _record_and_prepare(uid: int, usdce: float) -> dict:
+def _record_and_prepare(uid: int, funder: str, usdce: float) -> dict:
     """Record `usdce` (the wallet's current on-chain USDC.e) as a deposit, THEN wrap
     + approve it via prepare_for_live. The ordering is load-bearing: wrapping
     USDC.e→pUSD before reconciling would zero the deposit basis — so both the go-live
@@ -2439,14 +2439,24 @@ def _record_and_prepare(uid: int, usdce: float) -> dict:
     Reconcile is best-effort; returns the prepare_for_live result with the
     freshly-detected deposit merged in as `detected`.
     """
-    from weather import live_ledger
+    from weather import relayer, live_ledger
     from weather.secrets import prepare_for_live
+    path = _live_wallet_file(uid)
     detected = 0.0
     try:
-        detected = live_ledger.reconcile_deposit(_live_wallet_file(uid), usdce)
+        detected = live_ledger.reconcile_deposit(path, usdce)
     except Exception:  # noqa: BLE001 — ledger write is best-effort, never blocks the wrap
         pass
-    return {**prepare_for_live(uid), "detected": detected}
+    prep = prepare_for_live(uid)
+    # The wrap drops USDC.e toward 0. Re-sync the watermark to the *post-wrap* balance
+    # (re-read, not assumed 0 — the wrap may have failed) so the NEXT deposit is
+    # measured from there. Without this the watermark stays at this deposit's level
+    # and the next deposit is under-counted (or, if smaller, missed entirely).
+    try:
+        live_ledger.reconcile_deposit(path, relayer.usdce_balance(funder))
+    except Exception:  # noqa: BLE001
+        pass
+    return {**prep, "detected": detected}
 
 
 def _wrap_pending_live_deposits() -> list[dict]:
@@ -2471,7 +2481,7 @@ def _wrap_pending_live_deposits() -> list[dict]:
             usdce = relayer.usdce_balance(c["funder_address"])
             if usdce <= 0:
                 continue
-            prep = _record_and_prepare(uid, usdce)
+            prep = _record_and_prepare(uid, c["funder_address"], usdce)
             rec = {"uid": uid, "wrapped": round(usdce, 2),
                    "pusd": prep.get("pusd", 0.0), "fresh": prep.get("detected", 0) > 0}
             if prep.get("error"):
