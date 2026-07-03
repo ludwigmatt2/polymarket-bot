@@ -80,7 +80,7 @@ class TestModeDispatch:
 
     def test_wallet_live_shows_real_money(self, monkeypatch):
         monkeypatch.setattr(tb, "get_user_mode", lambda uid: "live")
-        monkeypatch.setattr(tb, "live_wallet_stats", lambda uid: {
+        monkeypatch.setattr(tb, "live_wallet_stats", lambda uid, ls=None: {
             "deposited": 100.0, "withdrawn": 0.0, "deployed": 8.0, "realized_pnl": 2.0,
             "wallet_balance": 102.0, "available": 94.0, "return_pct": 2.0,
             "pnl_today": 0.0, "pnl_week": 0.0, "pending_count": 1,
