@@ -61,26 +61,21 @@ WALLET_FILE   = DATA_DIR / "logs" / "wallet.json"
 def user_log_dir(uid: int) -> Path:
     return DATA_DIR / "logs" / "users" / str(uid)
 
-def user_trades_csv(uid: int) -> Path:
-    return user_log_dir(uid) / "paper_trades.csv"
-
-def user_signals_file(uid: int) -> Path:
-    return user_log_dir(uid) / "last_signals.json"
-
-def user_resolved_file(uid: int) -> Path:
-    return user_log_dir(uid) / "last_resolved.json"
-
 # The admin's data IS the root logs/ (the scan runs there; fan-out mirrors to
 # everyone else). Non-admin users never fall back to root — a fresh user must
-# see an empty slate, not the owner's portfolio.
+# see an empty slate, not the owner's portfolio. Every per-user file path derives
+# from this one primitive, so the admin exception lives in exactly one place.
+def user_data_dir(uid: int) -> Path:
+    return DATA_DIR / "logs" if uid == ADMIN_ID else user_log_dir(uid)
+
 def _trades_csv_path(uid: int) -> Path:
-    return DATA_DIR / "logs" / "paper_trades.csv" if uid == ADMIN_ID else user_trades_csv(uid)
+    return user_data_dir(uid) / "paper_trades.csv"
 
 def _signals_path(uid: int) -> Path:
-    return DATA_DIR / "logs" / "last_signals.json" if uid == ADMIN_ID else user_signals_file(uid)
+    return user_data_dir(uid) / "last_signals.json"
 
 def _resolved_path(uid: int) -> Path:
-    return DATA_DIR / "logs" / "last_resolved.json" if uid == ADMIN_ID else user_resolved_file(uid)
+    return user_data_dir(uid) / "last_resolved.json"
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -292,16 +287,12 @@ def user_wallet_file(uid: int) -> Path:
     return user_log_dir(uid) / "wallet.json"
 
 def _live_wallet_file(uid: int) -> Path:
-    """Real on-chain deposit ledger — admin at the root, others in their dir
-    (mirrors _trades_csv_path so it sits beside the matching live_trades.csv)."""
-    base = DATA_DIR / "logs" if uid == ADMIN_ID else user_log_dir(uid)
-    return base / "live_wallet.json"
+    """Real on-chain deposit ledger — sits beside the matching live_trades.csv."""
+    return user_data_dir(uid) / "live_wallet.json"
 
 def _live_trades_csv_path(uid: int) -> Path:
-    """Real live-order log — admin at the root, others in their dir (matches where
-    weather_bot writes live_trades.csv)."""
-    base = DATA_DIR / "logs" if uid == ADMIN_ID else user_log_dir(uid)
-    return base / "live_trades.csv"
+    """Real live-order log — matches where weather_bot writes live_trades.csv."""
+    return user_data_dir(uid) / "live_trades.csv"
 
 def _active_trades_csv_path(uid: int) -> Path:
     """The trade log for the user's CURRENT mode — live orders when live, paper
@@ -507,6 +498,12 @@ def read_live_stats(uid: int) -> dict:
     total_pnl  = sum(float(r["pnl_usd"]) for r in resolved if r.get("pnl_usd"))
     deployed   = sum(float(r["size_usd"]) for r in rows
                      if not r.get("resolved_at") and r.get("size_usd"))
+    today_str  = datetime.utcnow().strftime("%Y-%m-%d")
+    week_start = (datetime.utcnow() - timedelta(days=7)).isoformat()
+    pnl_today  = sum(float(r["pnl_usd"]) for r in resolved
+                     if r.get("pnl_usd") and r.get("resolved_at", "")[:10] == today_str)
+    pnl_week   = sum(float(r["pnl_usd"]) for r in resolved
+                     if r.get("pnl_usd") and r.get("resolved_at", "") >= week_start)
     return {
         "total": len(rows),
         "resolved": len(resolved),
@@ -517,14 +514,17 @@ def read_live_stats(uid: int) -> dict:
         "profit_factor": pf,
         "total_pnl": total_pnl,
         "deployed": deployed,
+        "pnl_today": pnl_today,
+        "pnl_week": pnl_week,
     }
 
-def live_wallet_stats(uid: int) -> dict:
+def live_wallet_stats(uid: int, ls: dict | None = None) -> dict:
     """Wallet view from REAL money: net on-chain deposits + realized live PnL.
-    Return % is computed from actual capital invested, not simulated paper deposits."""
+    Return % is computed from actual capital invested, not simulated paper deposits.
+    Pass `ls` (a read_live_stats result) to avoid re-parsing live_trades.csv."""
     from weather import live_ledger
     t   = live_ledger.totals(_live_wallet_file(uid))
-    ls  = read_live_stats(uid) or {}
+    ls  = ls if ls is not None else (read_live_stats(uid) or {})
     realized = ls.get("total_pnl", 0.0)
     deployed = ls.get("deployed", 0.0)
     deposited, withdrawn, net = t["deposited"], t["withdrawn"], t["net"]
@@ -534,24 +534,12 @@ def live_wallet_stats(uid: int) -> dict:
     balance    = net + realized
     available  = balance - deployed
     return_pct = (realized / deposited * 100) if deposited > 0 else None
-
-    today_str  = datetime.utcnow().strftime("%Y-%m-%d")
-    week_start = (datetime.utcnow() - timedelta(days=7)).isoformat()
-    csv_path   = _live_trades_csv_path(uid)
-    resolved: list[dict] = []
-    if csv_path.exists():
-        with csv_path.open() as f:
-            resolved = [r for r in csv.DictReader(f)
-                        if r.get("resolved_at") and not r.get("error")]
-    pnl_today = sum(float(r["pnl_usd"]) for r in resolved
-                    if r.get("pnl_usd") and r.get("resolved_at", "")[:10] == today_str)
-    pnl_week  = sum(float(r["pnl_usd"]) for r in resolved
-                    if r.get("pnl_usd") and r.get("resolved_at", "") >= week_start)
     return {
         "deposited": deposited, "withdrawn": withdrawn,
         "deployed": deployed, "realized_pnl": realized,
         "wallet_balance": balance, "available": available,
-        "return_pct": return_pct, "pnl_today": pnl_today, "pnl_week": pnl_week,
+        "return_pct": return_pct,
+        "pnl_today": ls.get("pnl_today", 0.0), "pnl_week": ls.get("pnl_week", 0.0),
         "pending_count": ls.get("pending", 0),
     }
 
@@ -627,7 +615,7 @@ def fmt_status(uid: int) -> str:
 
 def _fmt_status_live(uid: int) -> str:
     ls   = read_live_stats(uid)
-    ws   = live_wallet_stats(uid)
+    ws   = live_wallet_stats(uid, ls)   # reuse the parse ls already did
     scan = read_last_scan_meta(uid)
     since = _load_users().get(uid, {}).get("went_live_at", "")[:10]
     header = "*📊 Status* — 🟢 LIVE" + (f"  _(since {since})_" if since else "")
@@ -1229,9 +1217,12 @@ async def _live_deposit_reply(target, uid: int) -> None:
         return
     try:
         from weather import relayer, live_ledger
+        # Two independent JSON-RPC calls — overlap them instead of blocking serially.
         usdce, pusd = await asyncio.wait_for(
-            asyncio.to_thread(lambda: (relayer.usdce_balance(wallet),
-                                       relayer.pusd_balance(wallet))),
+            asyncio.gather(
+                asyncio.to_thread(relayer.usdce_balance, wallet),
+                asyncio.to_thread(relayer.pusd_balance, wallet),
+            ),
             timeout=30,
         )
     except Exception as exc:  # noqa: BLE001
