@@ -303,6 +303,13 @@ def _live_trades_csv_path(uid: int) -> Path:
     base = DATA_DIR / "logs" if uid == ADMIN_ID else user_log_dir(uid)
     return base / "live_trades.csv"
 
+def _active_trades_csv_path(uid: int) -> Path:
+    """The trade log for the user's CURRENT mode — live orders when live, paper
+    otherwise. Used by the 'current view' commands (/positions, /trades, /losses,
+    /why) so a live account sees its real trades, not the paper mirror. Paper-stat
+    readers (read_stats, wallet_stats) keep using _trades_csv_path unconditionally."""
+    return _live_trades_csv_path(uid) if get_user_mode(uid) == "live" else _trades_csv_path(uid)
+
 def _migrate_global_wallet() -> None:
     """One-time: move the legacy global ledger to the admin's per-user file."""
     admin_wallet = user_wallet_file(ADMIN_ID)
@@ -801,14 +808,15 @@ def _fmt_wallet_paper(uid: int) -> str:
 
 
 def fmt_positions(uid: int) -> str:
-    csv_path = _trades_csv_path(uid)
+    csv_path = _active_trades_csv_path(uid)
     if not csv_path.exists():
         return "No open positions."
 
     with csv_path.open() as f:
         rows = list(csv.DictReader(f))
 
-    pending = [r for r in rows if not r.get("resolved_at")]
+    # Exclude errored live rows (order never placed → not a real position).
+    pending = [r for r in rows if not r.get("resolved_at") and not r.get("error")]
     if not pending:
         return "✅ No open positions — all trades resolved."
 
@@ -887,7 +895,7 @@ def fmt_signals(signals: list[dict], uid: int) -> str:
 
 
 def fmt_trades(uid: int, n: int = 10) -> str:
-    trades_csv = _trades_csv_path(uid)
+    trades_csv = _active_trades_csv_path(uid)
     if not trades_csv.exists():
         return "No trades yet."
     with trades_csv.open() as f:
@@ -898,7 +906,8 @@ def fmt_trades(uid: int, n: int = 10) -> str:
     )[:n]
     if not resolved:
         return "No resolved trades yet."
-    lines = [f"*📋 Last {len(resolved)} Resolved Trades*\n"]
+    scope = "🟢 Live" if get_user_mode(uid) == "live" else "🟡 Paper"
+    lines = [f"*📋 Last {len(resolved)} Resolved Trades* — {scope}\n"]
     for r in resolved:
         pnl       = float(r.get("pnl_usd", 0))
         e         = "✅" if pnl > 0 else "❌"
@@ -918,7 +927,7 @@ def fmt_trades(uid: int, n: int = 10) -> str:
 
 def why_kb(uid: int, n: int = 10) -> InlineKeyboardMarkup | None:
     """❓ buttons for the trades shown by fmt_trades (same order, max 8)."""
-    trades_csv = _trades_csv_path(uid)
+    trades_csv = _active_trades_csv_path(uid)
     if not trades_csv.exists():
         return None
     with trades_csv.open() as f:
@@ -1153,7 +1162,7 @@ async def cmd_why(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
         return
-    trades_csv = _trades_csv_path(uid)
+    trades_csv = _active_trades_csv_path(uid)
     rows: list[dict] = []
     if trades_csv.exists():
         with trades_csv.open() as f:
@@ -1191,7 +1200,7 @@ async def cmd_losses(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             n = min(int(ctx.args[0]), 30)
         except ValueError:
             pass
-    trades_csv = _trades_csv_path(uid)
+    trades_csv = _active_trades_csv_path(uid)
     rows: list[dict] = []
     if trades_csv.exists():
         with trades_csv.open() as f:
@@ -1526,7 +1535,7 @@ async def cmd_setmaxbet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-@require_auth()
+@require_perm(perms.TRIGGER_SCAN)
 async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not has_permission(uid, perms.BYPASS_SCAN_COOLDOWN):
@@ -1550,7 +1559,7 @@ async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         summary = next((l for l in stdout.splitlines() if "evaluated" in l), "Scan complete.")
         await msg.edit_text(f"✅ {summary.strip()}", reply_markup=main_kb(uid))
 
-@require_auth()
+@require_perm(perms.TRIGGER_SCAN)
 async def cmd_resolve(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     msg = await update.effective_message.reply_text("⏳ Running auto-resolve...")
@@ -2148,7 +2157,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"🔴 Withdrawal failed: {str(e)[:200]}", reply_markup=main_kb(uid)
             )
     elif data.startswith("why:"):
-        trades_csv = _trades_csv_path(uid)
+        trades_csv = _active_trades_csv_path(uid)
         rows: list[dict] = []
         if trades_csv.exists():
             with trades_csv.open() as f:
