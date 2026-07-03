@@ -1310,18 +1310,32 @@ async def cmd_resolve(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 @require_perm(perms.USE_LEGACY_SETUP)
 async def cmd_setup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not ctx.args:
+    # Strip an explicit `replace` / `confirm` token from anywhere in the args.
+    replace = any(a.lower() in ("replace", "confirm") for a in ctx.args)
+    args = [a for a in ctx.args if a.lower() not in ("replace", "confirm")]
+    if not args:
         await update.message.reply_text(
             "*Setup your Polymarket account*\n\n"
             "Usage: `/setup <private_key> [proxy_address]`\n\n"
-            "Your private key is stored locally in `config/users.json`. "
-            "Send this command in a private chat with the bot.",
+            "Your private key is stored *encrypted* in `user_keys.enc.json` "
+            "(never in plain text). Send this command in a private chat with the bot.",
+            parse_mode="Markdown",
+        )
+        return
+    # Guard against silently replacing an existing wallet (fund-loss risk).
+    if get_user_key(uid) and not replace:
+        await update.message.reply_text(
+            "⚠️ *You already have a wallet.* `/setup` would replace its key — the old "
+            "key (and any funds) become *unrecoverable* unless backed up.\n\n"
+            "Back up first (`/wallet_setup` → 🔑 reveal), then run "
+            "`/setup <private_key> replace` to proceed.",
             parse_mode="Markdown",
         )
         return
     # Store key encrypted; scrub the plaintext arg from memory immediately
-    raw_key = ctx.args[0]
-    ctx.args[0] = "***"
+    raw_key = args[0]
+    for i in range(len(ctx.args)):
+        ctx.args[i] = "***"
     try:
         set_user_key(uid, raw_key)
     except RuntimeError as exc:
@@ -1332,8 +1346,8 @@ async def cmd_setup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if len(ctx.args) > 1:
-        proxy = ctx.args[1]
+    if len(args) > 1:
+        proxy = args[1]
         set_user_creds(uid, proxy_address=proxy, signature_type="gnosis-safe")
         with _users_transaction() as users:
             users[uid]["proxy_address"] = proxy

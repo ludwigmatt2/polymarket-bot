@@ -272,6 +272,50 @@ async def wallet_setup_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     return WALLET_CHOICE
 
 
+async def _do_create_wallet(q, uid: int) -> int:
+    """Generate a fresh EOA, store it (REPLACING any existing key), and wire the
+    V2 deposit wallet. Callers must confirm overwrite BEFORE calling this."""
+    address, pk = generate_wallet()
+    try:
+        set_user_creds(uid, pk=pk, proxy_address=None, signature_type="eoa")
+    except RuntimeError as exc:
+        await q.edit_message_text(f"❌ Key storage unavailable: {exc}")
+        return ConversationHandler.END
+    finally:
+        del pk
+    # Wire the V2 deposit wallet (derive from the EOA, store funder + sig=3 +
+    # L2 creds). Funds must go to the DEPOSIT WALLET, not the raw EOA. Only
+    # commit sig=3 + the deposit address if provisioning actually succeeded —
+    # otherwise creds stay EOA and we must not advertise a deposit wallet.
+    deposit_wallet = None
+    try:
+        res = await asyncio.to_thread(enable_deposit_wallet, uid)
+        deposit_wallet = res.get("funder_address")
+    except Exception:
+        deposit_wallet = None
+    provisioned = bool(deposit_wallet)
+    _set_user_fields(
+        uid,
+        wallet_address=address,
+        deposit_wallet=deposit_wallet,
+        wallet_type="generated-eoa",
+        signature_type=3 if provisioned else "eoa",
+        onboarded_at=datetime.utcnow().isoformat(),
+    )
+    fund_addr = deposit_wallet if provisioned else address
+    warn = "" if provisioned else (
+        "\n\n⚠️ Couldn't finish deposit-wallet setup (network). Setup retries "
+        "automatically when you go live — check back before funding."
+    )
+    await q.edit_message_text(
+        "*🆕 Wallet created* (key stored encrypted on the bot machine)\n\n"
+        + _FUNDING_TEXT.format(address=fund_addr) + warn,
+        reply_markup=_funding_kb(show_reveal=True),
+        parse_mode="Markdown",
+    )
+    return FUNDING
+
+
 async def on_wallet_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
@@ -281,50 +325,51 @@ async def on_wallet_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> in
         await q.edit_message_text(_DONE_TEXT, parse_mode="Markdown")
         return ConversationHandler.END
 
+    # Creating (or replacing) a wallet destroys the old key — guard it.
     if q.data == "ob_create":
-        address, pk = generate_wallet()
-        try:
-            set_user_creds(uid, pk=pk, proxy_address=None, signature_type="eoa")
-        except RuntimeError as exc:
-            await q.edit_message_text(f"❌ Key storage unavailable: {exc}")
-            return ConversationHandler.END
-        finally:
-            del pk
-        # Wire the V2 deposit wallet (derive from the EOA, store funder + sig=3 +
-        # L2 creds). Funds must go to the DEPOSIT WALLET, not the raw EOA. Only
-        # commit sig=3 + the deposit address if provisioning actually succeeded —
-        # otherwise creds stay EOA and we must not advertise a deposit wallet.
-        deposit_wallet = None
-        try:
-            res = await asyncio.to_thread(enable_deposit_wallet, uid)
-            deposit_wallet = res.get("funder_address")
-        except Exception:
-            deposit_wallet = None
-        provisioned = bool(deposit_wallet)
-        _set_user_fields(
-            uid,
-            wallet_address=address,
-            deposit_wallet=deposit_wallet,
-            wallet_type="generated-eoa",
-            signature_type=3 if provisioned else "eoa",
-            onboarded_at=datetime.utcnow().isoformat(),
-        )
-        fund_addr = deposit_wallet if provisioned else address
-        warn = "" if provisioned else (
-            "\n\n⚠️ Couldn't finish deposit-wallet setup (network). Setup retries "
-            "automatically when you go live — check back before funding."
-        )
+        existing = get_user_creds(uid) or {}
+        if existing.get("pk"):
+            addr = existing.get("funder_address") or "your existing wallet"
+            await q.edit_message_text(
+                "*⚠️ You already have a wallet*\n\n"
+                f"Current deposit wallet:\n`{addr}`\n\n"
+                "Creating a new one *replaces* it. The old private key is discarded "
+                "and any funds in the old wallet become *unrecoverable* unless you've "
+                "backed the key up first.\n\n"
+                "What do you want to do?",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔴 Replace (destroys old wallet)", callback_data="ob_create_confirm")],
+                    [InlineKeyboardButton("⬅️ Keep current wallet", callback_data="ob_keep")],
+                ]),
+                parse_mode="Markdown",
+            )
+            return WALLET_CHOICE
+        return await _do_create_wallet(q, uid)
+
+    if q.data == "ob_create_confirm":
+        return await _do_create_wallet(q, uid)
+
+    if q.data == "ob_keep":
+        creds = get_user_creds(uid) or {}
+        addr = creds.get("funder_address") or "(no deposit wallet on file)"
         await q.edit_message_text(
-            "*🆕 Wallet created* (key stored encrypted on the bot machine)\n\n"
-            + _FUNDING_TEXT.format(address=fund_addr) + warn,
+            "*✅ Keeping your current wallet.*\n\n"
+            + _FUNDING_TEXT.format(address=addr),
             reply_markup=_funding_kb(show_reveal=True),
             parse_mode="Markdown",
         )
         return FUNDING
 
     # ob_connect
+    replace_warn = ""
+    if (get_user_creds(uid) or {}).get("pk"):
+        replace_warn = (
+            "⚠️ *You already have a wallet* — pasting a key *replaces* it. Back up "
+            "your current key first (🔑 reveal option) if it holds funds.\n\n"
+        )
     await q.edit_message_text(
         "*🔗 Connect your Polymarket account*\n\n"
+        + replace_warn +
         "1. Open polymarket.com → click your profile → *Settings*\n"
         "2. Find *Export Private Key* and copy it\n"
         "3. Paste the key here as a normal message\n\n"
@@ -574,4 +619,9 @@ def build_conversation_handler() -> ConversationHandler:
         fallbacks=[CommandHandler("cancel", on_cancel)],
         conversation_timeout=600,
         per_chat=True,
+        # Let /start and /wallet_setup re-enter even if a previous conversation is
+        # still "active" (e.g. the user opened the wizard, never tapped a button,
+        # and the 10-min timeout hasn't fired). Without this, re-invoking
+        # /wallet_setup mid-conversation is silently dropped.
+        allow_reentry=True,
     )
