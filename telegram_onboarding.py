@@ -5,9 +5,9 @@ Flow (ConversationHandler, private chats only):
   /start <invite-code>        — registers the user, enters the wizard
   /wallet_setup               — re-entry point for already-registered users
 
-  WALLET_CHOICE  🆕 create wallet  /  🔗 connect Polymarket account  /  ⏭ skip
-  KEY_PASTE      (connect path) user pastes exported private key → encrypted store
-  PROXY_PASTE    (connect path) user pastes Polymarket deposit/proxy address
+  WALLET_CHOICE  🆕 create wallet  /  🔗 connect (import your own key)  /  ⏭ skip
+  KEY_PASTE      (connect path) user pastes a private key → its OWN V2 deposit
+                 wallet is derived (sig=3); no Polymarket proxy is stored
   FUNDING        funding instructions + on-demand balance check
 
 Invite codes live in config/invites.json; admin creates them with /invite.
@@ -37,7 +37,6 @@ from weather._io import atomic_write_text
 from weather.config import MIN_PROFIT_FACTOR, MIN_RESOLVED_TRADES
 from weather.paths import DATA_DIR
 from weather.secrets import (
-    derive_and_store_clob_creds,
     enable_deposit_wallet,
     get_user_creds,
     get_user_key,
@@ -49,7 +48,7 @@ INVITES_FILE = DATA_DIR / "config" / "invites.json"
 INVITE_TTL_DAYS = 7
 
 # Conversation states
-WALLET_CHOICE, KEY_PASTE, PROXY_PASTE, FUNDING = range(4)
+WALLET_CHOICE, KEY_PASTE, FUNDING = range(3)
 
 
 # ── Invite codes ──────────────────────────────────────────────────────────────
@@ -200,7 +199,10 @@ _FUNDING_TEXT = (
     "• Polymarket uses *USDC.e* (bridged USDC) — native USDC may not be tradeable\n"
     "• Also send a little *POL* (~0.2) for transaction gas\n\n"
     "Then tap *Check balance*. You start in *paper mode* either way — "
-    "no real money moves until you explicitly run /mymode live."
+    "no real money moves until you explicitly run /mymode live.\n\n"
+    "👁 *View this wallet read-only* (no login):\n"
+    "• Polymarket: polymarket.com/profile/{address}\n"
+    "• On-chain: polygonscan.com/address/{address}"
 )
 
 _DONE_TEXT = (
@@ -272,6 +274,37 @@ async def wallet_setup_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     return WALLET_CHOICE
 
 
+async def _provision_and_funding_text(uid: int, eoa_address: str, wallet_type: str, header: str) -> str:
+    """Wire the V2 deposit wallet for a just-stored key (derive funder + sig=3 +
+    L2 creds), persist the user's wallet metadata, and return the funding message.
+
+    The deposit wallet is the ONLY thing that trades via the bot — funds go there,
+    not to the raw EOA. Only commit sig=3 + the deposit address if provisioning
+    actually succeeded; otherwise creds stay EOA and we don't advertise a wallet.
+    """
+    deposit_wallet = None
+    try:
+        res = await asyncio.to_thread(enable_deposit_wallet, uid)
+        deposit_wallet = res.get("funder_address")
+    except Exception:
+        deposit_wallet = None
+    provisioned = bool(deposit_wallet)
+    _set_user_fields(
+        uid,
+        wallet_address=eoa_address,
+        deposit_wallet=deposit_wallet,
+        wallet_type=wallet_type,
+        signature_type=3 if provisioned else "eoa",
+        onboarded_at=datetime.utcnow().isoformat(),
+    )
+    fund_addr = deposit_wallet if provisioned else eoa_address
+    warn = "" if provisioned else (
+        "\n\n⚠️ Couldn't finish deposit-wallet setup (network). Setup retries "
+        "automatically when you go live — check back before funding."
+    )
+    return header + "\n\n" + _FUNDING_TEXT.format(address=fund_addr) + warn
+
+
 async def _do_create_wallet(q, uid: int) -> int:
     """Generate a fresh EOA, store it (REPLACING any existing key), and wire the
     V2 deposit wallet. Callers must confirm overwrite BEFORE calling this."""
@@ -283,36 +316,11 @@ async def _do_create_wallet(q, uid: int) -> int:
         return ConversationHandler.END
     finally:
         del pk
-    # Wire the V2 deposit wallet (derive from the EOA, store funder + sig=3 +
-    # L2 creds). Funds must go to the DEPOSIT WALLET, not the raw EOA. Only
-    # commit sig=3 + the deposit address if provisioning actually succeeded —
-    # otherwise creds stay EOA and we must not advertise a deposit wallet.
-    deposit_wallet = None
-    try:
-        res = await asyncio.to_thread(enable_deposit_wallet, uid)
-        deposit_wallet = res.get("funder_address")
-    except Exception:
-        deposit_wallet = None
-    provisioned = bool(deposit_wallet)
-    _set_user_fields(
-        uid,
-        wallet_address=address,
-        deposit_wallet=deposit_wallet,
-        wallet_type="generated-eoa",
-        signature_type=3 if provisioned else "eoa",
-        onboarded_at=datetime.utcnow().isoformat(),
+    text = await _provision_and_funding_text(
+        uid, address, "generated-eoa",
+        "*🆕 Wallet created* (key stored encrypted on the bot machine)",
     )
-    fund_addr = deposit_wallet if provisioned else address
-    warn = "" if provisioned else (
-        "\n\n⚠️ Couldn't finish deposit-wallet setup (network). Setup retries "
-        "automatically when you go live — check back before funding."
-    )
-    await q.edit_message_text(
-        "*🆕 Wallet created* (key stored encrypted on the bot machine)\n\n"
-        + _FUNDING_TEXT.format(address=fund_addr) + warn,
-        reply_markup=_funding_kb(show_reveal=True),
-        parse_mode="Markdown",
-    )
+    await q.edit_message_text(text, reply_markup=_funding_kb(show_reveal=True), parse_mode="Markdown")
     return FUNDING
 
 
@@ -399,6 +407,8 @@ async def on_key_paste(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
     try:
         set_user_creds(uid, pk=key)
+        from eth_account import Account
+        eoa = Account.from_key(key).address
     except RuntimeError as exc:
         await update.effective_chat.send_message(f"❌ Key storage unavailable: {exc}")
         return ConversationHandler.END
@@ -406,64 +416,19 @@ async def on_key_paste(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         del key
 
     warn = "" if deleted else (
-        "\n⚠️ I couldn't delete your message — *please delete it yourself now*."
+        "\n⚠️ I couldn't delete your message — *please delete it yourself now*.\n"
+    )
+    # Deposit-wallet-only model: the imported EOA gets its OWN deterministic V2
+    # deposit wallet (sig=3). We no longer store a Polymarket *proxy* address — the
+    # old proxy (email/Magic) flow can't trade via CLOB V2, so funds must live in
+    # the derived deposit wallet, exactly like a freshly-created wallet.
+    text = await _provision_and_funding_text(
+        uid, eoa, "imported-eoa", "*🔗 Key stored (encrypted).*" + warn,
     )
     await update.effective_chat.send_message(
-        "✅ Key stored (encrypted)." + warn + "\n\n"
-        "Now paste your *Polymarket deposit address* (shown on your portfolio page, "
-        "starts with 0x). This is the proxy wallet that holds your funds.\n"
-        "If you trade with a plain wallet (no Polymarket UI account), send *none*.",
-        parse_mode="Markdown",
+        text, reply_markup=_funding_kb(show_reveal=True), parse_mode="Markdown",
     )
-    return PROXY_PASTE
-
-
-async def on_proxy_paste(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    uid = update.effective_user.id
-    text = (update.message.text or "").strip()
-
-    if text.lower() in ("none", "no", "skip"):
-        set_user_creds(uid, signature_type="eoa")
-        _set_user_fields(
-            uid,
-            wallet_type="imported-eoa",
-            signature_type="eoa",
-            proxy_address=None,
-            onboarded_at=datetime.utcnow().isoformat(),
-        )
-    elif is_eth_address(text):
-        set_user_creds(uid, proxy_address=text, signature_type="gnosis-safe")
-        _set_user_fields(
-            uid,
-            wallet_address=text,
-            wallet_type="polymarket-proxy",
-            signature_type="gnosis-safe",
-            proxy_address=text,
-            onboarded_at=datetime.utcnow().isoformat(),
-        )
-    else:
-        await update.message.reply_text(
-            "❌ Not a valid address (need 0x + 40 hex chars). Paste again, send *none*, or /cancel.",
-            parse_mode="Markdown",
-        )
-        return PROXY_PASTE
-
-    await update.message.reply_text("✅ Account connected. Deriving trading credentials...")
-    try:
-        await asyncio.wait_for(
-            asyncio.to_thread(derive_and_store_clob_creds, uid),
-            timeout=20,
-        )
-        await update.effective_chat.send_message("🔑 L2 credentials derived and stored.")
-    except Exception as exc:
-        await update.effective_chat.send_message(
-            f"⚠️ Could not derive L2 credentials ({type(exc).__name__}). "
-            "Balance checks may show $0. Run /wallet\\_setup again to retry.",
-            parse_mode="Markdown",
-        )
-    await _balance_reply(update.effective_chat, uid)
-    await update.effective_chat.send_message(_DONE_TEXT, parse_mode="Markdown")
-    return ConversationHandler.END
+    return FUNDING
 
 
 def _seed_ledger_if_first(uid: int, amount: float) -> None:
@@ -613,7 +578,6 @@ def build_conversation_handler() -> ConversationHandler:
         states={
             WALLET_CHOICE: [CallbackQueryHandler(on_wallet_choice, pattern="^ob_")],
             KEY_PASTE: [MessageHandler(private & filters.TEXT & ~filters.COMMAND, on_key_paste)],
-            PROXY_PASTE: [MessageHandler(private & filters.TEXT & ~filters.COMMAND, on_proxy_paste)],
             FUNDING: [CallbackQueryHandler(on_funding_action, pattern="^ob_")],
         },
         fallbacks=[CommandHandler("cancel", on_cancel)],
