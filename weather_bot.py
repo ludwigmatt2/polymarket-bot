@@ -872,19 +872,37 @@ def main() -> None:
                     file=sys.stderr,
                 )
                 sys.exit(1)
-        live_trader = LiveTrader.from_creds(
-            _creds,
-            paper_trader=paper,
-            bankroll_usd=args.bankroll,
-            log_path=log_dir / "live_trades.csv",
-            idempotency_path=log_dir / "live_idempotency.json",
-        )
+        def _build_live_trader(creds):
+            return LiveTrader.from_creds(
+                creds,
+                paper_trader=paper,
+                bankroll_usd=args.bankroll,
+                log_path=log_dir / "live_trades.csv",
+                idempotency_path=log_dir / "live_idempotency.json",
+            )
+
+        live_trader = _build_live_trader(_creds)
         if not live_trader.is_unlocked():
             print("  Go-live gates not passed. Run: python weather_bot.py --mode stats", file=sys.stderr)
             sys.exit(1)
-        balance = live_trader.fetch_balance()
+        try:
+            balance = live_trader.fetch_balance()
+        except Exception as e:  # noqa: BLE001
+            # Stale L2 CLOB creds (e.g. after a wallet-key rotation) 401 on the first
+            # CLOB call. Re-derive once and rebuild, then retry — so unattended live
+            # scans self-heal instead of silently placing nothing.
+            if "invalid api key" not in str(e).lower():
+                raise
+            from weather.secrets import derive_and_store_clob_creds
+            print("  ⚠️  CLOB creds rejected (401) — re-deriving and retrying...", file=sys.stderr)
+            derive_and_store_clob_creds(admin_uid)
+            live_trader = _build_live_trader(get_user_creds(admin_uid))
+            balance = live_trader.fetch_balance()
+        # Kelly must size on REAL funds, never the CLI default (--bankroll defaults to
+        # 500). Cap to the actual wallet balance — mirrors the per-user fan-out path.
+        live_trader.bankroll_usd = min(live_trader.bankroll_usd, balance)
         from weather.config import MAX_LIVE_TRADE_USD, KELLY_FRACTION
-        print(f"  Live mode — bankroll=${args.bankroll:.0f}  USDC balance=${balance:.2f}  Kelly={KELLY_FRACTION:.2f}x  max_order=${MAX_LIVE_TRADE_USD:.0f}")
+        print(f"  Live mode — bankroll=${live_trader.bankroll_usd:.2f}  USDC balance=${balance:.2f}  Kelly={KELLY_FRACTION:.2f}x  max_order=${MAX_LIVE_TRADE_USD:.0f}")
         print()
 
     # paper / live mode — one-shot (interval=0) or continuous

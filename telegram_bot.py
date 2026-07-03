@@ -985,14 +985,22 @@ def _scan_cooldown_remaining(uid: int) -> float:
     elapsed = _time.monotonic() - _scan_last.get(uid, 0.0)
     return max(0.0, SCAN_COOLDOWN_SECS - elapsed)
 
+def _scan_args(mode: str) -> list[str]:
+    """weather_bot.py CLI for a one-shot root run in `mode` (+ fan-out to all users).
+    Both scan modes run one-shot; a *live* root scan is what actually places the
+    admin's live orders — paper never does. Resolve modes are already loop-free."""
+    args = [PYTHON, "weather_bot.py", "--mode", mode, "--all-users"]
+    if mode in ("paper", "live"):
+        args += ["--interval", "0"]
+    return args
+
+
 async def run_bot_async(mode: str, uid: int) -> tuple[str, str, int]:
     """Run weather_bot.py globally: root scan/resolve + fan-out to all users."""
     if _bot_run_lock.locked():
         return "", "A scan or resolve is already running — try again in a minute.", -2
     async with _bot_run_lock:
-        args = [PYTHON, "weather_bot.py", "--mode", mode, "--all-users"]
-        if mode == "paper":
-            args += ["--interval", "0"]
+        args = _scan_args(mode)
         proc = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE,
@@ -1000,11 +1008,14 @@ async def run_bot_async(mode: str, uid: int) -> tuple[str, str, int]:
             cwd=ROOT,
             env=os.environ.copy(),
         )
+        # Live scans add per-order placement + fill polling on top of the ~2-3 min
+        # market scan, so give them more headroom before the kill.
+        timeout = 600 if mode == "live" else 300
         try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
             proc.kill()
-            return "", "Timed out after 300s.", -1
+            return "", f"Timed out after {timeout}s.", -1
         return stdout.decode(), stderr.decode(), proc.returncode or 0
 
 
@@ -1538,7 +1549,9 @@ async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
     _scan_last[uid] = _time.monotonic()
     msg = await update.effective_message.reply_text("🔍 Scanning Polymarket...")
-    stdout, stderr, rc = await run_bot_async("paper", uid)
+    # The root scan runs in the ADMIN's mode — live when the admin is live, so a
+    # scan actually places the admin's live orders (fan-out excludes the admin).
+    stdout, stderr, rc = await run_bot_async(get_user_mode(ADMIN_ID), uid)
     if rc == -2:
         await msg.edit_text(f"⏳ {stderr}", reply_markup=main_kb(uid))
     elif rc != 0:
@@ -2177,7 +2190,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     elif data == "scan_confirm" and has_permission(uid, perms.TRIGGER_SCAN):
         await q.edit_message_text("🔍 Scanning Polymarket...")
-        stdout, stderr, rc = await run_bot_async("paper", uid)
+        stdout, stderr, rc = await run_bot_async(get_user_mode(ADMIN_ID), uid)
         if rc == -2:
             await q.edit_message_text(f"⏳ {stderr}", reply_markup=main_kb(uid))
         elif rc != 0:
@@ -2515,7 +2528,9 @@ async def _auto_scan(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         pass
 
     before = _count_trades(ADMIN_ID)
-    stdout, stderr, rc = await run_bot_async("paper", ADMIN_ID)
+    # Root scan runs in the admin's mode — live when live, so the scheduled scan
+    # places the admin's live orders autonomously (not just paper/calibration).
+    stdout, stderr, rc = await run_bot_async(get_user_mode(ADMIN_ID), ADMIN_ID)
     if rc == -2:
         return  # a scan/resolve was already running — skip silently
     if rc != 0:
