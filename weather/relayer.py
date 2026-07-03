@@ -23,6 +23,12 @@ from eth_utils import to_checksum_address
 
 from . import polymarket_v2 as pm
 
+# Relayer serialises actions per wallet: a new batch submitted while a prior one
+# is still settling is rejected with "wallet busy: active action exists". These
+# bound the retry that waits it out (≈ up to BUSY_RETRIES × BUSY_BACKOFF_SECS).
+BUSY_RETRIES = 6
+BUSY_BACKOFF_SECS = 5.0
+
 
 # ── read helpers (public RPC, fallback) ──────────────────────────────────────
 def _rpc(method: str, params: list):
@@ -137,19 +143,36 @@ class RelayerClient:
         return self._client
 
     def _batch(self, wallet: str, datas: list[tuple[str, str]]):
-        """Submit (target, calldata) pairs as one gasless batch from `wallet`."""
+        """Submit (target, calldata) pairs as one gasless batch from `wallet`.
+
+        Retries on the relayer's transient "wallet busy: active action exists"
+        (a prior batch — e.g. a just-submitted wrap — is still settling). Each
+        retry re-reads the on-chain nonce so it stays valid after the prior
+        action mines. Any other error propagates immediately.
+        """
         from py_builder_relayer_client.models import DepositWalletCall
         calls = [DepositWalletCall(target=to_checksum_address(t), value="0",
                                    data=d if d.startswith("0x") else "0x" + d)
                  for (t, d) in datas]
-        resp = self._relay().execute_deposit_wallet_batch(
-            calls=calls, wallet_address=to_checksum_address(wallet),
-            nonce=str(onchain_nonce(wallet)),
-            deadline=str(int(time.time()) + 240))
-        try:
-            return resp.wait()
-        except Exception:
-            return resp
+        last_exc: Exception | None = None
+        for _attempt in range(BUSY_RETRIES):
+            try:
+                resp = self._relay().execute_deposit_wallet_batch(
+                    calls=calls, wallet_address=to_checksum_address(wallet),
+                    nonce=str(onchain_nonce(wallet)),
+                    deadline=str(int(time.time()) + 240))
+            except Exception as e:  # noqa: BLE001
+                msg = str(e).lower()
+                if "wallet busy" in msg or "active action" in msg:
+                    last_exc = e  # bare `raise` can't re-raise it: `continue` leaves the except scope
+                    time.sleep(BUSY_BACKOFF_SECS)
+                    continue
+                raise
+            try:
+                return resp.wait()
+            except Exception:
+                return resp
+        raise last_exc  # retries exhausted (loop always runs → last_exc is set)
 
     def deploy_deposit_wallet(self, wallet: str):
         """Deploy the deposit wallet via the relayer (operator). Idempotent —

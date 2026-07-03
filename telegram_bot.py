@@ -2055,30 +2055,39 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         # Provision the deposit wallet for live: deploy (if needed) + wrap any
         # USDC.e → pUSD + approve exchanges (all gasless). Skips cleanly for
-        # users without a deposit wallet (legacy/paper). Never blocks the flip on
-        # a transient relayer hiccup — surfaces a warning instead.
-        from weather.secrets import get_user_creds, prepare_for_live
+        # users without a deposit wallet (legacy/paper), which flip directly.
+        from weather.secrets import get_user_creds
         _c = get_user_creds(uid) or {}
         prep_note = ""
         if _c.get("signature_type") == 3 and _c.get("funder_address"):
             await q.edit_message_text("⏳ Preparing your deposit wallet for live…")
             import asyncio
-            # Record the funded USDC.e as a real deposit BEFORE prepare_for_live
-            # wraps it to pUSD — otherwise a user who funded but never ran /deposit
-            # would have a $0 deposit basis and an infinite/blank live return.
-            try:
-                from weather import relayer, live_ledger
-                _usdce = await asyncio.to_thread(relayer.usdce_balance, _c["funder_address"])
-                live_ledger.reconcile_deposit(_live_wallet_file(uid), _usdce)
-            except Exception:
-                pass
-            prep = await asyncio.to_thread(prepare_for_live, uid)
-            if prep.get("error"):
-                prep_note = f"\n⚠️ Wallet prep incomplete: {prep['error'][:120]}"
-            elif prep.get("pusd", 0) <= 0:
-                prep_note = "\n⚠️ Deposit wallet has $0 pUSD — fund it (USDC.e) before orders can fill."
-            else:
-                prep_note = f"\n💰 Deposit wallet ready: ${prep['pusd']:,.2f} pUSD."
+            # Record the funded USDC.e as a real deposit BEFORE it is wrapped to pUSD
+            # (else a user who funded but never ran /deposit has a $0 basis / blank
+            # return) — _record_and_prepare enforces that reconcile-before-wrap order.
+            from weather import relayer
+            _usdce = await asyncio.to_thread(relayer.usdce_balance, _c["funder_address"])
+            prep = await asyncio.to_thread(_record_and_prepare, uid, _usdce)
+            # Provisioning MUST succeed before we flip. A half-live state (mode=live
+            # but wallet unwrapped/unapproved) silently fails every order — the exact
+            # trap this replaces. Stay in paper and surface the reason as PLAIN text
+            # (raw relayer errors contain characters that crash Markdown parsing —
+            # that Markdown crash is what previously hid the failure entirely).
+            if not prep.get("ready"):
+                if prep.get("error"):
+                    reason = f"⚠️ Wallet prep failed: {prep['error'][:200]}"
+                elif prep.get("pusd", 0) <= 0:
+                    reason = ("⚠️ Deposit wallet has $0 pUSD — fund it with USDC.e on "
+                              "Polygon first, then run /mymode live again.")
+                else:
+                    reason = "⚠️ Wallet prep did not complete."
+                await q.edit_message_text(
+                    "🔴 Still in PAPER — go-live aborted.\n" + reason
+                    + "\n\nYour funds are safe. Re-run /mymode live to retry.",
+                    reply_markup=main_kb(uid),  # no parse_mode → error text can't crash the send
+                )
+                return
+            prep_note = f"\n💰 Deposit wallet ready: ${prep['pusd']:,.2f} pUSD."
         with _users_transaction() as users:
             users[uid]["mode"] = "live"
             users[uid]["live_confirmed_at"] = datetime.utcnow().isoformat()
@@ -2422,8 +2431,79 @@ def _count_trades(uid: int) -> int:
         return 0
 
 
+def _record_and_prepare(uid: int, usdce: float) -> dict:
+    """Record `usdce` (the wallet's current on-chain USDC.e) as a deposit, THEN wrap
+    + approve it via prepare_for_live. The ordering is load-bearing: wrapping
+    USDC.e→pUSD before reconciling would zero the deposit basis — so both the go-live
+    flip and the auto-scan top-up path go through here rather than repeating it.
+    Reconcile is best-effort; returns the prepare_for_live result with the
+    freshly-detected deposit merged in as `detected`.
+    """
+    from weather import live_ledger
+    from weather.secrets import prepare_for_live
+    detected = 0.0
+    try:
+        detected = live_ledger.reconcile_deposit(_live_wallet_file(uid), usdce)
+    except Exception:  # noqa: BLE001 — ledger write is best-effort, never blocks the wrap
+        pass
+    return {**prepare_for_live(uid), "detected": detected}
+
+
+def _wrap_pending_live_deposits() -> list[dict]:
+    """Wrap any newly-deposited USDC.e → pUSD for every LIVE user so top-ups become
+    tradeable without a manual /mymode re-flip.
+
+    Cheap when idle: one balance read per live user, and it only acts when USDC.e > 0.
+    Never raises — one user's failure never blocks the others. Returns
+    [{uid, wrapped, pusd, fresh, error?}] for wallets that had unwrapped funds this
+    cycle (caller notifies).
+    """
+    from weather import relayer
+    from weather.secrets import get_user_creds
+    out: list[dict] = []
+    for uid in all_user_ids():
+        try:
+            if get_user_mode(uid) != "live":
+                continue
+            c = get_user_creds(uid) or {}
+            if c.get("signature_type") != 3 or not c.get("funder_address"):
+                continue
+            usdce = relayer.usdce_balance(c["funder_address"])
+            if usdce <= 0:
+                continue
+            prep = _record_and_prepare(uid, usdce)
+            rec = {"uid": uid, "wrapped": round(usdce, 2),
+                   "pusd": prep.get("pusd", 0.0), "fresh": prep.get("detected", 0) > 0}
+            if prep.get("error"):
+                rec["error"] = prep["error"]
+            out.append(rec)
+        except Exception as e:  # noqa: BLE001 — isolate per-user failures
+            out.append({"uid": uid, "wrapped": 0.0, "pusd": 0.0, "fresh": False, "error": str(e)})
+    return out
+
+
 async def _auto_scan(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Scheduled job: paper scan + fan-out to all users. Runs every AUTO_SCAN_INTERVAL seconds."""
+    # Auto-wrap any new USDC.e deposits → pUSD BEFORE the scan reads balances, so a
+    # top-up is tradeable on this very scan (no manual /mymode re-flip needed).
+    async def _dm(uid, text):
+        try:
+            await ctx.bot.send_message(uid, text)
+        except Exception:
+            pass
+    try:
+        for w in await asyncio.to_thread(_wrap_pending_live_deposits):
+            if w.get("error") and w.get("fresh"):  # alert on a NEW deposit, not a stuck balance
+                await _dm(w["uid"],
+                          f"⚠️ Auto-wrap of a new ${w['wrapped']:.2f} USDC.e deposit "
+                          f"didn't finish: {str(w['error'])[:150]}\nIt'll retry next scan.")
+            elif not w.get("error") and w.get("pusd", 0) > 0:
+                await _dm(w["uid"],
+                          f"💰 ${w['wrapped']:.2f} new deposit wrapped — "
+                          f"${w['pusd']:,.2f} pUSD now tradeable.")
+    except Exception:
+        pass
+
     before = _count_trades(ADMIN_ID)
     stdout, stderr, rc = await run_bot_async("paper", ADMIN_ID)
     if rc == -2:
