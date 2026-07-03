@@ -1029,7 +1029,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/scanreport — scan funnel: what was fetched, rejected, taken",
         "/losses [n] — losing trades with causes\n",
         "*Wallet & withdrawals*",
-        "/deposit <amount> [note] — record a deposit",
+        "/deposit — paper: record simulated capital · live: fund address + balance",
+        "/exportkey — reveal your key (60s) to view/trade on Polymarket",
         "/withdraw <amount|all> <0xaddr> — withdraw to an allowlisted address",
         "/allowlist — view allowlist & daily cap",
         "/allowlist\\_add <0xaddr> [label] — allowlist an address (24h cooling-off)",
@@ -1071,6 +1072,40 @@ async def cmd_paperstats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         _fmt_status_paper(uid), reply_markup=main_kb(uid), parse_mode="Markdown",
     )
+
+async def _autodelete_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        await ctx.bot.delete_message(ctx.job.data["chat_id"], ctx.job.data["message_id"])
+    except Exception:
+        pass
+
+@require_auth()
+async def cmd_exportkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Reveal YOUR OWN private key once (auto-deletes in 60s) so you can import it
+    into a browser wallet and view/trade this account on polymarket.com. Audited."""
+    uid = update.effective_user.id
+    from weather.secrets import get_user_creds
+    creds = get_user_creds(uid) or {}
+    pk = creds.get("pk")
+    if not pk:
+        await update.effective_message.reply_text(
+            "No key stored — run /wallet\\_setup first.", parse_mode="Markdown")
+        return
+    audit_log("private_key_revealed", actor=uid)
+    wallet = creds.get("funder_address") or ""
+    view = (f"\n\n👁 View read-only (no key needed):\n"
+            f"polymarket.com/profile/{wallet}\npolygonscan.com/address/{wallet}") if wallet else ""
+    msg = await update.effective_message.reply_text(
+        "🔑 *Your private key* (auto-deletes in 60s — copy it NOW):\n"
+        f"`{pk}`\n\n"
+        "Import it into a browser wallet (e.g. MetaMask) → *Connect Wallet* on "
+        "polymarket.com to view/trade this account.\n"
+        "⚠️ Anyone with this key controls your funds — only do this on a device you "
+        "trust, and never share it." + view,
+        parse_mode="Markdown",
+    )
+    ctx.job_queue.run_once(_autodelete_job, 60,
+                           data={"chat_id": msg.chat_id, "message_id": msg.message_id})
 
 @require_auth()
 async def cmd_wallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2485,6 +2520,7 @@ async def _run() -> None:
         ("scan",        cmd_scan),
         ("resolve",     cmd_resolve),
         ("setup",       cmd_setup),
+        ("exportkey",   cmd_exportkey),
         ("mymode",      cmd_mymode),
         ("deposit",     cmd_deposit),
         ("withdraw",    cmd_withdraw),
