@@ -297,6 +297,12 @@ def _live_wallet_file(uid: int) -> Path:
     base = DATA_DIR / "logs" if uid == ADMIN_ID else user_log_dir(uid)
     return base / "live_wallet.json"
 
+def _live_trades_csv_path(uid: int) -> Path:
+    """Real live-order log — admin at the root, others in their dir (matches where
+    weather_bot writes live_trades.csv)."""
+    base = DATA_DIR / "logs" if uid == ADMIN_ID else user_log_dir(uid)
+    return base / "live_trades.csv"
+
 def _migrate_global_wallet() -> None:
     """One-time: move the legacy global ledger to the admin's per-user file."""
     admin_wallet = user_wallet_file(ADMIN_ID)
@@ -476,6 +482,72 @@ def read_stats(uid: int) -> dict:
         "gates_passed": len(resolved) >= 20 and pf is not None and pf >= 1.5,
     }
 
+def read_live_stats(uid: int) -> dict:
+    """Real-money stats from live_trades.csv — the clean slate that begins at
+    go-live. Errored rows (order never placed) are excluded."""
+    csv_path = _live_trades_csv_path(uid)
+    if not csv_path.exists():
+        return {}
+    with csv_path.open() as f:
+        rows = [r for r in csv.DictReader(f) if not r.get("error")]
+
+    resolved = [r for r in rows if r.get("resolved_at")]
+    wins   = [r for r in resolved if r.get("pnl_usd") and float(r["pnl_usd"]) > 0]
+    losses = [r for r in resolved if r.get("pnl_usd") and float(r["pnl_usd"]) < 0]
+    gross_win  = sum(float(r["pnl_usd"]) for r in wins)
+    gross_loss = abs(sum(float(r["pnl_usd"]) for r in losses))
+    pf         = gross_win / gross_loss if gross_loss > 0 else None
+    total_pnl  = sum(float(r["pnl_usd"]) for r in resolved if r.get("pnl_usd"))
+    deployed   = sum(float(r["size_usd"]) for r in rows
+                     if not r.get("resolved_at") and r.get("size_usd"))
+    return {
+        "total": len(rows),
+        "resolved": len(resolved),
+        "pending": len(rows) - len(resolved),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": len(wins) / len(resolved) * 100 if resolved else None,
+        "profit_factor": pf,
+        "total_pnl": total_pnl,
+        "deployed": deployed,
+    }
+
+def live_wallet_stats(uid: int) -> dict:
+    """Wallet view from REAL money: net on-chain deposits + realized live PnL.
+    Return % is computed from actual capital invested, not simulated paper deposits."""
+    from weather import live_ledger
+    t   = live_ledger.totals(_live_wallet_file(uid))
+    ls  = read_live_stats(uid) or {}
+    realized = ls.get("total_pnl", 0.0)
+    deployed = ls.get("deployed", 0.0)
+    deposited, withdrawn, net = t["deposited"], t["withdrawn"], t["net"]
+
+    # Accounting balance (deposits − withdrawals + realized PnL). The on-chain pUSD
+    # is the source of truth shown by /deposit; this is the ROI ledger view.
+    balance    = net + realized
+    available  = balance - deployed
+    return_pct = (realized / deposited * 100) if deposited > 0 else None
+
+    today_str  = datetime.utcnow().strftime("%Y-%m-%d")
+    week_start = (datetime.utcnow() - timedelta(days=7)).isoformat()
+    csv_path   = _live_trades_csv_path(uid)
+    resolved: list[dict] = []
+    if csv_path.exists():
+        with csv_path.open() as f:
+            resolved = [r for r in csv.DictReader(f)
+                        if r.get("resolved_at") and not r.get("error")]
+    pnl_today = sum(float(r["pnl_usd"]) for r in resolved
+                    if r.get("pnl_usd") and r.get("resolved_at", "")[:10] == today_str)
+    pnl_week  = sum(float(r["pnl_usd"]) for r in resolved
+                    if r.get("pnl_usd") and r.get("resolved_at", "") >= week_start)
+    return {
+        "deposited": deposited, "withdrawn": withdrawn,
+        "deployed": deployed, "realized_pnl": realized,
+        "wallet_balance": balance, "available": available,
+        "return_pct": return_pct, "pnl_today": pnl_today, "pnl_week": pnl_week,
+        "pending_count": ls.get("pending", 0),
+    }
+
 def read_last_signals(uid: int) -> list[dict]:
     f = _signals_path(uid)
     if not f.exists():
@@ -538,6 +610,47 @@ def _extract_city(title: str) -> str:
 # ── Formatters ────────────────────────────────────────────────────────────────
 
 def fmt_status(uid: int) -> str:
+    """Live accounts see ONLY their real-money record (clean slate from go-live);
+    paper accounts see the paper record + go-live gate. Paper data is never lost —
+    it keeps feeding calibration and is viewable via /paperstats."""
+    if get_user_mode(uid) == "live":
+        return _fmt_status_live(uid)
+    return _fmt_status_paper(uid)
+
+
+def _fmt_status_live(uid: int) -> str:
+    ls   = read_live_stats(uid)
+    ws   = live_wallet_stats(uid)
+    scan = read_last_scan_meta(uid)
+    since = _load_users().get(uid, {}).get("went_live_at", "")[:10]
+    header = "*📊 Status* — 🟢 LIVE" + (f"  _(since {since})_" if since else "")
+
+    if not ls:
+        return (header + "\n\nNo live trades yet — real orders execute on the next "
+                "scheduled scan.\nFund with /deposit.")
+
+    lines = [header + "\n"]
+    if ws["return_pct"] is not None:
+        sign = "+" if ws["return_pct"] >= 0 else ""
+        lines.append(f"📈 *{sign}{ws['return_pct']:.1f}% return*"
+                     f"   (${ws['realized_pnl']:+,.2f} on ${ws['deposited']:,.2f} real)")
+    else:
+        lines.append(f"📈 Realized PnL: *${ws['realized_pnl']:+,.2f}*"
+                     f"   _(fund via /deposit to track ROI %)_")
+    lines.append(f"\n{ls['resolved']} resolved · {ls['pending']} open · {ls['total']} total")
+    if ls["win_rate"] is not None:
+        lines.append(f"Win rate:      {ls['win_rate']:.1f}%  ({ls['wins']}W / {ls['losses']}L)")
+    if ls["profit_factor"] is not None:
+        lines.append(f"Prof. factor:  {ls['profit_factor']:.2f}")
+    lines.append(f"Deployed now:  ${ws['deployed']:,.2f}  ·  Available ${ws['available']:,.2f}")
+    if scan:
+        lines.append(f"\nLast scan: {scan['scanned_at']} UTC"
+                     f" · {scan['high_conf']} high-conf / {scan['total']} signals")
+    lines.append("\n_Paper/model record: /paperstats_")
+    return "\n".join(lines)
+
+
+def _fmt_status_paper(uid: int) -> str:
     s    = read_stats(uid)
     ws   = wallet_stats(uid)
     mode = get_mode(uid)
@@ -605,6 +718,42 @@ def fmt_status(uid: int) -> str:
 
 
 def fmt_wallet(uid: int) -> str:
+    if get_user_mode(uid) == "live":
+        return _fmt_wallet_live(uid)
+    return _fmt_wallet_paper(uid)
+
+
+def _fmt_wallet_live(uid: int) -> str:
+    ws = live_wallet_stats(uid)
+    lines = ["*💼 Wallet* — 🟢 LIVE (real money)\n"]
+    if ws["deposited"] == 0:
+        lines.append("No real deposits yet.")
+        lines.append("Use /deposit to see your funding address + on-chain balance.\n")
+        lines.append(f"Realized PnL (live):  *${ws['realized_pnl']:+,.2f}*")
+        lines.append(f"Deployed right now:   ${ws['deployed']:,.2f}")
+        return "\n".join(lines)
+    ret_str = ""
+    if ws["return_pct"] is not None:
+        sign = "+" if ws["return_pct"] >= 0 else ""
+        ret_str = f"  ({sign}{ws['return_pct']:.1f}%)"
+    lines.append(f"💰 Balance:   *${ws['wallet_balance']:,.2f}*{ret_str}")
+    lines.append(f"├─ Deposited  ${ws['deposited']:,.2f}  _(real, on-chain)_")
+    if ws["withdrawn"] > 0:
+        lines.append(f"├─ Withdrawn  -${ws['withdrawn']:,.2f}")
+    lines.append(f"├─ Deployed   ${ws['deployed']:,.2f}  ({ws['pending_count']} open positions)")
+    avail_sign = "+" if ws["available"] >= 0 else ""
+    lines.append(f"└─ Available  {avail_sign}${ws['available']:,.2f}")
+    lines.append(f"\n📊 *Realized PnL (live)*")
+    lines.append(f"All-time:  *${ws['realized_pnl']:+,.2f}*")
+    if abs(ws["pnl_week"]) > 0:
+        lines.append(f"This week: ${ws['pnl_week']:+,.2f}")
+    if abs(ws["pnl_today"]) > 0:
+        lines.append(f"Today:     ${ws['pnl_today']:+,.2f}")
+    lines.append(f"\n_On-chain balance: /deposit · Paper record: /paperstats_")
+    return "\n".join(lines)
+
+
+def _fmt_wallet_paper(uid: int) -> str:
     ws   = wallet_stats(uid)
     mode = get_mode(uid)
     txns = read_wallet(uid).get("transactions", [])
@@ -870,6 +1019,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = [
         "*Portfolio*",
         "/status — overview: return %, win rate, gates",
+        "/paperstats — paper/model record (always available, even when live)",
         "/wallet — balance, deployed, PnL breakdown",
         "/positions — open trades grouped by date & city",
         "/trades [n] — last N resolved trades (default 10)",
@@ -911,6 +1061,15 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     await update.effective_message.reply_text(
         fmt_status(uid), reply_markup=main_kb(uid), parse_mode="Markdown",
+    )
+
+@require_auth()
+async def cmd_paperstats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """The paper/model track record — always available, even when trading live
+    (it keeps feeding calibration)."""
+    uid = update.effective_user.id
+    await update.effective_message.reply_text(
+        _fmt_status_paper(uid), reply_markup=main_kb(uid), parse_mode="Markdown",
     )
 
 @require_auth()
@@ -1869,6 +2028,15 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if _c.get("signature_type") == 3 and _c.get("funder_address"):
             await q.edit_message_text("⏳ Preparing your deposit wallet for live…")
             import asyncio
+            # Record the funded USDC.e as a real deposit BEFORE prepare_for_live
+            # wraps it to pUSD — otherwise a user who funded but never ran /deposit
+            # would have a $0 deposit basis and an infinite/blank live return.
+            try:
+                from weather import relayer, live_ledger
+                _usdce = await asyncio.to_thread(relayer.usdce_balance, _c["funder_address"])
+                live_ledger.reconcile_deposit(_live_wallet_file(uid), _usdce)
+            except Exception:
+                pass
             prep = await asyncio.to_thread(prepare_for_live, uid)
             if prep.get("error"):
                 prep_note = f"\n⚠️ Wallet prep incomplete: {prep['error'][:120]}"
@@ -1879,6 +2047,8 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         with _users_transaction() as users:
             users[uid]["mode"] = "live"
             users[uid]["live_confirmed_at"] = datetime.utcnow().isoformat()
+            # First-ever go-live: marks the start of the real-money track record.
+            users[uid].setdefault("went_live_at", users[uid]["live_confirmed_at"])
         audit_log("mode_live", actor=uid)
         if uid != ADMIN_ID:
             await notify_owner(ctx.bot, f"🟢 User `{uid}` switched to LIVE trading.")
@@ -2138,6 +2308,7 @@ async def check_alerts(ctx: ContextTypes.DEFAULT_TYPE) -> None:
 _USER_COMMANDS = [
     ("help",        "❓ All commands & usage"),
     ("status",      "📊 Portfolio overview: return %, win rate, gates"),
+    ("paperstats",  "📝 Paper/model track record (always available)"),
     ("wallet",      "💼 Balance, deployed capital & PnL breakdown"),
     ("positions",   "📍 Open trades grouped by date & city"),
     ("trades",      "📋 Last resolved trades"),
@@ -2303,6 +2474,7 @@ async def _run() -> None:
     for cmd, handler in [
         ("help",        cmd_help),
         ("status",      cmd_status),
+        ("paperstats",  cmd_paperstats),
         ("wallet",      cmd_wallet),
         ("positions",   cmd_positions),
         ("signals",     cmd_signals),
