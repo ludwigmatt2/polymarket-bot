@@ -76,9 +76,14 @@ def reconcile_deposit(path: Path, usdce_now: float, *, min_delta: float = 0.01) 
     return detected
 
 
-def net_deposited(path: Path) -> float:
-    """Net real capital in = deposits − withdrawals. The basis for live ROI."""
+def totals(path: Path) -> dict:
+    """Gross deposited / withdrawn / net, for the wallet view."""
     txns = read_ledger(path).get("transactions", [])
     dep = sum(t["amount"] for t in txns if t.get("type") == "deposit")
     wd = sum(t["amount"] for t in txns if t.get("type") == "withdraw")
-    return round(dep - wd, 6)
+    return {"deposited": round(dep, 6), "withdrawn": round(wd, 6), "net": round(dep - wd, 6)}
+
+
+def net_deposited(path: Path) -> float:
+    """Net real capital in = deposits − withdrawals. The basis for live ROI."""
+    return totals(path)["net"]
