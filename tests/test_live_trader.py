@@ -549,6 +549,50 @@ class TestGeoblock:
 # On-chain position reconciliation (Data API /positions)
 # ---------------------------------------------------------------------------
 
+class TestOnChainAutoResolve:
+    """Live trades book PnL from on-chain settlement, not weather forecasts."""
+
+    def _rows(self):
+        # A NO winner (currentValue full), a NO loser ($0), and one not-yet-settled.
+        base = {"direction": "NO", "filled_size": "10", "filled_price": "0.60",
+                "model_p": "0.20", "weather_direction": "range", "actual_outcome": ""}
+        return [
+            {**base, "market_id": "0xWIN"},
+            {**base, "market_id": "0xLOSE"},
+            {**base, "market_id": "0xPENDING"},
+        ]
+
+    def test_books_from_onchain_payout(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        _write_live_trades(trader._log_path, self._rows())
+        trader.fetch_positions = lambda: [
+            {"conditionId": "0xWIN", "redeemable": True, "currentValue": 10.0, "curPrice": 1.0},
+            {"conditionId": "0xLOSE", "redeemable": True, "currentValue": 0.0, "curPrice": 0.0},
+            {"conditionId": "0xPENDING", "redeemable": False, "currentValue": 10.0},
+        ]
+        resolved, _ = trader.auto_resolve()
+        assert resolved == 2  # pending one stays unbooked
+
+        import csv as _csv
+        rows = {r["market_id"]: r for r in _csv.DictReader(open(trader._log_path))}
+        # NO winner: outcome (YES-condition) False -> 0; pnl = size*(1-price) = +4.0
+        assert rows["0xWIN"]["actual_outcome"] == "0"
+        assert float(rows["0xWIN"]["pnl_usd"]) == pytest.approx(10 * (1 - 0.60))
+        # NO loser: outcome True -> 1; pnl = -size*price = -6.0
+        assert rows["0xLOSE"]["actual_outcome"] == "1"
+        assert float(rows["0xLOSE"]["pnl_usd"]) == pytest.approx(-10 * 0.60)
+        # Pending: untouched
+        assert rows["0xPENDING"]["actual_outcome"] == ""
+
+    def test_skips_all_when_positions_api_down(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        _write_live_trades(trader._log_path, self._rows())
+        trader.fetch_positions = lambda: None
+        assert trader.auto_resolve() == (0, 0)
+        rows = list(csv.DictReader(open(trader._log_path)))
+        assert all(r["actual_outcome"] == "" for r in rows)
+
+
 class TestPositionsReconciliation:
     def test_fetch_positions_empty_without_wallet(self, tmp_path):
         trader = _make_trader(tmp_path)  # no funder_address

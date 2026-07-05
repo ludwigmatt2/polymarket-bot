@@ -433,14 +433,33 @@ class LiveTrader:
             "status": order_status,
         }
 
-    def auto_resolve(self, weather_client, model=None) -> tuple[int, int]:
-        """
-        Fetch actual outcomes and resolve unresolved live trades.
-        Respects location_tz stored per-trade; falls back to UTC for pre-fix rows.
+    def auto_resolve(self, weather_client=None, model=None) -> tuple[int, int]:
+        """Resolve unresolved live trades from ON-CHAIN settlement — the money's
+        ground truth — not from weather forecasts.
+
+        Polymarket resolves each market off its own reference source, so booking
+        PnL from Open-Meteo mismarks near-bucket-edge outcomes (on Jul 4, three of
+        eight live trades that Open-Meteo scored as wins actually lost on-chain,
+        and vice-versa). A trade is booked only once its market has settled
+        on-chain (its position is `redeemable`); win/loss comes from the settled
+        payout. Markets not yet settled stay pending and are retried next pass.
+
+        `weather_client` is accepted for call-site compatibility but unused.
         Returns (resolved_count, skipped_count).
         """
         if not self._log_path.exists():
             return 0, 0
+
+        positions = self.fetch_positions()
+        if positions is None:
+            return 0, 0  # positions API unavailable — book nothing, retry next pass
+
+        # Index settled (on-chain resolved) positions by conditionId.
+        settled: dict[str, dict] = {}
+        for p in positions:
+            cond = (p.get("conditionId") or "").lower()
+            if cond and p.get("redeemable"):
+                settled[cond] = p
 
         now = datetime.now(timezone.utc)
         with open(self._log_path) as f:
@@ -451,59 +470,47 @@ class LiveTrader:
             if t.get("actual_outcome") in ("0", "1", 0, 1):
                 continue
 
-            res_date_str = t.get("resolution_date", "")
-            if not res_date_str:
-                skipped += 1
-                continue
-            res_dt = datetime.fromisoformat(res_date_str)
-            if not res_dt.tzinfo:
-                res_dt = res_dt.replace(tzinfo=timezone.utc)
-            if res_dt > now:
-                continue
-
-            metric = t.get("metric", "")
-            lat_str = t.get("lat", "")
-            lon_str = t.get("lon", "")
-            if not metric or not lat_str or not lon_str:
-                skipped += 1
-                continue
+            cond = (t.get("market_id") or "").lower()
+            pos = settled.get(cond)
+            if pos is None:
+                continue  # market not yet resolved on-chain — stay pending
 
             try:
-                lat, lon = float(lat_str), float(lon_str)
-                threshold = float(t["threshold"])
-                threshold_high = float(t["threshold_high"]) if t.get("threshold_high") else None
-                w_dir = t.get("weather_direction", "above")
                 filled_size = float(t.get("filled_size", 0) or 0)
                 filled_price = float(t.get("filled_price", 0) or 0)
             except (ValueError, KeyError):
                 skipped += 1
                 continue
-
             if filled_size <= 0:
                 skipped += 1
                 continue
 
-            loc_tz = t.get("location_tz") or "UTC"
-            loc = Location(city="", lat=lat, lon=lon, timezone=loc_tz)
-            actual_val = weather_client.get_historical_actual(loc, res_dt.date(), metric)
-            if actual_val is None:
-                skipped += 1
-                continue
-
-            outcome = _evaluate_outcome(actual_val, threshold, w_dir, threshold_high)
-
-            # PnL: filled_size is contracts; filled_price is cost per contract
-            if t.get("direction") == "YES":
-                pnl = filled_size * ((1.0 - filled_price) if outcome else -filled_price)
-            else:
-                pnl = filled_size * ((1.0 - filled_price) if (not outcome) else -filled_price)
+            # Settled payout: a winning outcome token is worth $1 (currentValue ≈
+            # size), a losing one $0. curPrice (0/1 post-resolution) is the tiebreak.
+            won_bet = (
+                float(pos.get("currentValue") or 0) > 1e-9
+                or float(pos.get("curPrice") or 0) >= 0.5
+            )
+            direction = t.get("direction", "NO")
+            # YES-condition truth = what the market actually resolved to.
+            outcome = won_bet if direction == "YES" else (not won_bet)
+            pnl = filled_size * ((1.0 - filled_price) if won_bet else -filled_price)
 
             model_p = float(t.get("model_p", 0.5) or 0.5)
+            w_dir = t.get("weather_direction", "above")
             t["actual_outcome"] = int(outcome)
             t["resolved_at"] = now.isoformat()
             t["pnl_usd"] = round(pnl, 4)
             t["brier_score"] = round(_brier(model_p, outcome), 4)
-            eur_rate = _fetch_ecb_rate(res_dt.date())
+
+            res_date_str = t.get("resolution_date", "")
+            eur_date = now.date()
+            if res_date_str:
+                try:
+                    eur_date = datetime.fromisoformat(res_date_str).date()
+                except ValueError:
+                    pass
+            eur_rate = _fetch_ecb_rate(eur_date)
             if eur_rate is not None:
                 t["eur_rate"] = eur_rate
                 t["pnl_eur"] = round(pnl * eur_rate, 4)

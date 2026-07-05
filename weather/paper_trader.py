@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import subprocess
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, time as _time, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from ._io import atomic_write_csv
 from .config import (
@@ -215,6 +217,10 @@ class PaperTrader:
                 continue
 
             loc_tz = t.get("location_tz") or "UTC"
+            # Wait until the event's local day is over + settled, so we read the
+            # final daily max/min from the archive, not a mid-day forecast.
+            if not _settle_ready(res_dt, loc_tz, now):
+                continue
             loc = Location(city="", lat=lat, lon=lon, timezone=loc_tz)
             actual_val = weather_client.get_historical_actual(loc, res_dt.date(), metric)
             if actual_val is None:
@@ -400,6 +406,29 @@ class PaperTrader:
 
     def _rewrite_all(self, trades: list[dict]) -> None:
         atomic_write_csv(self.log_path, CSV_HEADERS, trades)
+
+
+# How long after an event's LOCAL day ends before the archive's settled daily
+# max/min is trusted. Guards against resolving off an in-progress same-day
+# forecast (which mismarked 3 of 8 live trades on Jul 4). Override via env.
+RESOLVE_SETTLE_BUFFER_HOURS = float(os.environ.get("RESOLVE_SETTLE_BUFFER_HOURS", "6"))
+
+
+def _settle_ready(res_dt: datetime, loc_tz: str, now: datetime) -> bool:
+    """True once the event's local day has fully ended (+ a settle buffer), so the
+    archive returns the settled daily value rather than an in-progress forecast."""
+    try:
+        tz = ZoneInfo(loc_tz)
+    except Exception:
+        tz = timezone.utc
+    event_date = res_dt.astimezone(tz).date()
+    local_midnight_after = datetime.combine(
+        event_date + timedelta(days=1), _time(0, 0), tzinfo=tz
+    )
+    deadline = local_midnight_after.astimezone(timezone.utc) + timedelta(
+        hours=RESOLVE_SETTLE_BUFFER_HOURS
+    )
+    return now >= deadline
 
 
 def _evaluate_outcome(
