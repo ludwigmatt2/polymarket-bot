@@ -4,7 +4,37 @@ from datetime import date
 
 import pytest
 
-from weather import iem_client, station_truth, wu_client
+from weather import iem_client, station_parser, station_truth, wu_client
+
+_MIAMI_DESC = (
+    "This market will resolve to the temperature range that contains the highest "
+    "temperature recorded at the Miami Intl Airport Station in degrees Fahrenheit "
+    "on 4 Jul '26. The resolution source for this market will be information from "
+    "Wunderground, specifically the highest temperature recorded for all times on "
+    "this day by the Forecast for the Miami Intl Airport Station once information is "
+    "finalized, available here: https://www.wunderground.com/history/daily/us/fl/miami/KMIA."
+)
+_SEOUL_DESC = (
+    "This market will resolve to the temperature range that contains the highest "
+    "temperature recorded at the Incheon Intl Airport Station in degrees Celsius on "
+    "8 May '26. ... available here: "
+    "https://www.wunderground.com/history/daily/kr/incheon/RKSI."
+)
+
+
+def test_parse_station_us():
+    r = station_parser.station_from_description(_MIAMI_DESC)
+    assert r == {"icao": "KMIA", "country": "US", "unit": "F"}
+
+
+def test_parse_station_intl():
+    r = station_parser.station_from_description(_SEOUL_DESC)
+    assert r == {"icao": "RKSI", "country": "KR", "unit": "C"}
+
+
+def test_parse_station_none():
+    assert station_parser.station_from_description("no url here") is None
+    assert station_parser.station_from_description(None) is None
 
 
 class _Resp:

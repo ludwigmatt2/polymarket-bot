@@ -37,10 +37,12 @@ def _country(icao: str) -> str | None:
     return "US" if is_us(icao) else m["network"][:2]
 
 
-def daily_high_low(icao: str, day: date) -> dict | None:
+def daily_high_low(icao: str, day: date, country: str | None = None) -> dict | None:
     """{'max_f','min_f','source'} for the station's local `day` from WU obs, or None
-    on any failure. Temps are whole °F as WU serves them."""
-    cc = _country(icao)
+    on any failure. Temps are whole °F as WU serves them. `country` (2-letter, e.g.
+    from the market's Wunderground URL) lets this work for stations not in the IEM
+    registry; falls back to the registry when omitted."""
+    cc = (country or "").strip().upper() or _country(icao)
     if not cc:
         return None
     key = os.environ.get("WU_API_KEY", _DEFAULT_KEY)
