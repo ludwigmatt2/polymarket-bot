@@ -24,7 +24,7 @@ import os
 import threading
 from contextlib import contextmanager
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -2564,6 +2564,74 @@ async def _auto_scan(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         pass
 
 
+def _md_escape(s: str) -> str:
+    """Escape Telegram Markdown-v1 special chars in dynamic text (market titles)."""
+    for ch in ("_", "*", "`", "["):
+        s = s.replace(ch, "\\" + ch)
+    return s
+
+
+def _build_digest(uid: int) -> str | None:
+    """Morning summary for one user: balance, realized PnL, last-24h settlements,
+    and open positions. Mode-aware (live vs paper). None if there's nothing to say."""
+    live = get_user_mode(uid) == "live"
+    ws = live_wallet_stats(uid) if live else wallet_stats(uid)
+    if not ws:
+        return None
+
+    rows: list[dict] = []
+    csv_path = _active_trades_csv_path(uid)
+    if csv_path.exists():
+        with csv_path.open() as f:
+            rows = list(csv.DictReader(f))
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    settled = [r for r in rows
+               if r.get("resolved_at") and r["resolved_at"] >= cutoff and r.get("pnl_usd")]
+    wins = sum(1 for r in settled if float(r["pnl_usd"]) > 0)
+    losses = sum(1 for r in settled if float(r["pnl_usd"]) < 0)
+    pnl_24h = sum(float(r["pnl_usd"]) for r in settled)
+    pending = [r for r in rows if not r.get("resolved_at") and r.get("size_usd")]
+
+    if ws.get("deposited", 0) <= 0 and not rows:
+        return None  # nothing set up for this user yet
+
+    ret = f"{ws['return_pct']:+.1f}%" if ws.get("return_pct") is not None else "—"
+    tag = "🟢 LIVE (real money)" if live else "🧪 PAPER"
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    L = [
+        f"📊 *Daily Digest* — {today}",
+        f"{tag}\n",
+        f"💰 Balance *${ws['wallet_balance']:,.2f}*  ({ret})",
+        f"├ Deposited ${ws['deposited']:,.2f} · Deployed ${ws['deployed']:,.2f}",
+        f"└ Available ${ws['available']:,.2f}\n",
+        f"📈 *Realized PnL{' (live)' if live else ''}*",
+        f"All-time ${ws['realized_pnl']:+,.2f} · Today ${ws['pnl_today']:+,.2f} · "
+        f"Week ${ws['pnl_week']:+,.2f}\n",
+        (f"🔔 Settled (24h): {len(settled)} — {wins}W/{losses}L · ${pnl_24h:+,.2f}"
+         if settled else "🔔 Settled (24h): none"),
+        f"📍 Open: {len(pending)} positions · ${ws['deployed']:,.2f} deployed",
+    ]
+    for r in pending[:6]:
+        title = _md_escape((r.get("market_title") or "")[:38])
+        L.append(f"  • {title}  ${float(r.get('size_usd') or 0):,.2f}")
+    if len(pending) > 6:
+        L.append(f"  … +{len(pending) - 6} more")
+    return "\n".join(L)
+
+
+async def _daily_digest(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Scheduled: DM each active user a morning summary. Never raises."""
+    for uid in all_user_ids():
+        try:
+            if get_user_mode(uid) != "live" and not _active_trades_csv_path(uid).exists():
+                continue
+            msg = _build_digest(uid)
+            if msg:
+                await ctx.bot.send_message(uid, msg, parse_mode="Markdown")
+        except Exception:
+            pass
+
+
 async def _auto_resolve(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Scheduled job: auto-resolve pending trades. Runs every AUTO_RESOLVE_INTERVAL seconds."""
     stdout, stderr, rc = await run_bot_async("auto-resolve", ADMIN_ID)
@@ -2669,6 +2737,14 @@ async def _run() -> None:
             app.job_queue.run_repeating(_auto_scan,    interval=scan_interval,    first=300)
         if resolve_interval > 0:
             app.job_queue.run_repeating(_auto_resolve, interval=resolve_interval, first=600)
+
+        # Daily morning digest DM'd to each active user (default 06:00 UTC ≈ 08:00
+        # Munich). Set DIGEST_HOUR_UTC=-1 to disable.
+        digest_hour = int(os.environ.get("DIGEST_HOUR_UTC", "6"))
+        if 0 <= digest_hour <= 23:
+            app.job_queue.run_daily(
+                _daily_digest, time=dtime(hour=digest_hour, minute=0, tzinfo=timezone.utc)
+            )
 
         await app.updater.start_polling(drop_pending_updates=True)
         print("Polymarket Bot online.", flush=True)
