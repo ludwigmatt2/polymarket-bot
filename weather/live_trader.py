@@ -535,17 +535,27 @@ class LiveTrader:
         import urllib.request
 
         query = urllib.parse.urlencode({"user": self._funder_address})
+        # data-api 403s requests without a browser-like User-Agent — without this
+        # header every positions read fails, so redemption silently never runs.
+        req = urllib.request.Request(
+            f"{_DATA_API_POSITIONS}?{query}", headers={"User-Agent": "Mozilla/5.0"}
+        )
         try:
-            with urllib.request.urlopen(f"{_DATA_API_POSITIONS}?{query}", timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode())
             return data if isinstance(data, list) else []
         except Exception:
             return None
 
-    def redeemable_positions(self) -> list[dict]:
+    def redeemable_positions(self) -> list[dict] | None:
         """On-chain positions whose market has resolved and whose winnings are
-        claimable (redeemable=True). Use to drive post-resolution settlement."""
-        return [p for p in (self.fetch_positions() or []) if p.get("redeemable")]
+        claimable (redeemable=True). Use to drive post-resolution settlement.
+        Returns None when the positions API is unavailable (distinct from an
+        empty list) so the claim path can alert instead of silently no-op'ing."""
+        positions = self.fetch_positions()
+        if positions is None:
+            return None
+        return [p for p in positions if p.get("redeemable")]
 
     def claim_winnings(self) -> dict:
         """Redeem resolved (redeemable) on-chain positions back to pUSD in the
@@ -562,6 +572,10 @@ class LiveTrader:
         if not self._funder_address or not self._private_key:
             return {"claimed": 0}
         redeemable = self.redeemable_positions()
+        if redeemable is None:
+            # API unavailable (e.g. data-api 403) — distinct from "nothing to claim".
+            # Surface it so the resolve job can alert instead of silently no-op'ing.
+            return {"claimed": 0, "error": "positions API unavailable"}
         if not redeemable:
             return {"claimed": 0}
 

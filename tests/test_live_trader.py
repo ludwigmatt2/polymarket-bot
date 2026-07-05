@@ -565,14 +565,18 @@ class TestPositionsReconciliation:
             def read(self): return json.dumps(payload).encode()
 
         captured = {}
-        def fake_urlopen(url, timeout=10):
-            captured["url"] = url
+        def fake_urlopen(req, timeout=10):
+            # fetch_positions sends a Request (carrying the User-Agent header) so
+            # the data-api doesn't 403; capture its url + headers.
+            captured["url"] = req.full_url if hasattr(req, "full_url") else req
+            captured["headers"] = getattr(req, "headers", {})
             return _Resp()
         monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
 
         positions = trader.fetch_positions()
         assert positions == payload
         assert "user=0xproxy" in captured["url"]
+        assert captured["headers"].get("User-agent") == "Mozilla/5.0"
 
     def test_fetch_positions_returns_none_on_error(self, tmp_path, monkeypatch):
         """API failure returns None (distinct from a genuinely empty wallet)."""
