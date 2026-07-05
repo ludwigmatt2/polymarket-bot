@@ -398,6 +398,11 @@ class WeatherMarketScanner:
             }], _MISMATCH_FIELDS)
             return _MISMATCH_DROP
 
+        # Phase 1: resolving airport station from the rules (Wunderground URL), so
+        # the trade later settles on the station's reading, not the Open-Meteo grid.
+        from .station_parser import station_from_description
+        st = station_from_description(m.description) or {}
+
         return WeatherMarket(
             market_id=m.market_id,
             title=title,
@@ -416,6 +421,9 @@ class WeatherMarketScanner:
             yes_token_id=m.yes_token_id,
             no_token_id=m.no_token_id,
             tick_size=m.tick_size,
+            station_icao=st.get("icao", ""),
+            station_country=st.get("country", ""),
+            resolve_unit=st.get("unit", ""),
         )
 
     def _description_agrees(

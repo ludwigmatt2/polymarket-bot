@@ -47,6 +47,12 @@ class WeatherMarket:
     min_order_size: float = 0.0
     # Whether this is a negative-risk market (from CLOB order book); assume False
     neg_risk: bool = False
+    # Resolving airport station parsed from the market rules (Wunderground URL):
+    # ICAO, 2-letter country, and the whole-degree unit ("F"/"C") the market
+    # resolves in. Empty when the description couldn't be parsed → Open-Meteo path.
+    station_icao: str = ""
+    station_country: str = ""
+    resolve_unit: str = ""
 
 
 @dataclass
@@ -151,6 +157,11 @@ class PaperTrade:
     lat: float = 0.0
     lon: float = 0.0
     location_tz: str = "UTC"     # timezone used when this trade was forecast; E1 fix
+    # Resolving station (Phase 1): resolve via the station's Wunderground reading
+    # rather than the Open-Meteo grid. Empty for pre-Phase-1 rows → Open-Meteo path.
+    station_icao: str = ""
+    station_country: str = ""
+    resolve_unit: str = ""
     # Phase 0: persist the calibrator input (raw_p) and per-model breakdown so the
     # calibrator trains on the same scale it is applied to, and so per-model skill
     # (Phase 4) can be scored from history. raw_p is pre-calibration, pre-shrinkage.

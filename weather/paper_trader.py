@@ -41,6 +41,8 @@ CSV_HEADERS = [
     # Phase 0: appended at the end so pre-Phase-0 rows (which lack them) still parse —
     # DictReader fills missing trailing columns, _load_all backfills "" for them.
     "raw_p", "model_breakdown_json",
+    # Phase 1: resolving station (empty on older rows → Open-Meteo resolution path).
+    "station_icao", "station_country", "resolve_unit",
 ]
 
 # Brier score for an uninformed 50/50 forecast (climatology baseline)
@@ -100,6 +102,9 @@ class PaperTrader:
             location_tz=signal.market.location.timezone or "UTC",
             raw_p=signal.prob_result.raw_p,
             model_breakdown_json=json.dumps(signal.prob_result.model_breakdown),
+            station_icao=signal.market.station_icao,
+            station_country=signal.market.station_country,
+            resolve_unit=signal.market.resolve_unit,
         )
         self._append_trade(trade)
         self._existing_keys.add(key)
@@ -218,16 +223,31 @@ class PaperTrader:
 
             loc_tz = t.get("location_tz") or "UTC"
             # Wait until the event's local day is over + settled, so we read the
-            # final daily max/min from the archive, not a mid-day forecast.
+            # final daily value, not a mid-day forecast.
             if not _settle_ready(res_dt, loc_tz, now):
                 continue
-            loc = Location(city="", lat=lat, lon=lon, timezone=loc_tz)
-            actual_val = weather_client.get_historical_actual(loc, res_dt.date(), metric)
-            if actual_val is None:
-                skipped += 1
-                continue
 
-            outcome = _evaluate_outcome(actual_val, threshold, w_dir, threshold_high)
+            station_icao = t.get("station_icao") or ""
+            use_station = station_icao and metric in ("temperature_2m_max", "temperature_2m_min")
+            if use_station:
+                # Phase 1: resolve on the station's Wunderground reading (WU → IEM
+                # fallback), rounded to whole degrees in the market's unit — matching
+                # how Polymarket actually settles.
+                from .station_truth import station_outcome
+                outcome, _src, _val = station_outcome(
+                    station_icao, t.get("station_country") or "", t.get("resolve_unit") or "C",
+                    res_dt.date(), metric, threshold, threshold_high, w_dir,
+                )
+                if outcome is None:
+                    skipped += 1
+                    continue
+            else:
+                loc = Location(city="", lat=lat, lon=lon, timezone=loc_tz)
+                actual_val = weather_client.get_historical_actual(loc, res_dt.date(), metric)
+                if actual_val is None:
+                    skipped += 1
+                    continue
+                outcome = _evaluate_outcome(actual_val, threshold, w_dir, threshold_high)
 
             # Compute PnL and Brier in-place to avoid O(n²) load+rewrite per trade
             entry_price = float(t["entry_price"])
@@ -390,6 +410,9 @@ class PaperTrader:
                 "cumulative_brier": "",
                 "raw_p": trade.raw_p,
                 "model_breakdown_json": trade.model_breakdown_json,
+                "station_icao": trade.station_icao,
+                "station_country": trade.station_country,
+                "resolve_unit": trade.resolve_unit,
             })
 
     def _load_all(self) -> list[dict]:
