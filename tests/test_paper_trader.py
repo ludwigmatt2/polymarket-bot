@@ -206,6 +206,58 @@ class TestPhase0CalibrationInput:
         assert logged_p == pytest.approx(0.61), "legacy rows fall back to model_p"
 
 
+class TestStationResolution:
+    """Phase 1: trades with a resolving station settle on the station's reading."""
+
+    def _write_station_trade(self, trader, station="KLGA", country="US", unit="F"):
+        past = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+        row = {f: "" for f in CSV_HEADERS}
+        row.update({
+            "trade_id": "s001", "market_id": "mkt_st", "market_title": "station test",
+            "signal_time": past, "entry_price": 0.50, "model_p": 0.30, "direction": "NO",
+            "size_usd": 25.0, "size_factor": 1.0, "edge_pp": 0.10, "ensemble_spread": 0.05,
+            "confidence_score": 0.70, "resolution_date": past, "metric": "temperature_2m_max",
+            "threshold": 35.5556, "threshold_high": 36.1111, "weather_direction": "range",
+            "lat": 40.71, "lon": -74.0, "location_tz": "America/New_York", "raw_p": 0.30,
+            "station_icao": station, "station_country": country, "resolve_unit": unit,
+        })
+        trader.log_path.parent.mkdir(exist_ok=True)
+        with open(trader.log_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=CSV_HEADERS, extrasaction="ignore")
+            w.writeheader(); w.writerow(row)
+
+    def test_resolves_via_station_not_weather(self, tmp_path, monkeypatch):
+        import weather.station_truth as st
+        trader = _make_trader(tmp_path)
+        self._write_station_trade(trader)
+        # WU 97°F → in the 96-97 bucket → YES-condition true; weather_client unused
+        monkeypatch.setattr(st, "daily_value_f", lambda *a, **k: (97.0, "wunderground"))
+        client = MagicMock()
+        trader.auto_resolve(client, model=None)
+        client.get_historical_actual.assert_not_called()
+        rows = list(csv.DictReader(open(trader.log_path)))
+        assert rows[0]["actual_outcome"] == "1"
+
+    def test_station_stays_pending_when_no_data(self, tmp_path, monkeypatch):
+        import weather.station_truth as st
+        trader = _make_trader(tmp_path)
+        self._write_station_trade(trader)
+        monkeypatch.setattr(st, "daily_value_f", lambda *a, **k: (None, None))
+        trader.auto_resolve(MagicMock(), model=None)
+        rows = list(csv.DictReader(open(trader.log_path)))
+        assert rows[0]["actual_outcome"] == ""  # not booked
+
+    def test_no_station_uses_weather(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        self._write_station_trade(trader, station="")  # no station → Open-Meteo path
+        client = MagicMock()
+        client.get_historical_actual.return_value = 40.0  # above the range → NO wins
+        trader.auto_resolve(client, model=None)
+        client.get_historical_actual.assert_called_once()
+        rows = list(csv.DictReader(open(trader.log_path)))
+        assert rows[0]["actual_outcome"] == "0"
+
+
 class TestTimezoneResolution:
     def test_auto_resolve_uses_stored_tz(self, tmp_path):
         """auto_resolve must pass location_tz to get_historical_actual, not UTC."""
