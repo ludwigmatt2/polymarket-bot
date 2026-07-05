@@ -2567,11 +2567,15 @@ async def _auto_scan(ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def _auto_resolve(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Scheduled job: auto-resolve pending trades. Runs every AUTO_RESOLVE_INTERVAL seconds."""
     stdout, stderr, rc = await run_bot_async("auto-resolve", ADMIN_ID)
-    if rc not in (0, -2):
+    # claim_winnings() never raises, so a failed redemption leaves rc=0 — scan the
+    # output for the skip marker so a silently-stuck claim still alerts the owner.
+    claim_failed = "claim skipped (" in (stdout or "") + (stderr or "")
+    if rc not in (0, -2) or claim_failed:
+        header = "⚠️ Redemption/claim skipped" if claim_failed else "⚠️ Auto-resolve failed"
         try:
             await ctx.bot.send_message(
                 ADMIN_ID,
-                f"⚠️ Auto-resolve failed\n```\n{(stderr or stdout)[-300:].strip()}\n```",
+                f"{header}\n```\n{(stderr or stdout)[-300:].strip()}\n```",
                 parse_mode="Markdown",
             )
         except Exception:
