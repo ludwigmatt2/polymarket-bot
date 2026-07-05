@@ -681,12 +681,17 @@ class TestClaimWinnings:
                 captured["wallet"] = wallet
                 captured["grouped"] = grouped
                 return {"ok": True}
+            def wrap_usdce_to_pusd(self, wallet, amount_raw):
+                captured["wrapped_raw"] = amount_raw
 
         import weather.relayer as rl
         monkeypatch.setattr(rl, "RelayerClient", FakeRC)
+        monkeypatch.setattr(rl, "usdce_balance", lambda w: 0.0)  # no proceeds -> no wrap
 
         res = t.claim_winnings()
         assert res["claimed"] == 2
+        assert res.get("wrapped") == 0.0
+        assert "wrapped_raw" not in captured  # delta 0 -> wrap not called
         assert captured["wallet"] == "0xdeposit"
         g = {x["condition_id"]: x for x in captured["grouped"]}
         # binary: neg_risk False; neg: neg_risk True, NO -> amounts[1] = 3 * 1e6
@@ -707,9 +712,37 @@ class TestClaimWinnings:
 
         import weather.relayer as rl
         monkeypatch.setattr(rl, "RelayerClient", BoomRC)
+        monkeypatch.setattr(rl, "usdce_balance", lambda w: 0.0)
 
         res = t.claim_winnings()
         assert res["claimed"] == 0 and "relayer down" in res["error"]
+
+    def test_wraps_redemption_proceeds(self, tmp_path, monkeypatch):
+        """Redemption USDC.e is wrapped back to pUSD (delta only) so it never reads
+        as a deposit."""
+        t = self._trader(tmp_path)
+        t.redeemable_positions = lambda: [
+            {"conditionId": "0xa", "outcome": "Yes", "size": 5.0, "redeemable": True},
+        ]
+        captured = {}
+
+        class FakeRC:
+            def __init__(self, pk=None): pass
+            def redeem_positions(self, *a): return {"ok": True}
+            def wrap_usdce_to_pusd(self, wallet, amount_raw):
+                captured["wrapped_raw"] = amount_raw
+
+        import weather.relayer as rl
+        monkeypatch.setattr(rl, "RelayerClient", FakeRC)
+        # USDC.e: 2.0 before redeem (a genuine pending deposit), 7.0 after (+5 proceeds)
+        balances = iter([2.0, 7.0])
+        monkeypatch.setattr(rl, "usdce_balance", lambda w: next(balances))
+
+        res = t.claim_winnings()
+        assert res["claimed"] == 1
+        assert res["wrapped"] == pytest.approx(5.0)
+        # only the +5 proceeds wrapped; the pre-existing 2.0 deposit is left alone
+        assert captured["wrapped_raw"] == 5_000_000
 
     def test_reconcile_flags_missing_on_chain(self, tmp_path):
         """An open local trade with no matching on-chain position is flagged."""
