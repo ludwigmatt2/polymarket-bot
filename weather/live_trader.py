@@ -603,10 +603,26 @@ class LiveTrader:
             return {"claimed": 0}
 
         try:
+            from . import relayer as _relayer
             from .relayer import RelayerClient
             rc = RelayerClient(pk=self._private_key)
+            # Redemption pays out as USDC.e (neg-risk markets settle to the
+            # underlying, not pUSD). Left unwrapped, the deposit reconcile would
+            # mistake those winnings for a new deposit and inflate the ROI basis.
+            # Wrap the *delta* the redemption adds — so a genuine, not-yet-recorded
+            # USDC.e deposit sitting in the wallet is left for the normal detector.
+            usdce_before = _relayer.usdce_balance(self._funder_address)
             result = rc.redeem_positions(self._funder_address, list(groups.values()))
-            return {"claimed": len(groups), "conditions": list(groups.keys()), "result": result}
+            wrapped = 0.0
+            try:
+                delta = _relayer.usdce_balance(self._funder_address) - usdce_before
+                if delta > 0.01:
+                    rc.wrap_usdce_to_pusd(self._funder_address, int(delta * 1_000_000))
+                    wrapped = round(delta, 6)
+            except Exception:  # noqa: BLE001 — wrap is best-effort; funds stay safe
+                pass
+            return {"claimed": len(groups), "conditions": list(groups.keys()),
+                    "result": result, "wrapped": wrapped}
         except Exception as e:  # noqa: BLE001 — never break the resolve loop
             return {"claimed": 0, "error": str(e)}
 
