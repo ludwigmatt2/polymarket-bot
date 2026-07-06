@@ -28,8 +28,9 @@ def _mock_urlopen(monkeypatch, body, capture=None):
 
 
 def test_station_meta_us_and_intl():
-    assert iem.station_meta("KLGA") == {
-        "icao": "KLGA", "network": "NY_ASOS", "sid": "LGA", "tz": "America/New_York"}
+    m = iem.station_meta("KLGA")
+    assert m["network"] == "NY_ASOS" and m["sid"] == "LGA" and m["tz"] == "America/New_York"
+    assert m["lat"] == pytest.approx(40.78, abs=0.05) and m["lon"] == pytest.approx(-73.88, abs=0.05)
     # international keeps full ICAO and uses a two-underscore network
     assert iem.station_meta("rksi")["sid"] == "RKSI"
     assert iem.station_meta("RKSI")["network"] == "KR__ASOS"

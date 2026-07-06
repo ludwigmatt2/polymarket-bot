@@ -33,30 +33,32 @@ _UA = {"User-Agent": "Mozilla/5.0"}
 _MIN_INTERVAL_S = 1.05  # IEM requests ≤ 1 req/s per IP
 _last_call = [0.0]
 
-# ICAO → (IEM network, station sid, IANA tz). US ASOS = "{STATE}_ASOS" (one
-# underscore) with sid = ICAO minus the leading K; international = "{CC}__ASOS"
-# (two underscores) with sid = full ICAO. Seeded for the traded cities; extend as
-# new stations appear (network + sid + tz come from the IEM network GeoJSON).
-_STATION_REGISTRY: dict[str, tuple[str, str, str]] = {
-    "KLGA": ("NY_ASOS", "LGA", "America/New_York"),   # NYC / LaGuardia
-    "KMIA": ("FL_ASOS", "MIA", "America/New_York"),   # Miami Intl
-    "KDFW": ("TX_ASOS", "DFW", "America/Chicago"),     # Dallas/Fort Worth
-    "KATL": ("GA_ASOS", "ATL", "America/New_York"),   # Atlanta
-    "RKSI": ("KR__ASOS", "RKSI", "Asia/Seoul"),        # Seoul / Incheon
-    "VHHH": ("HK__ASOS", "VHHH", "Asia/Hong_Kong"),    # Hong Kong Intl
-    "LFPB": ("FR__ASOS", "LFPB", "Europe/Paris"),      # Paris / Le Bourget
-    "LFPG": ("FR__ASOS", "LFPG", "Europe/Paris"),      # Paris / Charles de Gaulle
-    "LLBG": ("IL__ASOS", "LLBG", "Asia/Jerusalem"),    # Tel Aviv / Ben Gurion
+# ICAO → (IEM network, station sid, IANA tz, lat, lon). US ASOS = "{STATE}_ASOS"
+# (one underscore) with sid = ICAO minus the leading K; international = "{CC}__ASOS"
+# (two underscores) with sid = full ICAO. Coords are the station's own location
+# (from the IEM network GeoJSON) — used to forecast AT the station, not the city.
+# Seeded for the traded cities; extend as new stations appear.
+_STATION_REGISTRY: dict[str, tuple[str, str, str, float, float]] = {
+    "KLGA": ("NY_ASOS", "LGA", "America/New_York", 40.7794, -73.8803),   # NYC / LaGuardia
+    "KMIA": ("FL_ASOS", "MIA", "America/New_York", 25.7880, -80.3169),   # Miami Intl
+    "KDFW": ("TX_ASOS", "DFW", "America/Chicago", 32.8968, -97.0380),    # Dallas/Fort Worth
+    "KATL": ("GA_ASOS", "ATL", "America/New_York", 33.6301, -84.4418),   # Atlanta
+    "RKSI": ("KR__ASOS", "RKSI", "Asia/Seoul", 37.4667, 126.4500),       # Seoul / Incheon
+    "VHHH": ("HK__ASOS", "VHHH", "Asia/Hong_Kong", 22.3094, 113.9219),   # Hong Kong Intl
+    "LFPB": ("FR__ASOS", "LFPB", "Europe/Paris", 48.9672, 2.4272),       # Paris / Le Bourget
+    "LFPG": ("FR__ASOS", "LFPG", "Europe/Paris", 49.0153, 2.5344),       # Paris / Charles de Gaulle
+    "LLBG": ("IL__ASOS", "LLBG", "Asia/Jerusalem", 32.0114, 34.8867),    # Tel Aviv / Ben Gurion
 }
 
 
 def station_meta(icao: str) -> dict | None:
-    """Return {icao, network, sid, tz} for a known station, else None."""
+    """Return {icao, network, sid, tz, lat, lon} for a known station, else None."""
     e = _STATION_REGISTRY.get((icao or "").strip().upper())
     if not e:
         return None
-    net, sid, tz = e
-    return {"icao": (icao or "").strip().upper(), "network": net, "sid": sid, "tz": tz}
+    net, sid, tz, lat, lon = e
+    return {"icao": (icao or "").strip().upper(), "network": net, "sid": sid,
+            "tz": tz, "lat": lat, "lon": lon}
 
 
 def is_us(icao: str) -> bool:
@@ -104,6 +106,28 @@ def daily_maxmin(icao: str, day: date) -> dict | None:
         return None
     row = arr[0]
     return {"max_f": row.get("max_temp_f"), "min_f": row.get("min_temp_f")}
+
+
+def daily_range(icao: str, start: date, end: date) -> dict[str, dict]:
+    """DSM daily max/min °F over [start, end] in one call, for backtest/MOS building.
+    Returns {'YYYY-MM-DD': {'max_f': float|None, 'min_f': float|None}} (empty on fail)."""
+    m = station_meta(icao)
+    if not m:
+        return {}
+    try:
+        arr = json.loads(_get("/cgi-bin/request/daily.py", {
+            "sts": start.isoformat(), "ets": end.isoformat(),
+            "network": m["network"], "stations": m["sid"],
+            "var": "max_temp_f,min_temp_f", "format": "json",
+        }))
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict[str, dict] = {}
+    for row in arr if isinstance(arr, list) else []:
+        d = str(row.get("day", ""))[:10]
+        if d:
+            out[d] = {"max_f": row.get("max_temp_f"), "min_f": row.get("min_temp_f")}
+    return out
 
 
 def metar_peak(icao: str, day: date, kind: str = "max") -> float | None:

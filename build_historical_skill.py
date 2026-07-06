@@ -275,36 +275,77 @@ def build_city(city: dict, start: date, end: date) -> tuple[dict, dict]:
     return entry, metrics_errors
 
 
+def build_station(icao: str, start: date, end: date) -> tuple[dict, dict]:
+    """Phase 2 MOS for one resolving station: forecast AT the station's coords,
+    corrected toward the station's OWN reading (IEM), not the ERA5 grid — so the
+    member shift removes the forecast's bias against the actual resolving thermometer."""
+    from weather import iem_client
+    m = iem_client.station_meta(icao)
+    if not m:
+        raise ValueError(f"unknown station {icao}")
+    times, fc_hourly_by_lead = _fetch_previous_runs(m["lat"], m["lon"], start, end)
+    iem_daily = iem_client.daily_range(icao, start, end)
+    actual = {
+        "temperature_2m_max": {d: iem_client.f_to_c(v["max_f"])
+                               for d, v in iem_daily.items() if v.get("max_f") is not None},
+        "temperature_2m_min": {d: iem_client.f_to_c(v["min_f"])
+                               for d, v in iem_daily.items() if v.get("min_f") is not None},
+    }
+    metrics_stats, metrics_errors = {}, {}
+    for metric, reducer in TEMP_METRICS.items():
+        fc_by_lead = {lead: daily_from_hourly(times, fc_hourly_by_lead.get(lead, []), reducer)
+                      for lead in LEADS}
+        errors = collect_errors(fc_by_lead, actual.get(metric, {}))
+        metrics_stats[metric] = build_metric_stats(errors)
+        metrics_errors[metric] = errors
+    entry = {"city": icao, "lat": m["lat"], "lon": m["lon"], "metrics": metrics_stats}
+    return entry, metrics_errors
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Build historical forecast-skill (MOS) table")
     ap.add_argument("--max-cities", type=int, default=0, help="limit cities (smoke test)")
     ap.add_argument("--validate-only", action="store_true", help="don't write JSON, just report MAE reduction")
+    ap.add_argument("--stations", action="store_true",
+                    help="Phase 2: build station-keyed MOS from IEM actuals (merged into existing table)")
     ap.add_argument("--start", default=START_DATE.isoformat())
     args = ap.parse_args()
 
-    cities = _load_cities()
-    if args.max_cities:
-        cities = cities[:args.max_cities]
     start = date.fromisoformat(args.start)
     end = date.today() - timedelta(days=1)
-    print(f"Building skill for {len(cities)} cities, {start} → {end}\n")
 
-    table: dict[str, dict] = {}
-    # per-metric list of per-city error structs {lead:{month:[errs]}} for validation
+    if args.stations:
+        from weather.iem_client import _STATION_REGISTRY
+        icaos = sorted(_STATION_REGISTRY)
+        targets = [{"icao": ic, "label": ic} for ic in icaos]
+        build = lambda t: build_station(t["icao"], start, end)  # noqa: E731
+        # merge into the existing table so non-station cities keep their MOS
+        table: dict[str, dict] = json.loads(SKILL_PATH.read_text()) if SKILL_PATH.exists() else {}
+        print(f"Building STATION MOS for {len(targets)} stations, {start} → {end}\n")
+    else:
+        cities = _load_cities()
+        if args.max_cities:
+            cities = cities[:args.max_cities]
+        targets = [{**c, "label": c["city"]} for c in cities]
+        build = lambda t: build_city(t, start, end)  # noqa: E731
+        table = {}
+        print(f"Building skill for {len(targets)} cities, {start} → {end}\n")
+
+    # per-metric list of per-target error structs {lead:{month:[errs]}} for validation
     city_structs: dict[str, list] = defaultdict(list)
 
-    for i, city in enumerate(cities, 1):
+    for i, tgt in enumerate(targets, 1):
         try:
-            entry, errors = build_city(city, start, end)
+            entry, errors = build(tgt)
         except Exception as exc:
-            print(f"  [{i}/{len(cities)}] {city['city']:<14} FAILED: {exc}")
+            print(f"  [{i}/{len(targets)}] {tgt['label']:<14} FAILED: {exc}")
             continue
-        table[_city_key(city["lat"], city["lon"])] = entry
+        table[_city_key(entry["lat"], entry["lon"])] = entry
         for metric, errs in errors.items():
             city_structs[metric].append(errs)
         all_cells = [cell for m in entry["metrics"].values() for lead in m.values() for cell in lead.values()]
         n_obs = sum(cell["n"] for cell in all_cells)
-        print(f"  [{i}/{len(cities)}] {city['city']:<14} cells={len(all_cells)} obs={n_obs}")
+        print(f"  [{i}/{len(targets)}] {tgt['label']:<14} cells={len(all_cells)} obs={n_obs}")
 
     # ── Out-of-sample validation (the acceptance gate) ───────────────────────────
     # The decision metric: does per-(lead,month) MOS beat the flat per-city mean
