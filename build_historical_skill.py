@@ -47,8 +47,11 @@ from weather.config import (
     OPEN_METEO_REQUEST_TIMEOUT,
 )
 
+from weather.paths import DATA_DIR
+
 CITY_BIAS_CSV = Path("logs/city_bias.csv")
-SKILL_PATH = Path(HISTORICAL_SKILL_PATH)
+# Write to the data volume (DATA_DIR/logs) — the same place the corrector reads.
+SKILL_PATH = DATA_DIR / HISTORICAL_SKILL_PATH
 
 LEADS = [1, 2, 3, 4, 5]
 # (skill metric → how a daily value is reduced from hourly temperature_2m)

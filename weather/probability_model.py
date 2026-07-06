@@ -37,6 +37,13 @@ from .config import (
     MOS_METRICS,
 )
 from .models import EnsembleForecast, RawProbabilityResult
+from .paths import DATA_DIR
+
+# The skill table lives under the data volume (DATA_DIR/logs), same as the
+# calibration log. HISTORICAL_SKILL_PATH is a cwd-relative string ("logs/...");
+# resolving it under DATA_DIR fixes a deploy bug where the scan (cwd=repo root)
+# looked in repo/logs/ and never found the file — silently disabling MOS.
+_DEFAULT_SKILL_PATH = DATA_DIR / HISTORICAL_SKILL_PATH
 
 
 class HistoricalSkillCorrector:
@@ -53,7 +60,7 @@ class HistoricalSkillCorrector:
 
     def __init__(
         self,
-        path: Path = Path(HISTORICAL_SKILL_PATH),
+        path: Path = _DEFAULT_SKILL_PATH,
         enabled_metrics: frozenset[str] = MOS_METRICS,
         max_distance_km: float = 100.0,
     ):
