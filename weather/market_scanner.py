@@ -28,7 +28,9 @@ from .config import (
     MIN_PARSE_RATE,
     WEATHER_SEARCH_TERMS,
 )
+from .iem_client import station_meta
 from .models import Location, WeatherMarket
+from .station_parser import station_from_description
 from .weather_client import WeatherClient
 
 # Patterns for extracting weather signal from market titles
@@ -400,13 +402,11 @@ class WeatherMarketScanner:
 
         # Phase 1: resolving airport station from the rules (Wunderground URL), so
         # the trade later settles on the station's reading, not the Open-Meteo grid.
-        from .station_parser import station_from_description
         st = station_from_description(m.description) or {}
         # Phase 2: forecast AT the resolving station (not the city center) when its
         # coords are known, so the ensemble + station-trained MOS line up with the
         # thermometer that actually settles. Unknown stations keep the city location.
-        from .iem_client import station_meta as _station_meta
-        sm = _station_meta(st.get("icao", "")) if st.get("icao") else None
+        sm = station_meta(st.get("icao", "")) if st.get("icao") else None
         if sm:
             location = Location(city=location.city, lat=sm["lat"], lon=sm["lon"],
                                 timezone=sm["tz"], country=st.get("country", ""))

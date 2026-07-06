@@ -23,7 +23,7 @@ from .config import (
     MAX_SLIPPAGE,
 )
 from .models import Location, Signal
-from .paper_trader import PaperTrader, _brier, _evaluate_outcome
+from .paper_trader import PaperTrader, _brier
 from .secrets import _LEGACY_SIG_MAP
 
 from .paths import DATA_DIR as _DATA_DIR

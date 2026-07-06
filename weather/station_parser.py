@@ -32,5 +32,8 @@ def station_from_description(desc: str | None) -> dict | None:
         return None
     country, icao = m.group(1).upper(), m.group(2).upper()
     u = _UNIT.search(desc)
-    unit = "F" if (u and u.group(1).lower().startswith("f")) else "C" if u else ("F" if country == "US" else "C")
+    if u:
+        unit = "F" if u.group(1).lower().startswith("f") else "C"
+    else:
+        unit = "F" if country == "US" else "C"
     return {"icao": icao, "country": country, "unit": unit}

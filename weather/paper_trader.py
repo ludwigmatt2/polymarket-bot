@@ -25,7 +25,8 @@ from .config import (
     MAX_PAPER_DRAWDOWN_PCT,
     PAPER_TRADE_SIZE_USD,
 )
-from .models import Location, PaperTrade, PaperTradingStats, Signal
+from .models import Location, PaperTrade, PaperTradingStats, Signal, _evaluate_outcome
+from .station_truth import station_outcome
 
 PAPER_TRADES_LOG = Path("logs/paper_trades.csv")
 
@@ -190,6 +191,9 @@ class PaperTrader:
         now = datetime.now(timezone.utc)
         trades = self._load_all()
         resolved = skipped = 0
+        # Memoize station reads across trades sharing a station/day/metric this pass
+        # (e.g. several threshold buckets for the same city/date = one WU fetch).
+        station_cache: dict = {}
 
         for t in trades:
             if t.get("actual_outcome") in ("0", "1", 0, 1):
@@ -233,10 +237,9 @@ class PaperTrader:
                 # Phase 1: resolve on the station's Wunderground reading (WU → IEM
                 # fallback), rounded to whole degrees in the market's unit — matching
                 # how Polymarket actually settles.
-                from .station_truth import station_outcome
                 outcome, _src, _val = station_outcome(
                     station_icao, t.get("station_country") or "", t.get("resolve_unit") or "C",
-                    res_dt.date(), metric, threshold, threshold_high, w_dir,
+                    res_dt.date(), metric, threshold, threshold_high, w_dir, cache=station_cache,
                 )
                 if outcome is None:
                     skipped += 1
@@ -454,16 +457,5 @@ def _settle_ready(res_dt: datetime, loc_tz: str, now: datetime) -> bool:
     return now >= deadline
 
 
-def _evaluate_outcome(
-    actual: float,
-    threshold: float,
-    direction: str,
-    threshold_high: float | None = None,
-) -> bool:
-    if direction == "above":
-        return actual > threshold
-    if direction == "below":
-        return actual < threshold
-    if direction == "range" and threshold_high is not None:
-        return threshold <= actual <= threshold_high
-    return abs(actual - threshold) <= 0.5  # "equal" — ±0.5°C
+# _evaluate_outcome now lives in weather.models (shared with the station resolver);
+# re-exported above via the models import so existing callers keep working.
