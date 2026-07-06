@@ -173,6 +173,24 @@ class PaperTrade:
     brier_score: float | None = None
 
 
+def _evaluate_outcome(
+    actual: float,
+    threshold: float,
+    direction: str,
+    threshold_high: float | None = None,
+) -> bool:
+    """Whether the YES-condition holds for a resolved value. Shared by the paper
+    resolver (Open-Meteo path) and the station resolver so the bucket rules can't
+    drift between them. Lives here (neutral module) to avoid an import cycle."""
+    if direction == "above":
+        return actual > threshold
+    if direction == "below":
+        return actual < threshold
+    if direction == "range" and threshold_high is not None:
+        return threshold <= actual <= threshold_high
+    return abs(actual - threshold) <= 0.5  # "equal" — ±0.5°C
+
+
 @dataclass
 class PaperTradingStats:
     total_trades: int

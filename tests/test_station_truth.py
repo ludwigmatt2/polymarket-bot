@@ -141,10 +141,3 @@ def test_station_outcome_no_data(monkeypatch):
     monkeypatch.setattr(station_truth, "daily_value_f", lambda *a, **k: (None, None))
     assert station_truth.station_outcome(
         "KLGA", "US", "F", date(2026, 7, 4), "temperature_2m_max", 35.5, 36.1, "range") == (None, None, None)
-
-
-def test_celsius_conversion(monkeypatch):
-    monkeypatch.setattr(wu_client, "daily_high_low",
-                        lambda i, d, c=None: {"max_f": 97.0, "min_f": 74.0, "source": "wunderground"})
-    v, src = station_truth.daily_value_c("KLGA", date(2026, 7, 4), "temperature_2m_max")
-    assert v == pytest.approx(36.11, abs=0.01) and src == "wunderground"

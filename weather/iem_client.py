@@ -53,12 +53,12 @@ _STATION_REGISTRY: dict[str, tuple[str, str, str, float, float]] = {
 
 def station_meta(icao: str) -> dict | None:
     """Return {icao, network, sid, tz, lat, lon} for a known station, else None."""
-    e = _STATION_REGISTRY.get((icao or "").strip().upper())
+    key = (icao or "").strip().upper()
+    e = _STATION_REGISTRY.get(key)
     if not e:
         return None
     net, sid, tz, lat, lon = e
-    return {"icao": (icao or "").strip().upper(), "network": net, "sid": sid,
-            "tz": tz, "lat": lat, "lon": lon}
+    return {"icao": key, "network": net, "sid": sid, "tz": tz, "lat": lat, "lon": lon}
 
 
 def is_us(icao: str) -> bool:
@@ -91,21 +91,7 @@ def _get(path: str, params: dict, retries: int = 3) -> str:
 def daily_maxmin(icao: str, day: date) -> dict | None:
     """DSM/CLI daily max & min in °F (US: official 2-min-avg; intl: recompute).
     Returns {"max_f": float|None, "min_f": float|None} or None if unavailable."""
-    m = station_meta(icao)
-    if not m:
-        return None
-    ds = day.isoformat()
-    try:
-        arr = json.loads(_get("/cgi-bin/request/daily.py", {
-            "sts": ds, "ets": ds, "network": m["network"], "stations": m["sid"],
-            "var": "max_temp_f,min_temp_f", "format": "json",
-        }))
-    except Exception:  # noqa: BLE001
-        return None
-    if not arr:
-        return None
-    row = arr[0]
-    return {"max_f": row.get("max_temp_f"), "min_f": row.get("min_temp_f")}
+    return daily_range(icao, day, day).get(day.isoformat())
 
 
 def daily_range(icao: str, start: date, end: date) -> dict[str, dict]:

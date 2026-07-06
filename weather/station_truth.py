@@ -15,52 +15,56 @@ from __future__ import annotations
 from datetime import date
 
 from . import iem_client, wu_client
+from .models import _evaluate_outcome
 
 _METRIC_KIND = {"temperature_2m_max": "max", "temperature_2m_min": "min"}
 
 
-def daily_value_f(icao: str, day: date, metric: str,
-                  country: str | None = None) -> tuple[float | None, str | None]:
-    """(value_°F, source) for the station's daily max/min, WU → IEM-peak → IEM-DSM.
-    `country` (from the market's Wunderground URL) lets WU resolve stations outside
-    the seeded registry. (None, None) if unsupported or every source fails."""
-    kind = _METRIC_KIND.get(metric)
-    if kind is None:
-        return None, None
-
+def _fetch_value_f(icao: str, day: date, kind: str,
+                   country: str | None) -> tuple[float | None, str | None]:
+    """The WU → IEM-peak → IEM-DSM fallback chain (one network probe)."""
     hl = wu_client.daily_high_low(icao, day, country)
     if hl:
         return (hl["max_f"] if kind == "max" else hl["min_f"]), "wunderground"
-
     peak = iem_client.metar_peak(icao, day, kind)
     if peak is not None:
         return peak, "iem_metar_peak"
-
     dm = iem_client.daily_maxmin(icao, day)
     if dm:
         v = dm["max_f"] if kind == "max" else dm["min_f"]
         if v is not None:
             return float(v), "iem_dsm"
-
     return None, None
 
 
-def daily_value_c(icao: str, day: date, metric: str,
-                  country: str | None = None) -> tuple[float | None, str | None]:
-    """Same as daily_value_f but the value is converted to °C."""
-    v, src = daily_value_f(icao, day, metric, country)
-    return (iem_client.f_to_c(v) if v is not None else None), src
+def daily_value_f(icao: str, day: date, metric: str, country: str | None = None,
+                  cache: dict | None = None) -> tuple[float | None, str | None]:
+    """(value_°F, source) for the station's daily max/min, WU → IEM-peak → IEM-DSM.
+    `country` (from the market's Wunderground URL) lets WU resolve stations outside
+    the seeded registry. Pass a `cache` dict to memoize the fetch across trades that
+    share a station/day/metric within one resolve pass. (None, None) if unsupported
+    or every source fails."""
+    kind = _METRIC_KIND.get(metric)
+    if kind is None:
+        return None, None
+    key = (icao, day.isoformat(), metric)
+    if cache is not None and key in cache:
+        return cache[key]
+    result = _fetch_value_f(icao, day, kind, country)
+    if cache is not None:
+        cache[key] = result
+    return result
 
 
 def station_outcome(icao: str, country: str, unit: str, day: date, metric: str,
-                    threshold_c: float, threshold_high_c: float | None,
-                    direction: str) -> tuple[bool | None, str | None, float | None]:
+                    threshold_c: float, threshold_high_c: float | None, direction: str,
+                    cache: dict | None = None) -> tuple[bool | None, str | None, float | None]:
     """Resolve a market's YES/NO outcome the way Polymarket does: take the station's
-    daily max/min, round to whole degrees IN THE MARKET'S UNIT, then apply the
-    bucket. Thresholds are stored in °C (the bot's internal unit); for °F markets
-    they are exact °F edges, so we compare in whole °F. Returns
-    (yes_condition | None, source, rounded_station_value_in_market_unit)."""
-    v_f, src = daily_value_f(icao, day, metric, country)
+    daily max/min, round to whole degrees IN THE MARKET'S UNIT, then apply the bucket
+    rule (shared with the Open-Meteo resolver via _evaluate_outcome). Thresholds are
+    stored in °C; for °F markets they are exact °F edges, so we compare in whole °F.
+    Returns (yes_condition | None, source, rounded_station_value_in_market_unit)."""
+    v_f, src = daily_value_f(icao, day, metric, country, cache)
     if v_f is None:
         return None, None, None
 
@@ -73,12 +77,4 @@ def station_outcome(icao: str, country: str, unit: str, day: date, metric: str,
         lo = round(threshold_c)
         hi = round(threshold_high_c) if threshold_high_c is not None else None
 
-    if direction == "range" and hi is not None:
-        yes = lo <= val <= hi
-    elif direction == "equal":
-        yes = val == lo
-    elif direction == "below":
-        yes = val < lo
-    else:  # "above"
-        yes = val > lo
-    return yes, src, float(val)
+    return _evaluate_outcome(val, lo, direction, hi), src, float(val)
