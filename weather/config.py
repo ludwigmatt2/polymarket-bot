@@ -83,6 +83,11 @@ KELLY_FRACTION = 0.25           # Quarter Kelly — conservative for uncertain e
 MAX_LIVE_TRADE_USD = float(os.environ.get("MAX_LIVE_TRADE_USD", "25.0"))  # overrideable via env or /setmaxbet
 DAILY_LOSS_LIMIT_PCT = 0.05     # Kill switch at -5% of total capital
 MAX_SLIPPAGE = float(os.environ.get("MAX_SLIPPAGE", "0.03"))  # market-buy price cap above entry (thin books)
+# Fraction of live balance held back from each order. Rapid-fire orders in one
+# scan each read balance before the prior order's USDC debit settles on-chain,
+# so a batch can collectively deploy slightly more than real funds. Reserving a
+# small buffer keeps the sum of a scan's orders strictly under available cash.
+BALANCE_BUFFER_PCT = float(os.environ.get("BALANCE_BUFFER_PCT", "0.03"))
 
 # ── Go-live gates (all must pass before real money) ────────────────────────────
 MIN_RESOLVED_TRADES = 20

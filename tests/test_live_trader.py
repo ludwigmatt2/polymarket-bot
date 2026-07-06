@@ -288,6 +288,22 @@ class TestFillReconciliation:
         with pytest.raises(AssertionError, match="fill parsing"):
             trader.execute_signal(_make_signal(market_p=0.35))
 
+    def test_balance_buffer_held_back_when_balance_bound(self, tmp_path):
+        """When the live balance caps the trade, a BALANCE_BUFFER_PCT slice is
+        reserved so a scan's rapid-fire orders can't collectively overdraw."""
+        from weather.config import BALANCE_BUFFER_PCT
+        trader = _make_trader(tmp_path)
+        trader._private_key = "0xkey"          # enable the on-chain balance guard
+        trader.fetch_balance = lambda: 10.0    # only $10 available on-chain
+        trader.kelly_size_usd = lambda signal: 25.0  # Kelly wants more than we hold
+        trader._client = _make_mock_client(filled=25.0)
+
+        trader.execute_signal(_make_signal(market_p=0.35, model_p=0.65))
+
+        amount = trader._client.create_and_post_market_order.call_args.args[0].amount
+        expected = 10.0 * (1.0 - BALANCE_BUFFER_PCT)   # $9.70, not the full $10
+        assert amount == pytest.approx(expected, abs=0.01)
+
 
 # ---------------------------------------------------------------------------
 # Session 4 tests — sizing, idempotency
