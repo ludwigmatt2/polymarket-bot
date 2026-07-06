@@ -32,6 +32,14 @@ def test_parse_station_intl():
     assert r == {"icao": "RKSI", "country": "KR", "unit": "C"}
 
 
+def test_parse_station_trailing_path():
+    # a dated URL must still yield the real ICAO, not the 4-letter "date" segment
+    desc = ("... recorded in degrees Fahrenheit ... https://www.wunderground.com/"
+            "history/daily/us/fl/miami/KMIA/date/2026-7-4")
+    assert station_parser.station_from_description(desc) == {
+        "icao": "KMIA", "country": "US", "unit": "F"}
+
+
 def test_parse_station_none():
     assert station_parser.station_from_description("no url here") is None
     assert station_parser.station_from_description(None) is None

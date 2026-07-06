@@ -454,12 +454,15 @@ class LiveTrader:
         if positions is None:
             return 0, 0  # positions API unavailable — book nothing, retry next pass
 
-        # Index settled (on-chain resolved) positions by conditionId.
-        settled: dict[str, dict] = {}
+        # Index settled (on-chain resolved) positions by (conditionId, outcome side),
+        # so a wallet holding both a YES and a NO position on one market resolves each
+        # trade against its OWN token rather than whichever position was last seen.
+        settled: dict[str, dict[str, dict]] = {}
         for p in positions:
             cond = (p.get("conditionId") or "").lower()
             if cond and p.get("redeemable"):
-                settled[cond] = p
+                side = str(p.get("outcome", "")).upper()
+                settled.setdefault(cond, {})[side] = p
 
         now = datetime.now(timezone.utc)
         with open(self._log_path) as f:
@@ -471,9 +474,10 @@ class LiveTrader:
                 continue
 
             cond = (t.get("market_id") or "").lower()
-            pos = settled.get(cond)
+            direction = t.get("direction", "NO")
+            pos = (settled.get(cond) or {}).get(direction.upper())
             if pos is None:
-                continue  # market not yet resolved on-chain — stay pending
+                continue  # our side not yet resolved on-chain — stay pending
 
             try:
                 filled_size = float(t.get("filled_size", 0) or 0)
@@ -486,12 +490,14 @@ class LiveTrader:
                 continue
 
             # Settled payout: a winning outcome token is worth $1 (currentValue ≈
-            # size), a losing one $0. curPrice (0/1 post-resolution) is the tiebreak.
-            won_bet = (
-                float(pos.get("currentValue") or 0) > 1e-9
-                or float(pos.get("curPrice") or 0) >= 0.5
-            )
-            direction = t.get("direction", "NO")
+            # size), a losing one $0. Trust currentValue when present; fall back to
+            # curPrice only when it's missing (a lingering last-trade curPrice on a
+            # $0 loser must not read as a win).
+            cv = pos.get("currentValue")
+            if cv is not None:
+                won_bet = float(cv) > 1e-9
+            else:
+                won_bet = float(pos.get("curPrice") or 0) >= 0.5
             # YES-condition truth = what the market actually resolved to.
             outcome = won_bet if direction == "YES" else (not won_bet)
             pnl = filled_size * ((1.0 - filled_price) if won_bet else -filled_price)

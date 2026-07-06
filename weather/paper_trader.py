@@ -227,26 +227,32 @@ class PaperTrader:
 
             loc_tz = t.get("location_tz") or "UTC"
             # Wait until the event's local day is over + settled, so we read the
-            # final daily value, not a mid-day forecast.
+            # final daily value, not a mid-day forecast. Fetch on the station's LOCAL
+            # calendar day (resolution_date is UTC — can be the adjacent date).
             if not _settle_ready(res_dt, loc_tz, now):
                 continue
+            event_date = _local_event_date(res_dt, loc_tz)
 
             station_icao = t.get("station_icao") or ""
-            use_station = station_icao and metric in ("temperature_2m_max", "temperature_2m_min")
+            resolve_unit = t.get("resolve_unit") or ""
+            # Require the unit too — never guess it, or a °F market with a blank unit
+            # would resolve in °C. Missing unit → fall through to the Open-Meteo path.
+            use_station = (station_icao and resolve_unit
+                           and metric in ("temperature_2m_max", "temperature_2m_min"))
             if use_station:
                 # Phase 1: resolve on the station's Wunderground reading (WU → IEM
                 # fallback), rounded to whole degrees in the market's unit — matching
                 # how Polymarket actually settles.
                 outcome, _src, _val = station_outcome(
-                    station_icao, t.get("station_country") or "", t.get("resolve_unit") or "C",
-                    res_dt.date(), metric, threshold, threshold_high, w_dir, cache=station_cache,
+                    station_icao, t.get("station_country") or "", resolve_unit,
+                    event_date, metric, threshold, threshold_high, w_dir, cache=station_cache,
                 )
                 if outcome is None:
                     skipped += 1
                     continue
             else:
                 loc = Location(city="", lat=lat, lon=lon, timezone=loc_tz)
-                actual_val = weather_client.get_historical_actual(loc, res_dt.date(), metric)
+                actual_val = weather_client.get_historical_actual(loc, event_date, metric)
                 if actual_val is None:
                     skipped += 1
                     continue
@@ -440,6 +446,18 @@ class PaperTrader:
 RESOLVE_SETTLE_BUFFER_HOURS = float(os.environ.get("RESOLVE_SETTLE_BUFFER_HOURS", "6"))
 
 
+def _local_event_date(res_dt: datetime, loc_tz: str):
+    """The event's calendar date in the station's LOCAL timezone — the day the
+    market resolves on. resolution_date is stored in UTC, which can differ from the
+    local date near UTC midnight, so both the settle gate and the value fetch must
+    use this, not res_dt.date()."""
+    try:
+        tz = ZoneInfo(loc_tz)
+    except Exception:
+        tz = timezone.utc
+    return res_dt.astimezone(tz).date()
+
+
 def _settle_ready(res_dt: datetime, loc_tz: str, now: datetime) -> bool:
     """True once the event's local day has fully ended (+ a settle buffer), so the
     archive returns the settled daily value rather than an in-progress forecast."""
@@ -447,9 +465,8 @@ def _settle_ready(res_dt: datetime, loc_tz: str, now: datetime) -> bool:
         tz = ZoneInfo(loc_tz)
     except Exception:
         tz = timezone.utc
-    event_date = res_dt.astimezone(tz).date()
     local_midnight_after = datetime.combine(
-        event_date + timedelta(days=1), _time(0, 0), tzinfo=tz
+        _local_event_date(res_dt, loc_tz) + timedelta(days=1), _time(0, 0), tzinfo=tz
     )
     deadline = local_midnight_after.astimezone(timezone.utc) + timedelta(
         hours=RESOLVE_SETTLE_BUFFER_HOURS
