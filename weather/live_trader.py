@@ -22,7 +22,7 @@ from .config import (
     MAX_LIVE_TRADE_USD,
     MAX_SLIPPAGE,
 )
-from .models import Location, Signal
+from .models import Signal
 from .paper_trader import PaperTrader, _brier
 from .secrets import _LEGACY_SIG_MAP
 
@@ -433,7 +433,7 @@ class LiveTrader:
             "status": order_status,
         }
 
-    def auto_resolve(self, weather_client=None, model=None) -> tuple[int, int]:
+    def auto_resolve(self, weather_client=None, model=None, positions=None) -> tuple[int, int]:
         """Resolve unresolved live trades from ON-CHAIN settlement — the money's
         ground truth — not from weather forecasts.
 
@@ -444,13 +444,15 @@ class LiveTrader:
         on-chain (its position is `redeemable`); win/loss comes from the settled
         payout. Markets not yet settled stay pending and are retried next pass.
 
-        `weather_client` is accepted for call-site compatibility but unused.
+        `weather_client` is accepted for call-site compatibility but unused. Pass a
+        `positions` snapshot to share one data-api fetch with claim_winnings.
         Returns (resolved_count, skipped_count).
         """
         if not self._log_path.exists():
             return 0, 0
 
-        positions = self.fetch_positions()
+        if positions is None:
+            positions = self.fetch_positions()
         if positions is None:
             return 0, 0  # positions API unavailable — book nothing, retry next pass
 
@@ -560,17 +562,19 @@ class LiveTrader:
         except Exception:
             return None
 
-    def redeemable_positions(self) -> list[dict] | None:
+    def redeemable_positions(self, positions=None) -> list[dict] | None:
         """On-chain positions whose market has resolved and whose winnings are
         claimable (redeemable=True). Use to drive post-resolution settlement.
         Returns None when the positions API is unavailable (distinct from an
-        empty list) so the claim path can alert instead of silently no-op'ing."""
-        positions = self.fetch_positions()
+        empty list) so the claim path can alert instead of silently no-op'ing.
+        Pass a `positions` snapshot to reuse one fetch."""
+        if positions is None:
+            positions = self.fetch_positions()
         if positions is None:
             return None
         return [p for p in positions if p.get("redeemable")]
 
-    def claim_winnings(self) -> dict:
+    def claim_winnings(self, positions=None) -> dict:
         """Redeem resolved (redeemable) on-chain positions back to pUSD in the
         deposit wallet, gaslessly via the relayer. Routes CTF (binary) vs
         NegRiskAdapter (neg-risk) per position. Driven by the data-api redeemable
@@ -584,7 +588,7 @@ class LiveTrader:
         """
         if not self._funder_address or not self._private_key:
             return {"claimed": 0}
-        redeemable = self.redeemable_positions()
+        redeemable = self.redeemable_positions(positions)
         if redeemable is None:
             # API unavailable (e.g. data-api 403) — distinct from "nothing to claim".
             # Surface it so the resolve job can alert instead of silently no-op'ing.

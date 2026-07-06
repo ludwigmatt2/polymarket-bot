@@ -289,10 +289,11 @@ def fan_out_auto_resolve(client: WeatherClient) -> None:
                     log_path=live_csv,
                     idempotency_path=user_dir / "live_idempotency.json",
                 )
-                live_resolved, live_skipped = user_live.auto_resolve(client, model=None)
+                _positions = user_live.fetch_positions()  # one snapshot for resolve + claim
+                live_resolved, live_skipped = user_live.auto_resolve(client, model=None, positions=_positions)
                 print(f"  User {uid} live: auto-resolved {live_resolved} trade(s).  "
                       f"{live_skipped} skipped.")
-                _claim = user_live.claim_winnings()
+                _claim = user_live.claim_winnings(positions=_positions)
                 if _claim.get("claimed"):
                     print(f"  User {uid} live: claimed {_claim['claimed']} resolved position(s) → pUSD.")
                 elif _claim.get("error"):
@@ -755,9 +756,10 @@ def main() -> None:
                 get_user_creds(_admin_uid) if _admin_uid else None,
                 paper_trader=paper, log_path=live_log,
             )
-            live_resolved, live_skipped = live_trader.auto_resolve(client, model=model)
+            _positions = live_trader.fetch_positions()  # one snapshot for resolve + claim
+            live_resolved, live_skipped = live_trader.auto_resolve(client, model=model, positions=_positions)
             print(f"  Live:  auto-resolved {live_resolved} trade(s).  {live_skipped} skipped.")
-            _claim = live_trader.claim_winnings()
+            _claim = live_trader.claim_winnings(positions=_positions)
             if _claim.get("claimed"):
                 print(f"  Live:  claimed {_claim['claimed']} resolved position(s) → pUSD.")
             elif _claim.get("error"):

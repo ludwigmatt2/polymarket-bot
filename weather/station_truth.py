@@ -20,40 +20,45 @@ from .models import _evaluate_outcome
 _METRIC_KIND = {"temperature_2m_max": "max", "temperature_2m_min": "min"}
 
 
-def _fetch_value_f(icao: str, day: date, kind: str,
-                   country: str | None) -> tuple[float | None, str | None]:
-    """The WU → IEM-peak → IEM-DSM fallback chain (one network probe)."""
+def _fetch_day(icao: str, day: date, country: str | None) -> dict | None:
+    """One probe covering BOTH metrics: {'max_f','min_f','source'} or None. WU and
+    IEM DSM both return max+min in a single call; metar_peak's two reductions run off
+    the same obs set (both present or both absent). So one call serves high AND low
+    markets for a station/day."""
     hl = wu_client.daily_high_low(icao, day, country)
     if hl:
-        return (hl["max_f"] if kind == "max" else hl["min_f"]), "wunderground"
-    peak = iem_client.metar_peak(icao, day, kind)
-    if peak is not None:
-        return peak, "iem_metar_peak"
+        return {"max_f": hl["max_f"], "min_f": hl["min_f"], "source": "wunderground"}
+    mx = iem_client.metar_peak(icao, day, "max")
+    mn = iem_client.metar_peak(icao, day, "min")
+    if mx is not None or mn is not None:
+        return {"max_f": mx, "min_f": mn, "source": "iem_metar_peak"}
     dm = iem_client.daily_maxmin(icao, day)
-    if dm:
-        v = dm["max_f"] if kind == "max" else dm["min_f"]
-        if v is not None:
-            return float(v), "iem_dsm"
-    return None, None
+    if dm and (dm.get("max_f") is not None or dm.get("min_f") is not None):
+        return {"max_f": dm.get("max_f"), "min_f": dm.get("min_f"), "source": "iem_dsm"}
+    return None
 
 
 def daily_value_f(icao: str, day: date, metric: str, country: str | None = None,
                   cache: dict | None = None) -> tuple[float | None, str | None]:
     """(value_°F, source) for the station's daily max/min, WU → IEM-peak → IEM-DSM.
     `country` (from the market's Wunderground URL) lets WU resolve stations outside
-    the seeded registry. Pass a `cache` dict to memoize the fetch across trades that
-    share a station/day/metric within one resolve pass. (None, None) if unsupported
-    or every source fails."""
+    the seeded registry. Pass a `cache` dict to memoize the day's fetch across trades
+    that share a station/day within one resolve pass — high and low markets then
+    reuse one probe. (None, None) if unsupported or every source fails."""
     kind = _METRIC_KIND.get(metric)
     if kind is None:
         return None, None
-    key = (icao, day.isoformat(), metric)
+    key = (icao, day.isoformat())
     if cache is not None and key in cache:
-        return cache[key]
-    result = _fetch_value_f(icao, day, kind, country)
-    if cache is not None:
-        cache[key] = result
-    return result
+        rec = cache[key]
+    else:
+        rec = _fetch_day(icao, day, country)
+        if cache is not None:
+            cache[key] = rec
+    if not rec:
+        return None, None
+    v = rec["max_f"] if kind == "max" else rec["min_f"]
+    return (float(v), rec["source"]) if v is not None else (None, None)
 
 
 def station_outcome(icao: str, country: str, unit: str, day: date, metric: str,
