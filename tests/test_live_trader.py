@@ -686,12 +686,12 @@ class TestClaimWinnings:
 
     def test_noop_without_redeemable(self, tmp_path):
         t = self._trader(tmp_path)
-        t.redeemable_positions = lambda: []
+        t.redeemable_positions = lambda positions=None: []
         assert t.claim_winnings() == {"claimed": 0}
 
     def test_routes_and_groups(self, tmp_path, monkeypatch):
         t = self._trader(tmp_path)
-        t.redeemable_positions = lambda: [
+        t.redeemable_positions = lambda positions=None: [
             {"conditionId": "0xbin", "outcome": "Yes", "size": 7.0, "negRisk": False, "redeemable": True},
             {"conditionId": "0xneg", "outcome": "No", "size": 3.0, "negRisk": True, "redeemable": True},
         ]
@@ -724,7 +724,7 @@ class TestClaimWinnings:
 
     def test_relayer_error_is_swallowed(self, tmp_path, monkeypatch):
         t = self._trader(tmp_path)
-        t.redeemable_positions = lambda: [
+        t.redeemable_positions = lambda positions=None: [
             {"conditionId": "0xa", "outcome": "Yes", "size": 1.0, "redeemable": True},
         ]
 
@@ -743,7 +743,7 @@ class TestClaimWinnings:
         """Redemption USDC.e is wrapped back to pUSD (delta only) so it never reads
         as a deposit."""
         t = self._trader(tmp_path)
-        t.redeemable_positions = lambda: [
+        t.redeemable_positions = lambda positions=None: [
             {"conditionId": "0xa", "outcome": "Yes", "size": 5.0, "redeemable": True},
         ]
         captured = {}

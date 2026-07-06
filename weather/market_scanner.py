@@ -400,16 +400,20 @@ class WeatherMarketScanner:
             }], _MISMATCH_FIELDS)
             return _MISMATCH_DROP
 
-        # Phase 1: resolving airport station from the rules (Wunderground URL), so
-        # the trade later settles on the station's reading, not the Open-Meteo grid.
+        # Resolving airport station from the rules (Wunderground URL). We only adopt
+        # the station when it's in the registry — that gates BOTH the forecast (at
+        # the station's coords) AND resolution (on the station's reading) on the same
+        # capability, so an unregistered station never prices on the city grid yet
+        # settles on the station. Unregistered → pure Open-Meteo path, consistently.
         st = station_from_description(m.description) or {}
-        # Phase 2: forecast AT the resolving station (not the city center) when its
-        # coords are known, so the ensemble + station-trained MOS line up with the
-        # thermometer that actually settles. Unknown stations keep the city location.
         sm = station_meta(st.get("icao", "")) if st.get("icao") else None
         if sm:
             location = Location(city=location.city, lat=sm["lat"], lon=sm["lon"],
                                 timezone=sm["tz"], country=st.get("country", ""))
+            station_icao, station_country = st["icao"], st.get("country", "")
+            resolve_unit = st.get("unit", "")
+        else:
+            station_icao = station_country = resolve_unit = ""
 
         return WeatherMarket(
             market_id=m.market_id,
@@ -429,9 +433,9 @@ class WeatherMarketScanner:
             yes_token_id=m.yes_token_id,
             no_token_id=m.no_token_id,
             tick_size=m.tick_size,
-            station_icao=st.get("icao", ""),
-            station_country=st.get("country", ""),
-            resolve_unit=st.get("unit", ""),
+            station_icao=station_icao,
+            station_country=station_country,
+            resolve_unit=resolve_unit,
         )
 
     def _description_agrees(
