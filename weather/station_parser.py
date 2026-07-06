@@ -14,8 +14,12 @@ from __future__ import annotations
 
 import re
 
+# The ICAO is the final path segment and is UPPERCASE in the URL (e.g. .../miami/KMIA),
+# while the country/city segments are lowercase. Matching the ICAO case-sensitively
+# (via the scoped (?-i:...)) pins it to the real station even if a trailing path is
+# ever appended (.../KMIA/date/...) — a lowercase segment like "date" can't match.
 _WU_URL = re.compile(
-    r"wunderground\.com/history/daily/([a-z]{2})/(?:[a-z0-9-]+/)+([a-z]{4})",
+    r"wunderground\.com/history/daily/([a-z]{2})/(?:[a-z0-9-]+/)+(?-i:([A-Z]{4}))",
     re.IGNORECASE,
 )
 # Precision the market resolves on, and unit (°F for US markets, °C elsewhere).

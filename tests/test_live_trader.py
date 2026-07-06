@@ -566,9 +566,9 @@ class TestOnChainAutoResolve:
         trader = _make_trader(tmp_path)
         _write_live_trades(trader._log_path, self._rows())
         trader.fetch_positions = lambda: [
-            {"conditionId": "0xWIN", "redeemable": True, "currentValue": 10.0, "curPrice": 1.0},
-            {"conditionId": "0xLOSE", "redeemable": True, "currentValue": 0.0, "curPrice": 0.0},
-            {"conditionId": "0xPENDING", "redeemable": False, "currentValue": 10.0},
+            {"conditionId": "0xWIN", "outcome": "No", "redeemable": True, "currentValue": 10.0, "curPrice": 1.0},
+            {"conditionId": "0xLOSE", "outcome": "No", "redeemable": True, "currentValue": 0.0, "curPrice": 0.0},
+            {"conditionId": "0xPENDING", "outcome": "No", "redeemable": False, "currentValue": 10.0},
         ]
         resolved, _ = trader.auto_resolve()
         assert resolved == 2  # pending one stays unbooked
@@ -591,6 +591,28 @@ class TestOnChainAutoResolve:
         assert trader.auto_resolve() == (0, 0)
         rows = list(csv.DictReader(open(trader._log_path)))
         assert all(r["actual_outcome"] == "" for r in rows)
+
+    def test_opposite_direction_positions_dont_collide(self, tmp_path):
+        # Same market, held both ways; market resolves YES. Each trade must book
+        # off its OWN token, not whichever position was indexed last.
+        trader = _make_trader(tmp_path)
+        base = {"filled_size": "10", "filled_price": "0.50", "model_p": "0.5",
+                "weather_direction": "range", "actual_outcome": ""}
+        _write_live_trades(trader._log_path, [
+            {**base, "market_id": "0xM", "direction": "YES"},
+            {**base, "market_id": "0xM", "direction": "NO"},
+        ])
+        trader.fetch_positions = lambda: [
+            {"conditionId": "0xM", "outcome": "Yes", "redeemable": True, "currentValue": 10.0},
+            {"conditionId": "0xM", "outcome": "No", "redeemable": True, "currentValue": 0.0},
+        ]
+        resolved, _ = trader.auto_resolve()
+        assert resolved == 2
+        rows = list(csv.DictReader(open(trader._log_path)))
+        yes = next(r for r in rows if r["direction"] == "YES")
+        no = next(r for r in rows if r["direction"] == "NO")
+        assert float(yes["pnl_usd"]) > 0   # YES won
+        assert float(no["pnl_usd"]) < 0    # NO lost
 
 
 class TestPositionsReconciliation:
