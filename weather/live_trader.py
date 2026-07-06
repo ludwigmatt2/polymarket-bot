@@ -17,6 +17,7 @@ from typing import Any
 
 from ._io import atomic_write_csv, atomic_write_json
 from .config import (
+    BALANCE_BUFFER_PCT,
     DAILY_LOSS_LIMIT_PCT,
     KELLY_FRACTION,
     MAX_LIVE_TRADE_USD,
@@ -292,11 +293,15 @@ class LiveTrader:
 
         # Pre-trade balance guard — never size above currently-available USDC.
         # Re-fetches per trade so cumulative sizing across multiple signals in
-        # one run can't exceed real funds. Skipped when no private key is set
-        # (unit tests inject a mock _poly directly, without credentials).
+        # one run can't exceed real funds. A BALANCE_BUFFER_PCT slice is held
+        # back because rapid-fire orders in one scan each read balance before the
+        # prior order's on-chain USDC debit settles, so the batch could otherwise
+        # deploy a hair over real funds (Available dips negative). Skipped when no
+        # private key is set (unit tests inject a mock _poly directly, no creds).
         if self._private_key:
             try:
-                size_usd = min(size_usd, self.fetch_balance())
+                spendable = self.fetch_balance() * (1.0 - BALANCE_BUFFER_PCT)
+                size_usd = min(size_usd, spendable)
             except Exception:
                 pass  # balance unavailable — proceed on the Kelly size
 
