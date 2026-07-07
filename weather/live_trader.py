@@ -17,7 +17,6 @@ from typing import Any
 
 from ._io import atomic_write_csv, atomic_write_json
 from .config import (
-    BALANCE_BUFFER_PCT,
     DAILY_LOSS_LIMIT_PCT,
     KELLY_FRACTION,
     MAX_LIVE_TRADE_USD,
@@ -221,6 +220,18 @@ class LiveTrader:
         self._clob_secret = clob_secret
         self._clob_passphrase = clob_passphrase
         self._client: Any = None
+        # USD committed by orders placed in the current scan. On-chain USDC debits
+        # lag the ~seconds between a scan's orders, so fetch_balance() reads stale
+        # (too-high) mid-scan; subtracting this from the fetched balance stops a
+        # batch collectively overdrawing. Reset per scan via reset_scan_commitments()
+        # — by the next scan settlement has landed and fetch_balance is authoritative.
+        self._committed_this_scan = 0.0
+
+    def reset_scan_commitments(self) -> None:
+        """Zero the in-scan spend tracker. Call once at the start of each scan's
+        execution loop (a fresh trader starts at 0, but the single-user main loop
+        reuses one trader across scans)."""
+        self._committed_this_scan = 0.0
 
     @classmethod
     def from_creds(cls, creds: dict | None, *, paper_trader, bankroll_usd: float = 0.0,
@@ -292,15 +303,14 @@ class LiveTrader:
         size_usd = self.kelly_size_usd(signal)
 
         # Pre-trade balance guard — never size above currently-available USDC.
-        # Re-fetches per trade so cumulative sizing across multiple signals in
-        # one run can't exceed real funds. A BALANCE_BUFFER_PCT slice is held
-        # back because rapid-fire orders in one scan each read balance before the
-        # prior order's on-chain USDC debit settles, so the batch could otherwise
-        # deploy a hair over real funds (Available dips negative). Skipped when no
-        # private key is set (unit tests inject a mock _poly directly, no creds).
+        # fetch_balance() reads real on-chain collateral, but a prior order's debit
+        # in the same scan may not have settled yet, so the read runs stale (too
+        # high). Subtracting what we've already committed this scan makes the sum of
+        # a scan's orders exact regardless of settlement lag — no buffer needed.
+        # Skipped when no private key is set (unit tests inject a mock _poly).
         if self._private_key:
             try:
-                spendable = self.fetch_balance() * (1.0 - BALANCE_BUFFER_PCT)
+                spendable = self.fetch_balance() - self._committed_this_scan
                 size_usd = min(size_usd, spendable)
             except Exception:
                 pass  # balance unavailable — proceed on the Kelly size
@@ -425,6 +435,9 @@ class LiveTrader:
             return {"order_id": order_id, "status": "unfilled", "filled": 0.0,
                     "size_usd": 0.0, "filled_price": 0.0, "price": 0.0}
 
+        # Book the real USD spent against this scan's budget so the next order in
+        # the same scan sizes off the true remaining balance, not a stale read.
+        self._committed_this_scan += usd_spent
         self._log_trade(signal, order_id, usd_spent, ep, filled, filled_price, order_status)
         self.paper_trader.log_trade(signal)
 
