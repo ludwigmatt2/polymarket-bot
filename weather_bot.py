@@ -778,9 +778,14 @@ def main() -> None:
         resolved = [t for t in paper._load_all() if t.get("actual_outcome") not in (None, "", "None")]
         count = 0
         for t in resolved:
+            # Phase-0 rule: the calibrator is applied to raw_p, so it must be
+            # trained on raw_p. Rows without raw_p (pre-Phase-0) are skipped —
+            # backfilling model_p would re-poison the scale (Jul 7 audit).
+            if t.get("raw_p") in (None, ""):
+                continue
             try:
                 model.log_observation(
-                    float(t["model_p"]),
+                    float(t["raw_p"]),
                     bool(int(t["actual_outcome"])),
                     direction=t.get("weather_direction", ""),
                 )

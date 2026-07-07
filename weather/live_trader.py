@@ -46,6 +46,10 @@ _CSV_HEADERS = [
     "actual_outcome", "resolved_at", "pnl_usd", "brier_score",
     # Tax fields — EUR equivalent at resolve date (ECB reference rate)
     "eur_rate", "pnl_eur",
+    # Calibrator input: pre-calibration, pre-shrinkage probability. The calibrator
+    # is APPLIED to raw_p at inference, so it must be TRAINED on raw_p — logging
+    # the calibrated+shrunk model_p here poisoned the scale (Jul 7 audit).
+    "raw_p",
 ]
 
 # Public Data API — on-chain positions per wallet address (no auth required).
@@ -542,8 +546,12 @@ class LiveTrader:
                 t["pnl_eur"] = round(pnl * eur_rate, 4)
             resolved += 1
 
-            if model is not None:
-                model.log_observation(model_p, outcome, direction=w_dir)
+            # Train the calibrator on raw_p — the scale it is applied to. Legacy
+            # rows without raw_p are skipped: model_p is calibrated+shrunk and
+            # feeding it back poisons the fit (Jul 7 audit).
+            raw_p = t.get("raw_p")
+            if model is not None and raw_p not in (None, ""):
+                model.log_observation(float(raw_p), outcome, direction=w_dir)
 
         if resolved:
             atomic_write_csv(self._log_path, _CSV_HEADERS, trades)
@@ -821,4 +829,5 @@ class LiveTrader:
                 "brier_score":       "",
                 "eur_rate":          "",
                 "pnl_eur":           "",
+                "raw_p":             round(signal.prob_result.raw_p, 4),
             })
