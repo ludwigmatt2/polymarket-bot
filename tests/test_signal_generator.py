@@ -10,7 +10,9 @@ from weather.models import EnsembleForecast, Location, RawProbabilityResult, Wea
 from weather.signal_generator import SignalGenerator
 
 
-def _make_market(yes_price=0.30, liquidity=5000.0, days_out=3):
+def _make_market(yes_price=0.30, liquidity=5000.0, days_out=3, station_icao="KMIA"):
+    # Gate 0.5 requires a registered station for temperature markets; pass
+    # station_icao="" to exercise the no-station rejection.
     return WeatherMarket(
         market_id="test_mkt",
         title="Will the high temperature in Miami exceed 90°F on May 5?",
@@ -23,6 +25,9 @@ def _make_market(yes_price=0.30, liquidity=5000.0, days_out=3):
         threshold=90.0,
         direction="above",
         url="https://polymarket.com/test",
+        station_icao=station_icao,
+        station_country="US",
+        resolve_unit="F",
     )
 
 
@@ -73,6 +78,13 @@ class TestQualityGates:
         signal = gen.evaluate(_make_market(yes_price=0.30))
         assert signal.quality_gate_passed is True
         assert signal.rejection_reason is None
+
+    # Gate 0.5 — verified resolution truth
+    def test_rejects_temp_market_without_station(self):
+        gen = _make_generator(model_p=0.80)
+        signal = gen.evaluate(_make_market(yes_price=0.30, station_icao=""))
+        assert signal.quality_gate_passed is False
+        assert "gate0.5_no_station_truth" in signal.rejection_reason
 
     # Gate 4 — fee-adjusted edge
     def test_rejects_insufficient_net_ev(self):
@@ -206,6 +218,9 @@ class TestQualityGates:
             threshold=90.0,
             direction="above",
             url="https://polymarket.com/test",
+            station_icao="KMIA",
+            station_country="US",
+            resolve_unit="F",
         )
         signal = gen.evaluate(market)
         assert signal.quality_gate_passed is False

@@ -37,17 +37,22 @@ def _country(icao: str) -> str | None:
     return "US" if is_us(icao) else m["network"][:2]
 
 
-def daily_high_low(icao: str, day: date, country: str | None = None) -> dict | None:
-    """{'max_f','min_f','source'} for the station's local `day` from WU obs, or None
-    on any failure. Temps are whole °F as WU serves them. `country` (2-letter, e.g.
-    from the market's Wunderground URL) lets this work for stations not in the IEM
-    registry; falls back to the registry when omitted."""
+def daily_high_low(icao: str, day: date, country: str | None = None,
+                   units: str = "e") -> dict | None:
+    """Daily max/min for the station's local `day` from WU obs, or None on any
+    failure. units='e' (English) → {'max_f','min_f','source'} in whole °F;
+    units='m' (metric) → {'max_c','min_c','source'} in whole °C — WU's OWN metric
+    values, so °C markets never re-convert an already-rounded °F reading (the
+    double-rounding trap: 30.4°C → WU 87°F → back-converted 30.56 → rounds to 31,
+    while WU's metric page shows 30). `country` (2-letter, e.g. from the market's
+    Wunderground URL) lets this work for stations not in the IEM registry; falls
+    back to the registry when omitted."""
     cc = (country or "").strip().upper() or _country(icao)
     if not cc:
         return None
     key = os.environ.get("WU_API_KEY", _DEFAULT_KEY)
     url = _HISTORICAL.format(icao=icao.strip().upper(), cc=cc) + "?" + urllib.parse.urlencode({
-        "apiKey": key, "units": "e",
+        "apiKey": key, "units": units,
         "startDate": day.strftime("%Y%m%d"), "endDate": day.strftime("%Y%m%d"),
     })
     try:
@@ -59,4 +64,6 @@ def daily_high_low(icao: str, day: date, country: str | None = None) -> dict | N
     temps = [o.get("temp") for o in obs if o.get("temp") is not None]
     if not temps:
         return None
-    return {"max_f": float(max(temps)), "min_f": float(min(temps)), "source": "wunderground"}
+    suffix = "c" if units == "m" else "f"
+    return {f"max_{suffix}": float(max(temps)), f"min_{suffix}": float(min(temps)),
+            "source": "wunderground"}

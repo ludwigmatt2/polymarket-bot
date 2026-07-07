@@ -20,6 +20,21 @@ _SEOUL_DESC = (
     "8 May '26. ... available here: "
     "https://www.wunderground.com/history/daily/kr/incheon/RKSI."
 )
+# London resolves at EGLC in FAHRENHEIT despite the gb/ country segment — the
+# explicit unit sentence must win over the country fallback.
+_LONDON_DESC = (
+    "This market will resolve to the temperature range that contains the highest "
+    "temperature recorded at the London City Airport Station in degrees Fahrenheit "
+    "on 8 Jul '26. ... available here: "
+    "https://www.wunderground.com/history/daily/gb/london/EGLC."
+)
+# Tel Aviv resolves off the NOAA/NWS timeseries page, not Wunderground.
+_TELAVIV_DESC = (
+    "This market will resolve to the temperature range that contains the highest "
+    "temperature recorded at the Sde Dov Airport Station in degrees Celsius on "
+    "7 Jul '26. The resolution source for this market is NOAA, available here: "
+    "https://www.weather.gov/wrh/timeseries?site=LLBG."
+)
 
 
 def test_parse_station_us():
@@ -30,6 +45,16 @@ def test_parse_station_us():
 def test_parse_station_intl():
     r = station_parser.station_from_description(_SEOUL_DESC)
     assert r == {"icao": "RKSI", "country": "KR", "unit": "C"}
+
+
+def test_parse_station_london_fahrenheit():
+    r = station_parser.station_from_description(_LONDON_DESC)
+    assert r == {"icao": "EGLC", "country": "GB", "unit": "F"}
+
+
+def test_parse_station_noaa_url():
+    r = station_parser.station_from_description(_TELAVIV_DESC)
+    assert r == {"icao": "LLBG", "country": "", "unit": "C"}
 
 
 def test_parse_station_trailing_path():
@@ -43,6 +68,12 @@ def test_parse_station_trailing_path():
 def test_parse_station_none():
     assert station_parser.station_from_description("no url here") is None
     assert station_parser.station_from_description(None) is None
+
+
+def test_registry_has_actual_resolving_stations():
+    # Dallas settles at Love Field (KDAL), NOT DFW; London at EGLC; Tokyo at RJTT.
+    for icao in ("KDAL", "EGLC", "RJTT", "LLBG"):
+        assert iem_client.station_meta(icao) is not None, icao
 
 
 class _Resp:
@@ -71,6 +102,20 @@ def test_daily_high_low_parses(monkeypatch):
     r = wu_client.daily_high_low("KMIA", date(2026, 7, 4))
     assert r == {"max_f": 91.0, "min_f": 80.0, "source": "wunderground"}
     assert "KMIA:9:US" in cap["url"] and "startDate=20260704" in cap["url"]
+    assert "units=e" in cap["url"]
+
+
+def test_daily_high_low_metric_units(monkeypatch):
+    # °C markets fetch WU's own metric values — no °F round-trip
+    body = json.dumps({"observations": [{"temp": 29}, {"temp": 17}]})
+    cap = {}
+    def fake(req, timeout=20):
+        cap["url"] = req.full_url
+        return _Resp(body)
+    monkeypatch.setattr("urllib.request.urlopen", fake)
+    r = wu_client.daily_high_low("LFPB", date(2026, 7, 5), "FR", units="m")
+    assert r == {"max_c": 29.0, "min_c": 17.0, "source": "wunderground"}
+    assert "units=m" in cap["url"]
 
 
 def test_daily_high_low_key_override(monkeypatch):
@@ -93,35 +138,73 @@ def test_daily_high_low_failure_returns_none(monkeypatch):
 # ── station_truth fallback chain ─────────────────────────────────────────────
 def test_prefers_wunderground(monkeypatch):
     monkeypatch.setattr(wu_client, "daily_high_low",
-                        lambda i, d, c=None: {"max_f": 97.0, "min_f": 74.0, "source": "wunderground"})
-    v, src = station_truth.daily_value_f("KLGA", date(2026, 7, 4), "temperature_2m_max")
+                        lambda i, d, c=None, units="e": {"max_f": 97.0, "min_f": 74.0, "source": "wunderground"})
+    v, src = station_truth.daily_value("KLGA", date(2026, 7, 4), "temperature_2m_max")
     assert v == 97.0 and src == "wunderground"
 
 
+def test_celsius_market_uses_wu_metric(monkeypatch):
+    # °C path must request units=m and use WU's metric values directly
+    seen = {}
+    def fake_wu(i, d, c=None, units="e"):
+        seen["units"] = units
+        return {"max_c": 29.0, "min_c": 17.0, "source": "wunderground"}
+    monkeypatch.setattr(wu_client, "daily_high_low", fake_wu)
+    v, src = station_truth.daily_value("LFPB", date(2026, 7, 5), "temperature_2m_max", unit="C")
+    assert v == 29.0 and src == "wunderground" and seen["units"] == "m"
+
+
+def test_celsius_fallback_converts_iem(monkeypatch):
+    monkeypatch.setattr(wu_client, "daily_high_low", lambda i, d, c=None, units="e": None)
+    monkeypatch.setattr(iem_client, "metar_peak", lambda i, d, kind: 86.0)  # 30.0°C
+    v, src = station_truth.daily_value("LFPB", date(2026, 7, 5), "temperature_2m_max", unit="C")
+    assert abs(v - 30.0) < 1e-9 and src == "iem_metar_peak"
+
+
 def test_falls_back_to_iem_peak(monkeypatch):
-    monkeypatch.setattr(wu_client, "daily_high_low", lambda i, d, c=None: None)
+    monkeypatch.setattr(wu_client, "daily_high_low", lambda i, d, c=None, units="e": None)
     monkeypatch.setattr(iem_client, "metar_peak", lambda i, d, kind: 91.0)
-    v, src = station_truth.daily_value_f("KMIA", date(2026, 7, 4), "temperature_2m_max")
+    v, src = station_truth.daily_value("KMIA", date(2026, 7, 4), "temperature_2m_max")
     assert v == 91.0 and src == "iem_metar_peak"
 
 
 def test_falls_back_to_iem_dsm(monkeypatch):
-    monkeypatch.setattr(wu_client, "daily_high_low", lambda i, d, c=None: None)
+    monkeypatch.setattr(wu_client, "daily_high_low", lambda i, d, c=None, units="e": None)
     monkeypatch.setattr(iem_client, "metar_peak", lambda i, d, kind: None)
     monkeypatch.setattr(iem_client, "daily_maxmin", lambda i, d: {"max_f": 93.0, "min_f": 75.0})
-    v, src = station_truth.daily_value_f("KATL", date(2026, 7, 4), "temperature_2m_max")
+    v, src = station_truth.daily_value("KATL", date(2026, 7, 4), "temperature_2m_max")
     assert v == 93.0 and src == "iem_dsm"
 
 
 def test_all_fail_returns_none(monkeypatch):
-    monkeypatch.setattr(wu_client, "daily_high_low", lambda i, d, c=None: None)
+    monkeypatch.setattr(wu_client, "daily_high_low", lambda i, d, c=None, units="e": None)
     monkeypatch.setattr(iem_client, "metar_peak", lambda i, d, kind: None)
     monkeypatch.setattr(iem_client, "daily_maxmin", lambda i, d: None)
-    assert station_truth.daily_value_f("KLGA", date(2026, 7, 4), "temperature_2m_max") == (None, None)
+    assert station_truth.daily_value("KLGA", date(2026, 7, 4), "temperature_2m_max") == (None, None)
 
 
 def test_unsupported_metric():
-    assert station_truth.daily_value_f("KLGA", date(2026, 7, 4), "precipitation_sum") == (None, None)
+    assert station_truth.daily_value("KLGA", date(2026, 7, 4), "precipitation_sum") == (None, None)
+
+
+def test_cache_keyed_by_unit(monkeypatch):
+    # A °F probe must not serve a °C market from cache
+    calls = []
+    def fake_wu(i, d, c=None, units="e"):
+        calls.append(units)
+        return ({"max_f": 86.0, "min_f": 70.0, "source": "wunderground"} if units == "e"
+                else {"max_c": 30.0, "min_c": 21.0, "source": "wunderground"})
+    monkeypatch.setattr(wu_client, "daily_high_low", fake_wu)
+    cache = {}
+    vf, _ = station_truth.daily_value("LFPB", date(2026, 7, 5), "temperature_2m_max",
+                                      cache=cache, unit="F")
+    vc, _ = station_truth.daily_value("LFPB", date(2026, 7, 5), "temperature_2m_max",
+                                      cache=cache, unit="C")
+    assert vf == 86.0 and vc == 30.0 and calls == ["e", "m"]
+    # …and the same unit IS served from cache
+    station_truth.daily_value("LFPB", date(2026, 7, 5), "temperature_2m_min",
+                              cache=cache, unit="C")
+    assert calls == ["e", "m"]
 
 
 @pytest.mark.parametrize("wu_f,thr_c,thr_hi_c,expect", [
@@ -131,21 +214,35 @@ def test_unsupported_metric():
     (98.0, 36.6667, 37.2222, True),    # Dallas 98-99°F, WU 98 → in (on-chain: NO lost)
 ])
 def test_station_outcome_us_range(monkeypatch, wu_f, thr_c, thr_hi_c, expect):
-    monkeypatch.setattr(station_truth, "daily_value_f", lambda *a, **k: (wu_f, "wunderground"))
+    monkeypatch.setattr(station_truth, "daily_value", lambda *a, **k: (wu_f, "wunderground"))
     yes, src, val = station_truth.station_outcome(
         "KLGA", "US", "F", date(2026, 7, 4), "temperature_2m_max", thr_c, thr_hi_c, "range")
     assert yes is expect and src == "wunderground"
 
 
 def test_station_outcome_intl_equal(monkeypatch):
-    # Seoul "20°C" equal market; WU 68°F == 20.0°C → rounds to 20 → equal → YES
-    monkeypatch.setattr(station_truth, "daily_value_f", lambda *a, **k: (68.0, "wunderground"))
+    # Seoul "20°C" equal market; WU metric 20°C → equal → YES (no °F round-trip)
+    monkeypatch.setattr(station_truth, "daily_value", lambda *a, **k: (20.0, "wunderground"))
     yes, _, val = station_truth.station_outcome(
         "RKSI", "KR", "C", date(2026, 5, 8), "temperature_2m_max", 20.0, None, "equal")
     assert yes is True and val == 20.0
 
 
+@pytest.mark.parametrize("val,thr_c,direction,expect", [
+    # Inclusive boundaries: station value landing EXACTLY on the threshold is YES.
+    (98.0, 36.6667, "above", True),    # "98°F or higher", WU 98 → YES (old strict > said NO)
+    (93.0, 33.8889, "below", True),    # "93°F or below", WU 93 → YES
+    (97.0, 36.6667, "above", False),   # below the ladder edge stays NO
+    (94.0, 33.8889, "below", False),
+])
+def test_station_outcome_inclusive_boundary(monkeypatch, val, thr_c, direction, expect):
+    monkeypatch.setattr(station_truth, "daily_value", lambda *a, **k: (val, "wunderground"))
+    yes, _, _ = station_truth.station_outcome(
+        "KLGA", "US", "F", date(2026, 7, 4), "temperature_2m_max", thr_c, None, direction)
+    assert yes is expect
+
+
 def test_station_outcome_no_data(monkeypatch):
-    monkeypatch.setattr(station_truth, "daily_value_f", lambda *a, **k: (None, None))
+    monkeypatch.setattr(station_truth, "daily_value", lambda *a, **k: (None, None))
     assert station_truth.station_outcome(
         "KLGA", "US", "F", date(2026, 7, 4), "temperature_2m_max", 35.5, 36.1, "range") == (None, None, None)

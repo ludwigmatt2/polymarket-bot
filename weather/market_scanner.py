@@ -311,6 +311,7 @@ class WeatherMarketScanner:
 
         threshold_high: float | None = None
         forecast_start_date: date | None = None
+        title_unit = ""  # whole-degree unit from the title ("F"/"C"); temp markets only
         above_below = _ABOVE_BELOW.search(title)
 
         if is_precip and not is_temp:
@@ -337,6 +338,7 @@ class WeatherMarketScanner:
                 threshold = _to_celsius(float(range_match.group(1)), unit)
                 threshold_high = _to_celsius(float(range_match.group(2)), unit)
                 direction = "range"
+                title_unit = unit
             else:
                 exact_match = _EXACT_TEMP.search(title)
                 degree_match = exact_match or _DEGREE_PATTERN.search(title)
@@ -345,6 +347,7 @@ class WeatherMarketScanner:
 
                 unit = degree_match.group(2).upper()
                 threshold = _to_celsius(float(degree_match.group(1)), unit)
+                title_unit = unit
 
                 if exact_match and not above_below:
                     direction = "equal"
@@ -411,9 +414,15 @@ class WeatherMarketScanner:
             location = Location(city=location.city, lat=sm["lat"], lon=sm["lon"],
                                 timezone=sm["tz"], country=st.get("country", ""))
             station_icao, station_country = st["icao"], st.get("country", "")
-            resolve_unit = st.get("unit", "")
         else:
-            station_icao = station_country = resolve_unit = ""
+            station_icao = station_country = ""
+        # The market's whole-degree unit is a property of the market, not of station
+        # adoption: the probability model needs it to widen bucket edges to their
+        # rounding pre-image even when no registered station exists (grid path).
+        # Description wins over title (London titles say °F AND resolve °F, but the
+        # description is the binding rules text). Temperature markets only.
+        is_temp_metric = metric in ("temperature_2m_max", "temperature_2m_min")
+        resolve_unit = (st.get("unit") or title_unit) if is_temp_metric else ""
 
         return WeatherMarket(
             market_id=m.market_id,

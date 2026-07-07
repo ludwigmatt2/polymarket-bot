@@ -43,6 +43,12 @@ MIN_PARSE_RATE = 0.30
 MIN_FETCHED_FOR_PARSE_ALARM = 50
 
 # ── Market filters ─────────────────────────────────────────────────────────────
+# Gate 0.5: only trade temperature markets whose resolving station is in the IEM
+# registry, so forecast target and settlement read the same thermometer. Grid-truth
+# labels disagreed with on-chain resolution on 33% of outcomes (phase-3 backtest);
+# an unregistered city is untradeable until its station is added and verified.
+REQUIRE_STATION_TRUTH = True
+
 MIN_MARKET_LIQUIDITY_USD = 50.0  # Lowered to include monthly precipitation markets
 BOOK_DEPTH_MIN_MULTIPLIER = 3   # Gate 5: require N× min liquidity in live CLOB book depth
 MIN_MARKET_PRICE = 0.03         # Avoid illiquid extremes

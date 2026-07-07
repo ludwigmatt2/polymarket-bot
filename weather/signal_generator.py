@@ -44,6 +44,7 @@ from .config import (
     BLOCKED_YES_CITIES,
     MIN_NET_EV_PP,
     MIN_YES_ENTRY_PRICE,
+    REQUIRE_STATION_TRUTH,
     ROUND_TRIP_FEE,
     VELOCITY_WINDOW_HOURS,
 )
@@ -119,6 +120,7 @@ class SignalGenerator:
             threshold_high=adj_threshold_high,
             lead_day=lead_day,
             month=month,
+            resolve_unit=market.resolve_unit,
         )
 
         gate_passed, rejection_reason, confidence_score = self._quality_gates(
@@ -187,6 +189,18 @@ class SignalGenerator:
         Returns (passes, rejection_reason, composite_confidence).
         Composite confidence is 0.0 for any early-rejection gate.
         """
+
+        # Gate 0.5: Verified resolution truth — temperature markets must carry a
+        # registered resolving station. Unregistered ones forecast the city grid and
+        # resolve on Open-Meteo reanalysis, which disagreed with on-chain settlement
+        # on 33% of outcomes (phase-3 backtest, PR #36). No trusted thermometer →
+        # no trade; register the station (iem_client._STATION_REGISTRY) to re-enable.
+        if (
+            REQUIRE_STATION_TRUTH
+            and market.metric in ("temperature_2m_max", "temperature_2m_min")
+            and not market.station_icao
+        ):
+            return False, f"gate0.5_no_station_truth:{market.location.city}", 0.0
 
         # Gate 0: Forecast freshness
         fetched_at = forecast.fetched_at
