@@ -185,3 +185,85 @@ class TestCalibration:
     def test_calibration_log_written(self, tmp_path, model):
         model.log_observation(0.7, True)
         assert model.calibration_log_path.exists()
+
+
+class TestRoundingPreimage:
+    """The market settles on whole-degree ROUNDED station values; the model must
+    price the rounding pre-image of each bucket, not its exact edges."""
+
+    def _forecast(self, members):
+        return EnsembleForecast(
+            lat=40.78, lon=-73.88,
+            target_date=date(2026, 7, 8),
+            metric="temperature_2m_max",
+            member_arrays={"gfs_seamless": members},
+            model_means={"gfs_seamless": float(np.mean(members)), "ecmwf_ifs025": float(np.mean(members))},
+        )
+
+    def test_helper_widens_f_range(self):
+        from weather.probability_model import _rounding_preimage
+        half_f = 0.5 * 5.0 / 9.0
+        # "between 96–97°F" stored as °C edges → pre-image [95.5, 97.5)°F
+        lo_c, hi_c = (96 - 32) * 5 / 9, (97 - 32) * 5 / 9
+        d, t, th = _rounding_preimage(lo_c, "range", hi_c, "F", "temperature_2m_max")
+        assert d == "range"
+        assert t == pytest.approx(lo_c - half_f)
+        assert th == pytest.approx(hi_c + half_f)
+
+    def test_helper_equal_f_becomes_halfdegree_range(self):
+        from weather.probability_model import _rounding_preimage
+        half_f = 0.5 * 5.0 / 9.0
+        t_c = (88 - 32) * 5 / 9
+        d, t, th = _rounding_preimage(t_c, "equal", None, "F", "temperature_2m_max")
+        # ±0.5°F ≈ ±0.28°C — NOT the legacy ±0.5°C (which was 1.8× too wide for °F)
+        assert d == "range"
+        assert th - t == pytest.approx(2 * half_f)
+
+    def test_helper_above_below_inclusive_wing(self):
+        from weather.probability_model import _rounding_preimage
+        d, t, _ = _rounding_preimage(31.0, "above", None, "C", "temperature_2m_max")
+        assert d == "above" and t == pytest.approx(30.5)
+        d, t, _ = _rounding_preimage(13.0, "below", None, "C", "temperature_2m_max")
+        assert d == "below" and t == pytest.approx(13.5)
+
+    def test_helper_noop_without_unit_or_for_precip(self):
+        from weather.probability_model import _rounding_preimage
+        assert _rounding_preimage(30.0, "range", 31.0, "", "temperature_2m_max") == ("range", 30.0, 31.0)
+        assert _rounding_preimage(5.0, "above", None, "F", "precipitation_sum") == ("above", 5.0, None)
+
+    def test_range_probability_wider_with_unit(self, model):
+        # Uniform-ish members straddling a 1°F bucket: the pre-image (2°F wide)
+        # must carry roughly twice the probability of the exact edges.
+        members = list(np.linspace(30.0, 40.0, 200))  # °C, flat density
+        fc = self._forecast(members)
+        lo_c, hi_c = (95 - 32) * 5 / 9, (96 - 32) * 5 / 9  # 95–96°F ≈ 35.0–35.56°C
+        p_legacy = model.compute_probability(fc, lo_c, "range", hi_c).raw_p
+        p_preimage = model.compute_probability(fc, lo_c, "range", hi_c, resolve_unit="F").raw_p
+        assert p_preimage > 1.5 * p_legacy
+
+    def test_equal_f_probability_narrower_than_legacy(self, model):
+        # Legacy "equal" used ±0.5°C for everything; a °F market's true band is
+        # ±0.5°F ≈ ±0.28°C, so the °F-aware probability must be LOWER.
+        members = list(np.linspace(25.0, 37.0, 200))
+        fc = self._forecast(members)
+        t_c = (88 - 32) * 5 / 9
+        p_legacy = model.compute_probability(fc, t_c, "equal").raw_p
+        p_preimage = model.compute_probability(fc, t_c, "equal", resolve_unit="F").raw_p
+        assert p_preimage < p_legacy
+
+    def test_equal_c_probability_matches_legacy_band(self, model):
+        # °C equal markets: pre-image ±0.5°C == the legacy band → ~same probability.
+        members = list(np.linspace(25.0, 37.0, 200))
+        fc = self._forecast(members)
+        p_legacy = model.compute_probability(fc, 31.0, "equal").raw_p
+        p_preimage = model.compute_probability(fc, 31.0, "equal", resolve_unit="C").raw_p
+        assert p_preimage == pytest.approx(p_legacy, abs=0.02)
+
+    def test_direction_label_preserved_for_calibrator_routing(self, model):
+        # equal→range conversion is internal math only; the result must still
+        # report direction="equal" so per-direction calibrators stay consistent.
+        members = list(np.linspace(25.0, 37.0, 50))
+        fc = self._forecast(members)
+        r = model.compute_probability(fc, 31.0, "equal", resolve_unit="F")
+        assert r.direction == "equal"
+        assert r.threshold == 31.0  # original edge, not the widened one

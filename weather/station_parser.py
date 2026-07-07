@@ -22,19 +22,30 @@ _WU_URL = re.compile(
     r"wunderground\.com/history/daily/([a-z]{2})/(?:[a-z0-9-]+/)+(?-i:([A-Z]{4}))",
     re.IGNORECASE,
 )
-# Precision the market resolves on, and unit (°F for US markets, °C elsewhere).
+# Some markets (e.g. Tel Aviv) resolve off the NOAA/NWS observation timeseries
+# instead of Wunderground: https://www.weather.gov/wrh/timeseries?site=LLBG
+# Same METAR observations underneath, so the WU→IEM truth chain still applies;
+# the URL carries no country segment — callers fall back to the station registry.
+_NOAA_URL = re.compile(r"weather\.gov/wrh/timeseries\?site=([A-Za-z0-9]{4})", re.IGNORECASE)
+# Precision the market resolves on, and unit. Do NOT infer from country when the
+# description is explicit — London (gb/…/EGLC) resolves in FAHRENHEIT.
 _UNIT = re.compile(r"in degrees (Fahrenheit|Celsius)", re.IGNORECASE)
 
 
 def station_from_description(desc: str | None) -> dict | None:
     """Return {'icao','country','unit'} parsed from a market description, or None.
-    `unit` is 'F' or 'C' (the whole-degree unit the market resolves in)."""
+    `unit` is 'F' or 'C' (the whole-degree unit the market resolves in). `country`
+    may be '' for NOAA-sourced markets (URL has no country segment)."""
     if not desc:
         return None
     m = _WU_URL.search(desc)
-    if not m:
-        return None
-    country, icao = m.group(1).upper(), m.group(2).upper()
+    if m:
+        country, icao = m.group(1).upper(), m.group(2).upper()
+    else:
+        n = _NOAA_URL.search(desc)
+        if not n:
+            return None
+        country, icao = "", n.group(1).upper()
     u = _UNIT.search(desc)
     if u:
         unit = "F" if u.group(1).lower().startswith("f") else "C"

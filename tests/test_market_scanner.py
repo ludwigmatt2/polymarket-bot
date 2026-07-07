@@ -16,13 +16,14 @@ def _make_gamma_market(
     yes_price=0.55,
     liquidity=500.0,
     days_out=2,
+    question="Will the high be above 20°C on June 1?",
 ) -> _GammaMarket:
     end_date = (datetime.now(timezone.utc) + timedelta(days=days_out)).isoformat()
     market = {
         "conditionId": condition_id,
         "outcomePrices": f'[{yes_price}, {1 - yes_price}]',
         "volumeClob": str(liquidity),
-        "question": "Will the high be above 20°C on June 1?",
+        "question": question,
         "description": description,
         "endDate": end_date,
         "clobTokenIds": '["yes-token-123", "no-token-456"]',
@@ -290,3 +291,45 @@ class TestParseRateAlarm:
                             lambda: [_make_gamma_market(condition_id=f"ok{i}") for i in range(60)])
         scanner.scan()
         assert not (tmp_path / "logs" / "scanner_alarm.csv").exists()
+
+
+class TestStationAndUnit:
+    def test_resolve_unit_from_title_without_station(self):
+        """Temp markets keep their whole-degree unit even when no registered
+        station exists — the probability model needs it for rounding pre-images."""
+        scanner = _make_scanner_with_geocode()
+        gm = _make_gamma_market()  # °C title, description has no WU/NOAA URL
+        wm = scanner._parse_market(gm)
+        assert wm.station_icao == "" and wm.resolve_unit == "C"
+
+    def test_resolve_unit_description_beats_title(self):
+        # London resolves at EGLC in FAHRENHEIT — description rules text wins.
+        desc = ("This market will resolve YES if the highest temperature is between "
+                "68-69°F, recorded at the London City Airport Station in "
+                "degrees Fahrenheit on 1 Jun '26, available here: "
+                "https://www.wunderground.com/history/daily/gb/london/EGLC.")
+        scanner = _make_scanner_with_geocode()
+        gm = _make_gamma_market(
+            title="Temperature in London on June 1? - Will the high be between 68-69°F on June 1?",
+            question="Will the high be between 68-69°F on June 1?",
+            description=desc,
+        )
+        wm = scanner._parse_market(gm)
+        assert wm.station_icao == "EGLC"
+        assert wm.resolve_unit == "F"
+        # forecast point moves to the station, not the city geocode
+        assert abs(wm.location.lat - 51.5053) < 0.01
+
+    def test_noaa_station_adopted(self):
+        desc = ("This market will resolve to the temperature range that contains the "
+                "highest temperature recorded at the Sde Dov Airport Station in degrees "
+                "Celsius on 7 Jul '26. Resolution source: "
+                "https://www.weather.gov/wrh/timeseries?site=LLBG.")
+        scanner = _make_scanner_with_geocode(lat=32.08, lon=34.78, tz="Asia/Jerusalem")
+        gm = _make_gamma_market(
+            title="Temperature in Tel Aviv on July 7? - Will the high be 31°C on July 7?",
+            question="Will the high be 31°C on July 7?",
+            description=desc,
+        )
+        wm = scanner._parse_market(gm)
+        assert wm.station_icao == "LLBG" and wm.resolve_unit == "C"

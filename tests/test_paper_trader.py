@@ -231,7 +231,7 @@ class TestStationResolution:
         trader = _make_trader(tmp_path)
         self._write_station_trade(trader)
         # WU 97°F → in the 96-97 bucket → YES-condition true; weather_client unused
-        monkeypatch.setattr(st, "daily_value_f", lambda *a, **k: (97.0, "wunderground"))
+        monkeypatch.setattr(st, "daily_value", lambda *a, **k: (97.0, "wunderground"))
         client = MagicMock()
         trader.auto_resolve(client, model=None)
         client.get_historical_actual.assert_not_called()
@@ -242,7 +242,7 @@ class TestStationResolution:
         import weather.station_truth as st
         trader = _make_trader(tmp_path)
         self._write_station_trade(trader)
-        monkeypatch.setattr(st, "daily_value_f", lambda *a, **k: (None, None))
+        monkeypatch.setattr(st, "daily_value", lambda *a, **k: (None, None))
         trader.auto_resolve(MagicMock(), model=None)
         rows = list(csv.DictReader(open(trader.log_path)))
         assert rows[0]["actual_outcome"] == ""  # not booked

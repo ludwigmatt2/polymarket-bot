@@ -157,8 +157,12 @@ class ProbabilityModel:
         threshold_high: float | None = None,
         lead_day: int | None = None,
         month: int | None = None,
+        resolve_unit: str = "",
     ) -> RawProbabilityResult:
-        """Full pipeline: (MOS member-shift) → raw P → KDE smoothing → calibration."""
+        """Full pipeline: (MOS member-shift) → rounding pre-image → raw P → KDE →
+        calibration. `resolve_unit` ("F"/"C") is the whole-degree unit the market
+        resolves in; when given, bucket edges are widened to the rounding pre-image
+        (see _rounding_preimage). Empty → legacy exact-edge behavior."""
         member_arrays = forecast.member_arrays
         # Phase 1 MOS: shift each model's members by −mean_error before counting,
         # so raw_p itself is bias-corrected. Applied per-model so the breakdown and
@@ -175,6 +179,15 @@ class ProbabilityModel:
             if shift is not None:
                 member_arrays = {m: [v - shift for v in vals] for m, vals in member_arrays.items()}
 
+        # The market resolves on the station value ROUNDED to whole degrees in its
+        # unit, so the YES event in continuous member space is the rounding
+        # pre-image of the bucket, not the bucket's exact edges. Widen once here;
+        # everything downstream (breakdown, raw_p, KDE) then prices the true event.
+        # The original direction is kept for calibrator routing and the result.
+        eff_dir, eff_t, eff_th = _rounding_preimage(
+            threshold, direction, threshold_high, resolve_unit, forecast.metric
+        )
+
         # Phase 4: in one pass, pool members, build the parallel per-member weight
         # vector (so the more skillful model is amplified beyond its raw member count),
         # and compute each model's breakdown fraction. Equal weights reproduce the
@@ -188,7 +201,7 @@ class ProbabilityModel:
             w = self.model_weights.get(model, 1.0) if MODEL_WEIGHTING_ENABLED else 1.0
             members.extend(vals)
             member_weights.extend([w] * len(vals))
-            model_breakdown[model] = _fraction_satisfying(vals, threshold, direction, threshold_high)
+            model_breakdown[model] = _fraction_satisfying(vals, eff_t, eff_dir, eff_th)
 
         if not members:
             return RawProbabilityResult(
@@ -199,10 +212,10 @@ class ProbabilityModel:
                 direction=direction, metric=forecast.metric,
             )
 
-        raw_p = _fraction_satisfying(members, threshold, direction, threshold_high, member_weights)
+        raw_p = _fraction_satisfying(members, eff_t, eff_dir, eff_th, member_weights)
 
         if len(members) >= 10:
-            raw_p = _apply_kde(members, threshold, direction, threshold_high, raw_p, member_weights)
+            raw_p = _apply_kde(members, eff_t, eff_dir, eff_th, raw_p, member_weights)
 
         calibrated_p = self._apply_calibration(raw_p, direction)
 
@@ -336,6 +349,45 @@ def _predict(calibrator: Any, raw_p: float) -> float:
 
 # ── KDE and fraction helpers ──────────────────────────────────────────────────
 
+_TEMP_METRICS = ("temperature_2m_max", "temperature_2m_min")
+
+
+def _rounding_preimage(
+    threshold: float,
+    direction: str,
+    threshold_high: float | None,
+    resolve_unit: str,
+    metric: str,
+) -> tuple[str, float, float | None]:
+    """Map a market bucket to its rounding pre-image in continuous °C member space.
+
+    Polymarket settles on the station value rounded to whole degrees in the
+    market's unit, so e.g. "between 96–97°F" is YES for raw temps in
+    [95.5, 97.5)°F — a 2°F-wide event, not the 1°F the exact edges span. Thresholds
+    are stored as exact °C conversions of the market-unit edges, so the half-degree
+    step is 0.5·5/9 °C for °F markets and 0.5 °C for °C markets:
+      range [lo, hi] → [lo−half, hi+half];   equal X → [X−half, X+half] (as range)
+      above "X or higher" → v ≥ X−half;      below "X or below" → v ≤ X+half
+    above/below assume the inclusive ladder phrasing (see models._evaluate_outcome).
+    Unknown unit or non-temperature metric → unchanged (legacy exact-edge behavior;
+    "equal" keeps its historic ±0.5°C band via the helpers' own fallback).
+    Returns (direction, threshold, threshold_high) for the math only — callers keep
+    the market's real direction for calibrator routing and reporting.
+    """
+    unit = (resolve_unit or "").upper()
+    if unit not in ("F", "C") or metric not in _TEMP_METRICS:
+        return direction, threshold, threshold_high
+    half = 0.5 * 5.0 / 9.0 if unit == "F" else 0.5
+    if direction == "equal":
+        return "range", threshold - half, threshold + half
+    if direction == "range" and threshold_high is not None:
+        return "range", threshold - half, threshold_high + half
+    if direction == "above":
+        return "above", threshold - half, threshold_high
+    if direction == "below":
+        return "below", threshold + half, threshold_high
+    return direction, threshold, threshold_high
+
 def _apply_kde(
     members: list[float],
     threshold: float,
@@ -353,7 +405,11 @@ def _apply_kde(
         # Uniform weights are equivalent to no weights.
         w = np.asarray(weights, dtype=float) if weights is not None else None
         kde = gaussian_kde(members, bw_method="scott", weights=w)
-        x_eval = np.linspace(min(members) - 20, max(members) + 20, 500)
+        # 2001 points: at a typical ~45°C span that's ~0.022°C steps, so even the
+        # narrowest bucket (a half-widened °F range ≈ 0.28°C) gets ~12+ grid points.
+        # The old 500-point grid put only ~6 points across a whole °F bucket, making
+        # the Riemann mass estimate itself a bin-edge lottery.
+        x_eval = np.linspace(min(members) - 20, max(members) + 20, 2001)
         density = kde(x_eval)
         total = density.sum()
         if not np.isfinite(total) or total <= 0:

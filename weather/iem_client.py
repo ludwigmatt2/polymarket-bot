@@ -41,13 +41,16 @@ _last_call = [0.0]
 _STATION_REGISTRY: dict[str, tuple[str, str, str, float, float]] = {
     "KLGA": ("NY_ASOS", "LGA", "America/New_York", 40.7794, -73.8803),   # NYC / LaGuardia
     "KMIA": ("FL_ASOS", "MIA", "America/New_York", 25.7880, -80.3169),   # Miami Intl
-    "KDFW": ("TX_ASOS", "DFW", "America/Chicago", 32.8968, -97.0380),    # Dallas/Fort Worth
+    "KDFW": ("TX_ASOS", "DFW", "America/Chicago", 32.8968, -97.0380),    # Dallas/Fort Worth (unused by markets; kept for MOS table)
+    "KDAL": ("TX_ASOS", "DAL", "America/Chicago", 32.8471, -96.8518),    # Dallas Love Field — the station Polymarket ACTUALLY resolves on
     "KATL": ("GA_ASOS", "ATL", "America/New_York", 33.6301, -84.4418),   # Atlanta
     "RKSI": ("KR__ASOS", "RKSI", "Asia/Seoul", 37.4667, 126.4500),       # Seoul / Incheon
     "VHHH": ("HK__ASOS", "VHHH", "Asia/Hong_Kong", 22.3094, 113.9219),   # Hong Kong Intl
     "LFPB": ("FR__ASOS", "LFPB", "Europe/Paris", 48.9672, 2.4272),       # Paris / Le Bourget
     "LFPG": ("FR__ASOS", "LFPG", "Europe/Paris", 49.0153, 2.5344),       # Paris / Charles de Gaulle
-    "LLBG": ("IL__ASOS", "LLBG", "Asia/Jerusalem", 32.0114, 34.8867),    # Tel Aviv / Ben Gurion
+    "LLBG": ("IL__ASOS", "LLBG", "Asia/Jerusalem", 32.0114, 34.8867),    # Tel Aviv / Ben Gurion (NOAA-sourced markets, °C)
+    "EGLC": ("GB__ASOS", "EGLC", "Europe/London", 51.5053, 0.0553),      # London City Airport (°F markets!)
+    "RJTT": ("JP__ASOS", "RJTT", "Asia/Tokyo", 35.5533, 139.7811),       # Tokyo / Haneda (°C)
 }
 
 

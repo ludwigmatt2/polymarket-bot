@@ -181,11 +181,17 @@ def _evaluate_outcome(
 ) -> bool:
     """Whether the YES-condition holds for a resolved value. Shared by the paper
     resolver (Open-Meteo path) and the station resolver so the bucket rules can't
-    drift between them. Lives here (neutral module) to avoid an import cycle."""
+    drift between them. Lives here (neutral module) to avoid an import cycle.
+
+    above/below are INCLUSIVE: the traded ladder markets phrase the outer buckets
+    as "X or higher" / "X or below", and station values are whole degrees — a
+    value landing exactly on X resolves YES on Polymarket. (With the old strict
+    inequality that tie was labeled NO; harmless on continuous grid values, wrong
+    on rounded station values.)"""
     if direction == "above":
-        return actual > threshold
+        return actual >= threshold
     if direction == "below":
-        return actual < threshold
+        return actual <= threshold
     if direction == "range" and threshold_high is not None:
         return threshold <= actual <= threshold_high
     return abs(actual - threshold) <= 0.5  # "equal" — ±0.5°C
