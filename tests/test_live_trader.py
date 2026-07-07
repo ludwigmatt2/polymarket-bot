@@ -288,21 +288,28 @@ class TestFillReconciliation:
         with pytest.raises(AssertionError, match="fill parsing"):
             trader.execute_signal(_make_signal(market_p=0.35))
 
-    def test_balance_buffer_held_back_when_balance_bound(self, tmp_path):
-        """When the live balance caps the trade, a BALANCE_BUFFER_PCT slice is
-        reserved so a scan's rapid-fire orders can't collectively overdraw."""
-        from weather.config import BALANCE_BUFFER_PCT
+    def test_in_scan_commitment_prevents_stale_overdraw(self, tmp_path):
+        """A scan's second order sizes off balance minus what the first already
+        committed, so a stale (non-decrementing) balance read can't overdraw."""
         trader = _make_trader(tmp_path)
-        trader._private_key = "0xkey"          # enable the on-chain balance guard
-        trader.fetch_balance = lambda: 10.0    # only $10 available on-chain
-        trader.kelly_size_usd = lambda signal: 25.0  # Kelly wants more than we hold
-        trader._client = _make_mock_client(filled=25.0)
+        trader._private_key = "0xkey"
+        # Balance never drops between orders (settlement lag) — always reads $10.
+        trader.fetch_balance = lambda: 10.0
+        trader.kelly_size_usd = lambda signal: 7.0   # each order wants $7
+        trader.reset_scan_commitments()
 
-        trader.execute_signal(_make_signal(market_p=0.35, model_p=0.65))
+        # First order: min($7, $10 − $0) = $7, filled.
+        trader._client = _make_mock_client(filled=20.0)  # 20 sh * 0.35 = $7 spent
+        trader.execute_signal(_make_signal(market_id="mkt_one", market_p=0.35, model_p=0.65))
+        amt1 = trader._client.create_and_post_market_order.call_args.args[0].amount
+        assert amt1 == pytest.approx(7.0, abs=0.01)
 
-        amount = trader._client.create_and_post_market_order.call_args.args[0].amount
-        expected = 10.0 * (1.0 - BALANCE_BUFFER_PCT)   # $9.70, not the full $10
-        assert amount == pytest.approx(expected, abs=0.01)
+        # Second order in the SAME scan (distinct market): min($7, $10 − $7) = $3.
+        trader._client = _make_mock_client(filled=8.57)  # ~8.57 sh * 0.35 = $3
+        trader.execute_signal(_make_signal(market_id="mkt_two", market_p=0.35, model_p=0.65))
+        amt2 = trader._client.create_and_post_market_order.call_args.args[0].amount
+        assert amt2 == pytest.approx(3.0, abs=0.01)
+        assert amt1 + amt2 <= 10.0 + 0.01   # scan total never exceeds real balance
 
 
 # ---------------------------------------------------------------------------

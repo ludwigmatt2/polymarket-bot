@@ -86,6 +86,7 @@ def run_scan(
               f"(set HTTPS_PROXY).", file=sys.stderr)
     elif live_trader and actionable:
         print(f"  [3/3] Executing {len(actionable)} live order(s)...")
+        live_trader.reset_scan_commitments()  # fresh in-scan spend budget
         for s in actionable:
             try:
                 result = live_trader.execute_signal(s)
@@ -245,6 +246,7 @@ def _execute_live_for_user(
 
     print(f"    user {uid}: LIVE, bankroll=${trader.bankroll_usd:.2f}, "
           f"{len(actionable)} signal(s)")
+    trader.reset_scan_commitments()  # fresh in-scan spend budget
     for s in actionable:
         try:
             result = trader.execute_signal(s)
