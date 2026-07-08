@@ -51,6 +51,13 @@ _STATION_REGISTRY: dict[str, tuple[str, str, str, float, float]] = {
     "LLBG": ("IL__ASOS", "LLBG", "Asia/Jerusalem", 32.0114, 34.8867),    # Tel Aviv / Ben Gurion (NOAA-sourced markets, °C)
     "EGLC": ("GB__ASOS", "EGLC", "Europe/London", 51.5053, 0.0553),      # London City Airport (°F markets!)
     "RJTT": ("JP__ASOS", "RJTT", "Asia/Tokyo", 35.5533, 139.7811),       # Tokyo / Haneda (°C)
+    # Jul-8 registry expansion (scripts/discover_stations.py — IEM+WU verified):
+    "LEMD": ("ES__ASOS", "LEMD", "Europe/Madrid", 40.4667, -3.5556),     # Madrid / Barajas (°C)
+    "OMDB": ("AE__ASOS", "OMDB", "Asia/Dubai", 25.2539, 55.3656),        # Dubai Intl (°F markets!)
+    "WSSS": ("SG__ASOS", "WSSS", "Asia/Singapore", 1.3667, 103.9833),    # Singapore / Changi (°C)
+    "ZSPD": ("CN__ASOS", "ZSPD", "Asia/Shanghai", 31.1167, 121.7667),    # Shanghai / Pudong (°C)
+    # Canadian networks are CA_{PROVINCE}_ASOS (three segments — see is_us()).
+    "CYYZ": ("CA_ON_ASOS", "CYYZ", "America/Toronto", 43.6772, -79.6306),  # Toronto / Pearson (°C)
 }
 
 
@@ -65,9 +72,12 @@ def station_meta(icao: str) -> dict | None:
 
 
 def is_us(icao: str) -> bool:
-    """True for CONUS/US ASOS networks (single underscore) — the DSM-backed sites."""
+    """True for CONUS/US ASOS networks — the DSM-backed sites. US networks are
+    exactly two segments ({STATE}_ASOS, incl. California's CA_ASOS); international
+    are {CC}__ASOS (empty middle segment) and Canada is CA_{PROV}_ASOS (three
+    segments) — the old "no double underscore" test misread Canada as US."""
     m = station_meta(icao)
-    return bool(m and "__" not in m["network"])
+    return bool(m and len(m["network"].split("_")) == 2)
 
 
 def _throttle() -> None:
