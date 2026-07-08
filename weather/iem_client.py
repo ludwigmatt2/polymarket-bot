@@ -129,9 +129,14 @@ def metar_peak(icao: str, day: date, kind: str = "max") -> float | None:
     start = datetime(day.year, day.month, day.day, tzinfo=tz)
     end = start + timedelta(days=1)
     try:
+        # sts/ets MUST carry a UTC offset — IEM's validator rejects naive
+        # timestamps (pydantic timezone_aware error) and the old %H:%M format
+        # made this fetch silently return None (caught Jul 8 wiring the
+        # running-extreme feature; also the WU-fallback path in station_truth).
         txt = _get("/cgi-bin/request/asos.py", {
             "station": m["sid"], "data": "tmpf", "tz": m["tz"],
-            "sts": start.strftime("%Y-%m-%dT%H:%M"), "ets": end.strftime("%Y-%m-%dT%H:%M"),
+            "sts": start.isoformat(timespec="minutes"),
+            "ets": end.isoformat(timespec="minutes"),
             "format": "onlycomma", "missing": "empty",
         })
     except Exception:  # noqa: BLE001

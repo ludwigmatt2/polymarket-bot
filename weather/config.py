@@ -55,6 +55,14 @@ BOOK_DEPTH_MIN_MULTIPLIER = 3   # Gate 5: require N× min liquidity in live CLOB
 # 12pp edge floor on entry; nothing else caps this (edge is computed off the Gamma
 # quote). Only enforced when both best quotes were fetched (live sidecar up).
 MAX_BOOK_SPREAD = 0.04
+
+# Running-extreme clip: on a market's event day, fetch the station's live
+# running max/min (IEM METAR, ~5-15 min latency) and clip ensemble members at
+# it — the final daily max is max(observed-so-far, rest-of-day), so this is
+# exact math. It both creates signals (market slow to react to the tape) and
+# protects (never fade a market watching a live feed we didn't have — the
+# adverse-selection channel Gate 9.5 crudely approximates).
+RUNNING_OBS_ENABLED = True
 MIN_MARKET_PRICE = 0.03         # Avoid illiquid extremes
 MAX_MARKET_PRICE = 0.97
 # Gate 9.5: skip "equal" direction markets where crowd is this confident —

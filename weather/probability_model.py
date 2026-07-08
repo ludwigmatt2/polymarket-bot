@@ -158,11 +158,15 @@ class ProbabilityModel:
         lead_day: int | None = None,
         month: int | None = None,
         resolve_unit: str = "",
+        observed_extreme: float | None = None,
     ) -> RawProbabilityResult:
-        """Full pipeline: (MOS member-shift) → rounding pre-image → raw P → KDE →
-        calibration. `resolve_unit` ("F"/"C") is the whole-degree unit the market
-        resolves in; when given, bucket edges are widened to the rounding pre-image
-        (see _rounding_preimage). Empty → legacy exact-edge behavior."""
+        """Full pipeline: (MOS member-shift) → (running-extreme clip) → rounding
+        pre-image → raw P → KDE → calibration. `resolve_unit` ("F"/"C") is the
+        whole-degree unit the market resolves in; when given, bucket edges are
+        widened to the rounding pre-image (see _rounding_preimage).
+        `observed_extreme` (°C) is the station's running max/min when scanning ON
+        the event day: the final daily max is max(observed, rest-of-day), so each
+        member is clipped at the observation — exact math, not a heuristic."""
         member_arrays = forecast.member_arrays
         # Phase 1 MOS: shift each model's members by −mean_error before counting,
         # so raw_p itself is bias-corrected. Applied per-model so the breakdown and
@@ -178,6 +182,25 @@ class ProbabilityModel:
             )
             if shift is not None:
                 member_arrays = {m: [v - shift for v in vals] for m, vals in member_arrays.items()}
+
+        # Running-extreme clip — AFTER the MOS shift (the observation is ground
+        # truth, not forecast; shifting after clipping could push members back
+        # below what the thermometer has already recorded). When the clip binds,
+        # the clipped members form a point mass AT the observation — remember
+        # that, because Gaussian KDE smoothing would smear that certainty back
+        # across an already-decided boundary (e.g. observed 30.6 ≥ "30.5 or
+        # higher" must be ~P=1, but KDE bled it to 0.84 in testing).
+        clip_bound = False
+        if observed_extreme is not None and forecast.metric in _TEMP_METRICS:
+            _clip = max if forecast.metric == "temperature_2m_max" else min
+            clip_bound = any(
+                _clip(v, observed_extreme) != v
+                for vals in member_arrays.values() for v in vals
+            )
+            member_arrays = {
+                m: [_clip(v, observed_extreme) for v in vals]
+                for m, vals in member_arrays.items()
+            }
 
         # The market resolves on the station value ROUNDED to whole degrees in its
         # unit, so the YES event in continuous member space is the rounding
@@ -214,7 +237,10 @@ class ProbabilityModel:
 
         raw_p = _fraction_satisfying(members, eff_t, eff_dir, eff_th, member_weights)
 
-        if len(members) >= 10:
+        # KDE smoothing reduces discretization noise on a smooth forecast
+        # distribution — but never over a binding observation clip (point mass
+        # is the TRUTH there; the exact weighted fraction handles it correctly).
+        if len(members) >= 10 and not clip_bound:
             raw_p = _apply_kde(members, eff_t, eff_dir, eff_th, raw_p, member_weights)
 
         calibrated_p = self._apply_calibration(raw_p, direction)

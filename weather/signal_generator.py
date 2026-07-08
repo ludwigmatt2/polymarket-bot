@@ -46,9 +46,11 @@ from .config import (
     MIN_NET_EV_PP,
     MIN_YES_ENTRY_PRICE,
     REQUIRE_STATION_TRUTH,
+    RUNNING_OBS_ENABLED,
     EDGE_SAFETY_MARGIN_PP,
     VELOCITY_WINDOW_HOURS,
 )
+from . import station_obs
 from .city_bias import CityBiasCorrector
 from .models import EnsembleForecast, RawProbabilityResult, Signal, WeatherMarket
 from .probability_model import ProbabilityModel
@@ -95,6 +97,23 @@ class SignalGenerator:
         lead_day = max(1, round(days_to_res))
         month = market.resolution_date.month
 
+        # Running-extreme observation: scanning ON the event day, part of the
+        # outcome is already measured — fetch the station's live running max/min
+        # so the model can clip members at it. None (off-day / no station / feed
+        # down) → feature stands down. Logged per trade (running_obs_c) so its
+        # PnL contribution is separable in the validation data.
+        observed_c = None
+        if (
+            RUNNING_OBS_ENABLED
+            and market.station_icao
+            and market.metric in ("temperature_2m_max", "temperature_2m_min")
+            and market.forecast_start_date is None
+            and station_obs.is_event_day(market.resolution_date, market.location.timezone, now)
+        ):
+            kind = "max" if market.metric.endswith("max") else "min"
+            event_day = station_obs.local_event_date(market.resolution_date, market.location.timezone)
+            observed_c = station_obs.running_extreme_c(market.station_icao, event_day, kind)
+
         # Bias correction. Phase 1 MOS (member-shift inside compute_probability) owns
         # temperature correction where it has data; in that case the flat Phase-2 city
         # bias must stand down to avoid double-correcting. The flat threshold offset is
@@ -122,6 +141,7 @@ class SignalGenerator:
             lead_day=lead_day,
             month=month,
             resolve_unit=market.resolve_unit,
+            observed_extreme=observed_c,
         )
 
         gate_passed, rejection_reason, confidence_score = self._quality_gates(
@@ -176,6 +196,7 @@ class SignalGenerator:
             signal_time=now,
             forecast=forecast,
             prob_result=prob_result,
+            running_obs_c=observed_c,
         )
 
     def _quality_gates(
