@@ -134,6 +134,9 @@ class Signal:
     signal_time: datetime
     forecast: EnsembleForecast
     prob_result: RawProbabilityResult
+    # Station's running max/min (°C) used to clip members when scanned on the
+    # event day; None when the feature stood down. Logged for PnL attribution.
+    running_obs_c: float | None = None
 
     @property
     def entry_price(self) -> float:
@@ -169,6 +172,9 @@ class PaperTrade:
     station_icao: str = ""
     station_country: str = ""
     resolve_unit: str = ""
+    # Running-extreme clip: the observed station max/min (°C) applied at signal
+    # time, "" /None when the feature stood down — separates its PnL contribution.
+    running_obs_c: float | None = None
     # Phase 0: persist the calibrator input (raw_p) and per-model breakdown so the
     # calibrator trains on the same scale it is applied to, and so per-model skill
     # (Phase 4) can be scored from history. raw_p is pre-calibration, pre-shrinkage.

@@ -409,3 +409,50 @@ class TestSideAwareLiquidity:
         m = self._no_side_market(no_book_depth_usd=5000.0)
         s = gen.evaluate(m)
         assert s.quality_gate_passed is True
+
+
+class TestRunningObsWiring:
+    """The running-extreme observation is fetched only on the event day for
+    station markets, passed into the model, and logged on the Signal."""
+
+    def _event_day_market(self, days_out=0):
+        from datetime import datetime, timedelta, timezone
+        m = _make_market(yes_price=0.60)
+        # resolution deadline later today (station-local "now" is the event day)
+        m.resolution_date = datetime.now(timezone.utc) + timedelta(hours=6)
+        return m
+
+    def test_observation_fetched_and_passed_on_event_day(self, monkeypatch):
+        from weather import station_obs
+        calls = {}
+        def fake_obs(icao, day, kind):
+            calls["args"] = (icao, kind)
+            return 33.0
+        monkeypatch.setattr(station_obs, "running_extreme_c", fake_obs)
+        gen = _make_generator(model_p=0.10)
+        sig = gen.evaluate(self._event_day_market())
+        assert calls["args"][0] == "KMIA" and calls["args"][1] == "max"
+        assert sig.running_obs_c == pytest.approx(33.0)
+        # the model received it
+        kwargs = gen.model.compute_probability.call_args.kwargs
+        assert kwargs["observed_extreme"] == pytest.approx(33.0)
+
+    def test_not_fetched_before_event_day(self, monkeypatch):
+        from weather import station_obs
+        called = []
+        monkeypatch.setattr(station_obs, "running_extreme_c",
+                            lambda *a: called.append(1) or 33.0)
+        gen = _make_generator(model_p=0.10)
+        sig = gen.evaluate(_make_market(yes_price=0.60, days_out=3))
+        assert not called
+        assert sig.running_obs_c is None
+        assert gen.model.compute_probability.call_args.kwargs["observed_extreme"] is None
+
+    def test_not_fetched_without_station(self, monkeypatch):
+        from weather import station_obs
+        called = []
+        monkeypatch.setattr(station_obs, "running_extreme_c",
+                            lambda *a: called.append(1) or 33.0)
+        gen = _make_generator(model_p=0.10)
+        gen.evaluate(self._event_day_market().__class__ and _make_market(yes_price=0.60, station_icao=""))
+        assert not called

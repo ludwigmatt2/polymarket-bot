@@ -48,6 +48,9 @@ CSV_HEADERS = [
     # or "grid" (Open-Meteo reanalysis fallback). The re-live gate counts ONLY
     # station-labeled trades — grid labels disagreed with on-chain 33% of the time.
     "label_source",
+    # Running-extreme clip: observed station max/min (°C) applied at signal time
+    # ("" = feature stood down) — separates the feature's PnL contribution.
+    "running_obs_c",
 ]
 
 # Brier score for an uninformed 50/50 forecast (climatology baseline)
@@ -109,6 +112,7 @@ class PaperTrader:
             model_breakdown_json=json.dumps(signal.prob_result.model_breakdown),
             station_icao=signal.market.station_icao,
             station_country=signal.market.station_country,
+            running_obs_c=getattr(signal, "running_obs_c", None),
             resolve_unit=signal.market.resolve_unit,
         )
         self._append_trade(trade)
@@ -486,6 +490,8 @@ class PaperTrader:
                 "station_icao": trade.station_icao,
                 "station_country": trade.station_country,
                 "resolve_unit": trade.resolve_unit,
+                "running_obs_c": ("" if trade.running_obs_c is None
+                                  else round(trade.running_obs_c, 2)),
             })
 
     def _load_all(self) -> list[dict]:
