@@ -83,6 +83,11 @@ ROUND_TRIP_FEE = 0.04           # 4% total
 
 # ── Paper trading ──────────────────────────────────────────────────────────────
 PAPER_TRADE_SIZE_USD = 25.0
+# Virtual bankroll the paper record is measured against (display/ROI only — flat
+# $25 sizing = 2.5% of it per trade). Set at the Jul-8 paper reset: live paused,
+# fresh $1,000 forward-validation run on the fixed model (rounding pre-image +
+# station truth), old history archived to paper_trades.pre_reset_*.bak.
+PAPER_BANKROLL_USD = 1000.0
 
 # ── Live trading (Kelly sizing) ────────────────────────────────────────────────
 KELLY_FRACTION = 0.25           # Quarter Kelly — conservative for uncertain edge

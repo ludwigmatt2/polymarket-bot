@@ -667,9 +667,12 @@ def _fmt_status_paper(uid: int) -> str:
             f"   (${ws['realized_pnl']:+,.2f} on ${ws['deposited']:,.0f})"
         )
     else:
+        # No deposit basis → measure the paper record against the virtual bankroll.
+        from weather.config import PAPER_BANKROLL_USD
+        bal = PAPER_BANKROLL_USD + s["total_pnl"]
+        ret = s["total_pnl"] / PAPER_BANKROLL_USD * 100
         lines.append(
-            f"📈 PnL: *${s['total_pnl']:+,.2f}*"
-            f"   _(use /deposit to track ROI %)_"
+            f"📈 *{ret:+.1f}% return*   (${bal:,.2f} of ${PAPER_BANKROLL_USD:,.0f} paper bankroll)"
         )
 
     lines.append(f"\n{s['resolved']} resolved · {s['pending']} pending · {s['total']} total")
