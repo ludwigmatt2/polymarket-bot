@@ -375,6 +375,9 @@ def _write_resolved_file(paper: "PaperTrader", resolved_count: int, log_dir: Pat
         [r for r in rows if r.get("resolved_at")],
         key=lambda x: x.get("resolved_at", ""), reverse=True
     )[:resolved_count]
+    # Re-live gate progress rides along so the Telegram alert job can announce
+    # (once) when the gate flips green — no separate polling of the stats.
+    stats = paper.compute_stats()
     (log_dir / "last_resolved.json").write_text(json.dumps({
         "resolved_at": __import__("datetime").datetime.utcnow().isoformat(),
         "count": resolved_count,
@@ -387,6 +390,9 @@ def _write_resolved_file(paper: "PaperTrader", resolved_count: int, log_dir: Pat
             }
             for r in recently_resolved
         ],
+        "gate_ready": stats.ready_for_live,
+        "gate_progress": stats.failure_reasons,
+        "gate_station_resolved": stats.station_resolved,
     }))
 
 

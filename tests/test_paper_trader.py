@@ -310,3 +310,107 @@ class TestTimezoneResolution:
         # 27.0 > 25 and 28.4 > 25 — both resolve YES despite different API values
         assert local_outcome == "1"
         assert utc_outcome == "1"
+
+
+def _add_station_trades(trader: PaperTrader, n: int, win_rate: float = 0.7,
+                        span_days: int = 30, model_p: float = 0.15,
+                        entry_price: float = 0.30, direction: str = "NO") -> None:
+    """Resolved STATION-labeled NO trades: model says P(YES)=model_p, market says
+    entry-implied P(YES)=1−entry... for NO, cost=entry_price so market P(YES)=
+    1−entry_price. Wins = outcome NO (actual 0) at rate win_rate, spread over
+    span_days so the gate's calendar criterion is controllable."""
+    start = datetime.now(timezone.utc) - timedelta(days=span_days - 1)
+    rows = []
+    for i in range(n):
+        won = i < int(n * win_rate)          # NO bet wins when outcome = 0
+        outcome = 0 if won else 1
+        pnl = 25.0 * (1.0 / entry_price - 1.0) if won else -25.0
+        sig_day = start + timedelta(days=i % span_days)
+        rows.append({
+            "trade_id": f"st{i:04d}", "market_id": f"stmkt_{i}",
+            "market_title": f"Station market {i}",
+            "signal_time": sig_day.isoformat(),
+            "entry_price": entry_price, "model_p": model_p, "direction": direction,
+            "size_usd": 25.0, "edge_pp": 0.12, "ensemble_spread": 0.05,
+            "confidence_score": 0.8,
+            "resolution_date": (sig_day + timedelta(days=1)).isoformat(),
+            "actual_outcome": outcome,
+            "resolved_at": (sig_day + timedelta(days=1)).isoformat(),
+            "pnl_usd": round(pnl, 4),
+            "brier_score": round((model_p - outcome) ** 2, 4),
+            "label_source": "station",
+        })
+    path = trader.log_path
+    path.parent.mkdir(exist_ok=True)
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_HEADERS, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+
+
+class TestReliveGate:
+    """Jul-8 gate: station-labeled trades only, calendar span, PF, and the
+    model-must-beat-the-market Brier test."""
+
+    def test_gate_passes_on_good_station_record(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        # 160 station trades over 30 days, 80% NO win rate.
+        # model_p=0.15 vs realized YES rate 20% → model Brier ≈ 0.1625
+        # market P(YES)=0.70 (NO entry 0.30) → market Brier ≈ 0.53 → model wins
+        _add_station_trades(trader, 160, win_rate=0.8, span_days=30)
+        stats = trader.compute_stats()
+        assert stats.station_resolved == 160
+        assert stats.days_elapsed >= 30
+        assert stats.station_model_brier < stats.station_market_brier
+        assert stats.ready_for_live, stats.failure_reasons
+
+    def test_gate_rejects_too_few_station_trades(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        _add_station_trades(trader, 60, win_rate=0.8, span_days=30)
+        stats = trader.compute_stats()
+        assert not stats.ready_for_live
+        assert any("station_resolved" in r for r in stats.failure_reasons)
+
+    def test_gate_rejects_short_calendar_span(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        _add_station_trades(trader, 160, win_rate=0.8, span_days=5)
+        stats = trader.compute_stats()
+        assert not stats.ready_for_live
+        assert any("days" in r for r in stats.failure_reasons)
+
+    def test_gate_rejects_model_that_does_not_beat_market(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        # Model barely disagrees with the market (model 0.65 vs market 0.70) and
+        # the realized YES rate is 0.70 — the market is calibrated, the model
+        # isn't better. PF still fine (80% NO wins impossible here: outcome rate
+        # 70% YES → NO wins 30%) — use direction YES so wins align:
+        # YES entry 0.70, model 0.65, outcomes 70% YES.
+        rows_win_rate = 0.7
+        _add_station_trades(trader, 160, win_rate=rows_win_rate, span_days=30,
+                            model_p=0.10, entry_price=0.30, direction="NO")
+        # override: make model WORSE than market — model_p 0.10 vs realized 0.30
+        # while market implied P(YES)=0.70... market Brier here is bad too; craft
+        # explicit comparison instead: model_p=0.55 with realized YES 30%:
+        # model Brier=(0.55-0/1)^2 mix ≈ 0.55²·0.7+0.45²·0.3=0.272
+        # market P(YES)=0.70: 0.7²·0.7+0.3²·0.3=0.37 → model still wins. Push model
+        # to 0.85: 0.85²·0.7 + 0.15²·0.3 = 0.512 > 0.37 → model loses.
+        _add_station_trades(trader, 160, win_rate=0.7, span_days=30,
+                            model_p=0.85, entry_price=0.30, direction="NO")
+        stats = trader.compute_stats()
+        assert stats.station_model_brier >= stats.station_market_brier
+        assert not stats.ready_for_live
+        assert any("model_brier" in r for r in stats.failure_reasons)
+
+    def test_grid_labeled_trades_do_not_count(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        _add_resolved_trades(trader, 200, win_rate=0.8)  # no label_source
+        stats = trader.compute_stats()
+        assert stats.station_resolved == 0
+        assert not stats.ready_for_live
+
+    def test_market_brier_reconstruction_no_side(self, tmp_path):
+        # One NO trade at entry 0.30 → market P(YES) = 0.70; outcome YES=1
+        trader = _make_trader(tmp_path)
+        _add_station_trades(trader, 1, win_rate=0.0, span_days=1)
+        stats = trader.compute_stats()
+        assert stats.station_market_brier == pytest.approx((0.70 - 1.0) ** 2, abs=1e-4)

@@ -539,13 +539,18 @@ def _find_time_index(daily: dict, target_date: date) -> int | None:
 
 
 def _extract_members(daily: dict, metric: str, target_date: date) -> list[float]:
-    """Pull all ensemble member values for target_date from an Open-Meteo daily block."""
+    """Pull all ensemble member values for target_date from an Open-Meteo daily block.
+
+    The CONTROL run comes back under the bare variable name (no `_memberNN`
+    suffix) — e.g. `temperature_2m_max` alongside `temperature_2m_max_member01..50`.
+    It's the unperturbed (typically highest-quality) run; the old "member"-only
+    filter silently discarded one control per model (Jul-7 audit)."""
     time_index = _find_time_index(daily, target_date)
     if time_index is None:
         return []
     members: list[float] = []
     for key, values in daily.items():
-        if key.startswith(metric) and "member" in key and time_index < len(values):
+        if key.startswith(metric) and ("member" in key or key == metric) and time_index < len(values):
             v = values[time_index]
             if v is not None:
                 members.append(float(v))

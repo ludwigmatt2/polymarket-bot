@@ -217,3 +217,10 @@ class PaperTradingStats:
     max_drawdown_pct: float
     ready_for_live: bool
     failure_reasons: list[str]  # Why not ready, if applicable
+    # Re-live gate (Jul-8): evaluated ONLY on station-labeled trades — evidence
+    # from the fixed system, scored against the thermometer that actually pays.
+    station_resolved: int = 0
+    station_profit_factor: float = 0.0
+    station_model_brier: float = 0.25   # model's Brier on station trades
+    station_market_brier: float = 0.25  # the MARKET PRICE's Brier on the same trades
+    days_elapsed: int = 0               # calendar span of station-labeled record
