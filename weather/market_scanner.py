@@ -28,6 +28,7 @@ from .config import (
     MIN_PARSE_RATE,
     WEATHER_SEARCH_TERMS,
 )
+from . import station_obs
 from .iem_client import station_meta
 from .models import Location, WeatherMarket
 from .station_parser import station_from_description
@@ -604,8 +605,20 @@ class WeatherMarketScanner:
             delta: timedelta = res_date - now
             hours_out = delta.total_seconds() / 3600
             if hours_out < 0:
-                reasons["already_resolved"] = reasons.get("already_resolved", 0) + 1
-                continue
+                # Polymarket stamps endDate at event-day NOON UTC — hours before
+                # the station's local day (and the books) actually end. A station
+                # temperature market is only truly over once its local event day
+                # has passed; until then it keeps trading, and the event-day
+                # window (running-max clip + intraday loop) is where the tape
+                # edge lives. Non-station/precip markets keep the strict drop.
+                still_event_day = (
+                    m.station_icao
+                    and m.metric in ("temperature_2m_max", "temperature_2m_min")
+                    and station_obs.is_event_day(res_date, m.location.timezone, now)
+                )
+                if not still_event_day:
+                    reasons["already_resolved"] = reasons.get("already_resolved", 0) + 1
+                    continue
             # Compare on exact hours, not timedelta.days (which floors toward zero
             # and would keep markets up to ~1 day past the cutoff).
             if hours_out / 24 > MAX_DAYS_TO_RESOLUTION:

@@ -333,3 +333,39 @@ class TestStationAndUnit:
         )
         wm = scanner._parse_market(gm)
         assert wm.station_icao == "LLBG" and wm.resolve_unit == "C"
+
+
+class TestEventDayExpiry:
+    """Markets past their noon-UTC endDate stay tradeable while the station's
+    local event day is still running (temp station markets only)."""
+
+    def _wm(self, hours_past=2, station="KLGA", metric="temperature_2m_max"):
+        from datetime import datetime, timedelta, timezone
+        from weather.models import Location, WeatherMarket
+        return WeatherMarket(
+            market_id="m1", title="t", yes_price=0.5, liquidity_usd=500.0,
+            resolution_date=datetime.now(timezone.utc) - timedelta(hours=hours_past),
+            resolution_source="WU",
+            location=Location(city="NYC", lat=40.78, lon=-73.88,
+                              timezone="America/New_York"),
+            metric=metric, threshold=30.0, direction="above", url="u",
+            station_icao=station, resolve_unit="F",
+        )
+
+    def test_past_enddate_kept_during_event_day(self, monkeypatch):
+        from weather import station_obs
+        monkeypatch.setattr(station_obs, "is_event_day", lambda *a, **k: True)
+        scanner = _make_scanner_with_geocode()
+        assert scanner._filter_tradeable([self._wm()]) != []
+
+    def test_dropped_after_event_day_ends(self, monkeypatch):
+        from weather import station_obs
+        monkeypatch.setattr(station_obs, "is_event_day", lambda *a, **k: False)
+        scanner = _make_scanner_with_geocode()
+        assert scanner._filter_tradeable([self._wm(hours_past=14)]) == []
+
+    def test_non_station_market_still_dropped(self, monkeypatch):
+        from weather import station_obs
+        monkeypatch.setattr(station_obs, "is_event_day", lambda *a, **k: True)
+        scanner = _make_scanner_with_geocode()
+        assert scanner._filter_tradeable([self._wm(station="")]) == []

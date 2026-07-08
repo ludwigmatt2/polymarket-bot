@@ -145,7 +145,11 @@ class SignalGenerator:
         )
 
         gate_passed, rejection_reason, confidence_score = self._quality_gates(
-            market, forecast, prob_result, now, days_to_res
+            market, forecast, prob_result, now, days_to_res,
+            # The entry window extends past the nominal deadline exactly when we
+            # hold live tape information (a fetched running extreme) — trading
+            # the event-day afternoon blind would be pure adverse selection.
+            intraday_ok=observed_c is not None,
         )
 
         # Record price AFTER gate check so Gate 6 velocity uses previous prices
@@ -206,6 +210,7 @@ class SignalGenerator:
         prob: RawProbabilityResult,
         now: datetime,
         days_to_res: float,
+        intraday_ok: bool = False,
     ) -> tuple[bool, str | None, float]:
         """
         Returns (passes, rejection_reason, composite_confidence).
@@ -232,10 +237,14 @@ class SignalGenerator:
         if age_hours > MAX_FORECAST_AGE_HOURS:
             return False, f"gate0_stale_forecast:{age_hours:.1f}h", 0.0
 
-        # Gate 1: Entry timing window
+        # Gate 1: Entry timing window. days_to_res measures to Polymarket's
+        # nominal endDate (event-day NOON UTC) — the local day runs on for hours
+        # after it. The too-late cut is bypassed when we hold live tape
+        # information (intraday_ok: a fetched running extreme) — with the clip
+        # active the late window is our best-informed time, not our blindest.
         if days_to_res > MAX_ENTRY_DAYS_AHEAD:
             return False, f"gate1_too_early:{days_to_res:.1f}d", 0.0
-        if days_to_res < MIN_ENTRY_HOURS_AHEAD / 24:
+        if days_to_res < MIN_ENTRY_HOURS_AHEAD / 24 and not intraday_ok:
             return False, f"gate1_too_late:{days_to_res * 24:.1f}h", 0.0
 
         # Gate 2.5: Min ensemble members

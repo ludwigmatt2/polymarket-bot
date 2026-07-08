@@ -10,18 +10,39 @@ This is the live feed informed traders watch — the flow Gate 9.5 crudely
 refuses to fade on extreme "equal" prices. Now the bot reads the same
 thermometer, from IEM's near-real-time METAR mirror (free, ~5–15 min latency).
 
-Results are cached per (station, day, kind, UTC-hour) so a generator that
-lives across hourly scans re-reads the feed at most once per hour per station.
+Results are cached per (station, day, kind, 10-minute bucket) — fine enough
+for the 15-minute intraday loop, and a bound on feed load for hourly scans.
+Every fresh fetch is timed into logs/obs_fetch_log.csv: that latency/failure
+record is the agreed decision data for whether a paid obs feed (Synoptic)
+would actually buy anything over IEM.
 """
 
 from __future__ import annotations
 
+import csv
+import time
 from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 
 from . import iem_client
+from .paths import DATA_DIR
 
 _cache: dict[tuple, float | None] = {}
+_FETCH_LOG = DATA_DIR / "logs" / "obs_fetch_log.csv"
+
+
+def _log_fetch(icao: str, kind: str, ok: bool, elapsed_ms: int) -> None:
+    try:
+        _FETCH_LOG.parent.mkdir(parents=True, exist_ok=True)
+        new = not _FETCH_LOG.exists()
+        with open(_FETCH_LOG, "a", newline="") as f:
+            w = csv.writer(f)
+            if new:
+                w.writerow(["ts", "icao", "kind", "ok", "elapsed_ms"])
+            w.writerow([datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        icao, kind, int(ok), elapsed_ms])
+    except Exception:  # noqa: BLE001 — telemetry must never block a scan
+        pass
 
 
 def local_event_date(res_dt: datetime, tz_name: str) -> date:
@@ -50,16 +71,19 @@ def running_extreme_c(icao: str, day: date, kind: str) -> float | None:
     """The station's observed running max/min (°C) for `day` so far, from the
     raw METAR stream. None when the feed has no obs (or on any fetch failure) —
     callers must treat None as 'feature stands down', never as 0."""
-    hour_bucket = datetime.now(timezone.utc).strftime("%Y%m%dT%H")
-    key = (icao, day.isoformat(), kind, hour_bucket)
+    now = datetime.now(timezone.utc)
+    bucket = now.strftime("%Y%m%dT%H") + str(now.minute // 10)
+    key = (icao, day.isoformat(), kind, bucket)
     if key in _cache:
         return _cache[key]
-    if len(_cache) > 512:  # hourly buckets expire naturally; just bound memory
+    if len(_cache) > 512:  # time buckets expire naturally; just bound memory
         _cache.clear()
+    t0 = time.monotonic()
     try:
         v_f = iem_client.metar_peak(icao, day, kind)
     except Exception:  # noqa: BLE001 — obs are an enhancement, never a blocker
         v_f = None
+    _log_fetch(icao, kind, v_f is not None, int((time.monotonic() - t0) * 1000))
     v_c = iem_client.f_to_c(v_f) if v_f is not None else None
     _cache[key] = v_c
     return v_c
