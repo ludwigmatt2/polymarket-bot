@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from weather.config import MAX_ENSEMBLE_SPREAD, MAX_ENTRY_DAYS_AHEAD, MIN_NET_EV_PP, ROUND_TRIP_FEE
+from weather.config import MAX_ENSEMBLE_SPREAD, MAX_ENTRY_DAYS_AHEAD, MIN_NET_EV_PP, EDGE_SAFETY_MARGIN_PP
 from weather.models import EnsembleForecast, Location, RawProbabilityResult, WeatherMarket
 from weather.signal_generator import SignalGenerator
 
@@ -92,7 +92,7 @@ class TestQualityGates:
         gen = _make_generator(model_p=0.32)
         signal = gen.evaluate(_make_market(yes_price=0.30))
         assert signal.quality_gate_passed is False
-        assert "gate4_fee_adjusted_edge" in signal.rejection_reason
+        assert "gate4_margin_adjusted_edge" in signal.rejection_reason
 
     def test_rejects_low_liquidity(self):
         from weather.config import MIN_MARKET_LIQUIDITY_USD
@@ -329,8 +329,8 @@ class TestEdgeCalculation:
 
     def test_net_ev_gate_threshold(self):
         # Post-shrinkage gate 4 requires |calibrated_p - market| * k ≥ fee + min_ev,
-        # so the minimum passing gross edge is (ROUND_TRIP_FEE + MIN_NET_EV_PP) / k.
-        min_gross = (ROUND_TRIP_FEE + MIN_NET_EV_PP) / 0.675  # k for days_out=3, spread=0.05
+        # so the minimum passing gross edge is (EDGE_SAFETY_MARGIN_PP + MIN_NET_EV_PP) / k.
+        min_gross = (EDGE_SAFETY_MARGIN_PP + MIN_NET_EV_PP) / 0.675  # k for days_out=3, spread=0.05
         gen = _make_generator(model_p=0.30 + min_gross + 0.005)  # just above threshold
         signal = gen.evaluate(_make_market(yes_price=0.30))
         assert signal.quality_gate_passed is True

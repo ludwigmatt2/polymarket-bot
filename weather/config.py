@@ -81,9 +81,17 @@ MIN_YES_ENTRY_PRICE = 0.15
 # Tokyo NO remains tradeable (+19.8% ROI). Other cities may be added as data accumulates.
 BLOCKED_YES_CITIES: list[str] = ["Tokyo"]
 
-# ── Fee model ──────────────────────────────────────────────────────────────────
-TAKER_FEE_PER_SIDE = 0.02       # 2% per trade (Polymarket CLOB taker)
-ROUND_TRIP_FEE = 0.04           # 4% total
+# ── Edge safety margin ─────────────────────────────────────────────────────────
+# Polymarket charges NO fees on these markets, positions are held to resolution,
+# and redemption is free — the old "ROUND_TRIP_FEE=0.04" was fiction. What the
+# haircut actually pays for is MODEL ERROR / adverse selection: when the model
+# disagrees with the market, part of that gap is the model being wrong, and the
+# marginal trades are where miscalibration lives (Jul-7 audit calibration curve).
+# Reduced 4pp → 3pp at the Jul-8 paper reset; to be tuned empirically from the
+# realized-vs-modeled edge curve once ~150+ station-resolved trades exist.
+# Execution costs are handled explicitly elsewhere (Gate 5.5 spread cap + the
+# edge-preserving FAK price cap), NOT by this margin.
+EDGE_SAFETY_MARGIN_PP = 0.03
 
 # ── Paper trading ──────────────────────────────────────────────────────────────
 PAPER_TRADE_SIZE_USD = 25.0
@@ -96,8 +104,16 @@ PAPER_BANKROLL_USD = 1000.0
 # ── Live trading (Kelly sizing) ────────────────────────────────────────────────
 KELLY_FRACTION = 0.25           # Quarter Kelly — conservative for uncertain edge
 MAX_LIVE_TRADE_USD = float(os.environ.get("MAX_LIVE_TRADE_USD", "25.0"))  # overrideable via env or /setmaxbet
-DAILY_LOSS_LIMIT_PCT = 0.05     # Kill switch at -5% of total capital
+# Kill switch: halt for the day when resolved losses exceed
+# max(DAILY_LOSS_LIMIT_PCT × bankroll, 2 × max order) — the floor keeps a small
+# bankroll from tripping on a single normal-sized losing trade.
+DAILY_LOSS_LIMIT_PCT = 0.05
 MAX_SLIPPAGE = float(os.environ.get("MAX_SLIPPAGE", "0.03"))  # market-buy price cap above entry (thin books)
+# Exposure caps: one bin per event (adjacent bins of the same temperature ladder
+# share the same forecast error — the bot would otherwise concentrate NO bets
+# exactly where its miss lands), and a cap on total USD resolving the same day
+# (the whole book marks overnight in one batch while the kill switch is blind).
+MAX_DAY_EXPOSURE_PCT = 0.40
 
 # ── Go-live gates (all must pass before real money) ────────────────────────────
 MIN_RESOLVED_TRADES = 20

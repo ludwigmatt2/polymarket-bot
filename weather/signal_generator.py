@@ -9,7 +9,7 @@ Gate structure (evaluated in order):
   Gate 2.7: Volatility regime    — is cross-model spread acceptably low?
   Gate 5:   Liquidity            — enough USD in the book to enter/exit?
   Gate 7:   Valid price range    — not at degenerate extremes?
-  Gate 4:   Fee-adjusted edge    — positive EV after round-trip fees? (blocks most trades)
+  Gate 4:   Margin-adjusted edge — positive EV after the model-error safety margin?
   Gate 6:   Odds velocity        — fast price movement = informed flow present?
   Gate 8:   Composite confidence — weighted spread + timing + calibration score?
   Gate 9.5: Equal extreme-price   — crowd >85% confident = market has station data.
@@ -46,7 +46,7 @@ from .config import (
     MIN_NET_EV_PP,
     MIN_YES_ENTRY_PRICE,
     REQUIRE_STATION_TRUTH,
-    ROUND_TRIP_FEE,
+    EDGE_SAFETY_MARGIN_PP,
     VELOCITY_WINDOW_HOURS,
 )
 from .city_bias import CityBiasCorrector
@@ -149,7 +149,7 @@ class SignalGenerator:
 
         # Re-check gate 4 after both shrinkages
         if gate_passed:
-            net_ev_shrunk = abs(model_p - market.yes_price) - ROUND_TRIP_FEE
+            net_ev_shrunk = abs(model_p - market.yes_price) - EDGE_SAFETY_MARGIN_PP
             if net_ev_shrunk < MIN_NET_EV_PP:
                 gate_passed = False
                 rejection_reason = f"gate4_after_shrinkage:{net_ev_shrunk:.3f}"
@@ -296,11 +296,11 @@ class SignalGenerator:
             matched = next(c for c in BLOCKED_YES_CITIES if c in market.title)
             return False, f"gate9.8_city_yes_blocked:{matched}", 0.0
 
-        # Gate 4: Fee-adjusted edge (blocks the majority of candidate trades)
+        # Gate 4: Margin-adjusted edge (blocks the majority of candidate trades)
         gross_ev = abs(prob.calibrated_p - market.yes_price)
-        net_ev = gross_ev - ROUND_TRIP_FEE
+        net_ev = gross_ev - EDGE_SAFETY_MARGIN_PP
         if net_ev < MIN_NET_EV_PP:
-            return False, f"gate4_fee_adjusted_edge:{net_ev:.3f}_required:{MIN_NET_EV_PP}", 0.0
+            return False, f"gate4_margin_adjusted_edge:{net_ev:.3f}_required:{MIN_NET_EV_PP}", 0.0
 
         # Gate 6: Odds velocity — fast movement signals informed flow
         if self.price_tracker is not None:

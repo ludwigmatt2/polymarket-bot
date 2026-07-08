@@ -18,11 +18,12 @@ from typing import Any
 from ._io import atomic_write_csv, atomic_write_json
 from .config import (
     DAILY_LOSS_LIMIT_PCT,
+    EDGE_SAFETY_MARGIN_PP,
     KELLY_FRACTION,
+    MAX_DAY_EXPOSURE_PCT,
     MAX_LIVE_TRADE_USD,
     MAX_SLIPPAGE,
     MIN_NET_EV_PP,
-    ROUND_TRIP_FEE,
 )
 from .models import Signal
 from .paper_trader import PaperTrader, _brier
@@ -232,12 +233,48 @@ class LiveTrader:
         # batch collectively overdrawing. Reset per scan via reset_scan_commitments()
         # — by the next scan settlement has landed and fetch_balance is authoritative.
         self._committed_this_scan = 0.0
+        self._events_this_scan: set[str] = set()
+        self._day_committed_this_scan: dict[str, float] = {}
 
     def reset_scan_commitments(self) -> None:
-        """Zero the in-scan spend tracker. Call once at the start of each scan's
-        execution loop (a fresh trader starts at 0, but the single-user main loop
-        reuses one trader across scans)."""
+        """Zero the in-scan spend/exposure trackers. Call once at the start of each
+        scan's execution loop (a fresh trader starts at 0, but the single-user main
+        loop reuses one trader across scans)."""
         self._committed_this_scan = 0.0
+        self._events_this_scan = set()
+        self._day_committed_this_scan = {}
+
+    @staticmethod
+    def _event_key_of(lat, lon, metric: str, resolution_date: str) -> str:
+        """Identity of a market EVENT (one temperature ladder): same station/city
+        + metric + event day. Bins of one ladder share this key; conditionIds
+        don't. Coordinates rounded so geocode jitter can't split an event."""
+        try:
+            lat_s, lon_s = f"{float(lat):.2f}", f"{float(lon):.2f}"
+        except (TypeError, ValueError):
+            lat_s, lon_s = str(lat), str(lon)
+        return f"{lat_s}:{lon_s}:{metric}:{str(resolution_date)[:10]}"
+
+    def _has_open_event(self, event_key: str) -> bool:
+        """True if an open (unresolved) live trade already covers this event."""
+        for row in self._load_open_live_trades():
+            k = self._event_key_of(row.get("lat"), row.get("lon"),
+                                   row.get("metric", ""), row.get("resolution_date", ""))
+            if k == event_key:
+                return True
+        return False
+
+    def _open_day_exposure(self, day_iso: str) -> float:
+        """USD already riding on positions that resolve on `day_iso` (size_usd is
+        the actual USD spent — _log_trade writes usd_spent into that column)."""
+        total = 0.0
+        for row in self._load_open_live_trades():
+            if str(row.get("resolution_date", ""))[:10] == day_iso:
+                try:
+                    total += float(row.get("size_usd") or 0.0)
+                except ValueError:
+                    pass
+        return total
 
     @classmethod
     def from_creds(cls, creds: dict | None, *, paper_trader, bankroll_usd: float = 0.0,
@@ -262,14 +299,17 @@ class LiveTrader:
         return self.paper_trader.compute_stats().ready_for_live
 
     def daily_pnl(self) -> float:
-        """Sum of resolved live PnL today (UTC date). Kill switch reads this."""
+        """Sum of live PnL RESOLVED today (UTC date). Kill switch reads this.
+        Keyed on resolved_at, not submitted_at: trades settle on-chain the day
+        after submission, so a submit-date filter never saw yesterday's trades
+        losing today — the kill switch was effectively dead (Jul-7 audit)."""
         if not self._log_path.exists():
             return 0.0
         today = datetime.now(timezone.utc).date().isoformat()
         total = 0.0
         with open(self._log_path) as f:
             for row in csv.DictReader(f):
-                if row.get("submitted_at", "").startswith(today) and row.get("pnl_usd"):
+                if row.get("resolved_at", "").startswith(today) and row.get("pnl_usd"):
                     try:
                         total += float(row["pnl_usd"])
                     except ValueError:
@@ -277,12 +317,16 @@ class LiveTrader:
         return total
 
     def kelly_size_usd(self, signal: Signal) -> float:
-        """Quarter-Kelly stake in USD, capped at MAX_LIVE_TRADE_USD."""
+        """Quarter-Kelly stake in USD, capped at MAX_LIVE_TRADE_USD. The win
+        probability is haircut by EDGE_SAFETY_MARGIN_PP so sizing believes the
+        same margin-adjusted edge Gate 4 requires — raw-model_p Kelly was
+        systematically overbetting relative to the entry criteria."""
         ep = signal.entry_price
         if not (0.0 < ep < 1.0):
             return 0.0
         b = (1.0 / ep) - 1.0
         p = signal.model_p if signal.direction == "YES" else (1.0 - signal.model_p)
+        p = max(p - EDGE_SAFETY_MARGIN_PP, 0.0)
         full_kelly = (b * p - (1.0 - p)) / b
         if full_kelly <= 0:
             return 0.0
@@ -296,14 +340,35 @@ class LiveTrader:
         if not self.is_unlocked():
             raise RuntimeError("Go-live gates not passed — run: python weather_bot.py dashboard")
 
-        # Daily loss kill switch — live now that daily_pnl reads real pnl_usd
+        # Daily loss kill switch. The floor of 2× max order keeps a small
+        # bankroll from halting on one normal-sized losing trade (5% of $65
+        # is $3.25 — less than a single stake).
         today_pnl = self.daily_pnl()
-        if today_pnl < -(self.bankroll_usd * DAILY_LOSS_LIMIT_PCT):
+        loss_limit = max(self.bankroll_usd * DAILY_LOSS_LIMIT_PCT, 2.0 * _get_max_trade_usd())
+        if today_pnl < -loss_limit:
             raise RuntimeError(
-                f"Daily loss limit hit: {today_pnl:.2f} USD — halting until tomorrow"
+                f"Daily loss limit hit: {today_pnl:.2f} USD (limit {loss_limit:.2f}) "
+                "— halting until tomorrow"
             )
 
         if self._is_duplicate(signal):
+            return None
+
+        # One bin per event: adjacent buckets of the same temperature ladder are
+        # priced off the same forecast, so their model error is one shared bet —
+        # signals arrive edge-sorted, so the first (best) bin wins and the rest
+        # of the event is skipped, this scan and while a position stays open.
+        event = self._event_key_of(signal.market.location.lat, signal.market.location.lon,
+                                   signal.market.metric, signal.market.resolution_date.isoformat())
+        if event in self._events_this_scan or self._has_open_event(event):
+            return None
+
+        # Per-resolution-day exposure cap: the whole book marks in one overnight
+        # settlement batch; cap what can ride on a single calendar day.
+        day = signal.market.resolution_date.date().isoformat()
+        day_cap = self.bankroll_usd * MAX_DAY_EXPOSURE_PCT
+        day_open = self._open_day_exposure(day) + self._day_committed_this_scan.get(day, 0.0)
+        if day_open >= day_cap:
             return None
 
         size_usd = self.kelly_size_usd(signal)
@@ -382,7 +447,7 @@ class LiveTrader:
         # The FAK fills only depth at/under the cap and kills the rest, so a thin
         # or worse-priced book yields an unfilled order, never a bad fill.
         p_win = signal.model_p if signal.direction == "YES" else 1.0 - signal.model_p
-        cap_edge = math.floor((p_win - ROUND_TRIP_FEE - MIN_NET_EV_PP) / tick) * tick
+        cap_edge = math.floor((p_win - EDGE_SAFETY_MARGIN_PP - MIN_NET_EV_PP) / tick) * tick
         cap_slip = round(ep * (1.0 + MAX_SLIPPAGE) / tick) * tick
         price_cap = min(cap_slip, cap_edge, 1.0 - tick)
         price_cap = round(max(price_cap, tick), 6)
@@ -459,7 +524,11 @@ class LiveTrader:
 
         # Book the real USD spent against this scan's budget so the next order in
         # the same scan sizes off the true remaining balance, not a stale read.
+        # Filled orders also claim their event (one bin per ladder) and count
+        # toward their resolution-day's exposure cap.
         self._committed_this_scan += usd_spent
+        self._events_this_scan.add(event)
+        self._day_committed_this_scan[day] = self._day_committed_this_scan.get(day, 0.0) + usd_spent
         self._log_trade(signal, order_id, usd_spent, ep, filled, filled_price, order_status)
         self.paper_trader.log_trade(signal)
 

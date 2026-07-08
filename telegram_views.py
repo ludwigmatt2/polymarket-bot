@@ -15,7 +15,7 @@ import json
 from weather.config import (
     MAX_ENSEMBLE_SPREAD,
     MIN_COMPOSITE_CONFIDENCE,
-    ROUND_TRIP_FEE,
+    EDGE_SAFETY_MARGIN_PP,
 )
 
 # Telegram hard limit is 4096 chars; leave headroom for markup overhead.
@@ -89,7 +89,7 @@ def fmt_why(row: dict) -> str:
             lines.append(f"Model:          {model_p:.1%}")
         lines.append(f"Market priced:  {yes_price:.1%}")
         lines.append(
-            f"Edge:           *{edge:.1%}* (≥ {ROUND_TRIP_FEE:.0%} fees needed)"
+            f"Edge:           *{edge:.1%}* (≥ {EDGE_SAFETY_MARGIN_PP:.0%} margin needed)"
         )
 
     # Per-model breakdown from the stored JSON
