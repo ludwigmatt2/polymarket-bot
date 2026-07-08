@@ -51,6 +51,10 @@ REQUIRE_STATION_TRUTH = True
 
 MIN_MARKET_LIQUIDITY_USD = 50.0  # Lowered to include monthly precipitation markets
 BOOK_DEPTH_MIN_MULTIPLIER = 3   # Gate 5: require N× min liquidity in live CLOB book depth
+# Gate 5.5: max bid-ask spread on the traded side. A 4¢+ book eats a third of the
+# 12pp edge floor on entry; nothing else caps this (edge is computed off the Gamma
+# quote). Only enforced when both best quotes were fetched (live sidecar up).
+MAX_BOOK_SPREAD = 0.04
 MIN_MARKET_PRICE = 0.03         # Avoid illiquid extremes
 MAX_MARKET_PRICE = 0.97
 # Gate 9.5: skip "equal" direction markets where crowd is this confident —

@@ -38,6 +38,13 @@ class WeatherMarket:
     forecast_start_date: "date | None" = None  # set for monthly markets
     # Current CLOB order-book depth; 0.0 = not fetched
     book_depth_usd: float = 0.0
+    # NO-token book (the side the bot's NO signals actually consume) + best quotes
+    # per side for the spread gate. 0.0 = not fetched / empty book side.
+    no_book_depth_usd: float = 0.0
+    yes_best_ask: float = 0.0
+    yes_best_bid: float = 0.0
+    no_best_ask: float = 0.0
+    no_best_bid: float = 0.0
     # CLOB outcome token IDs — captured from Gamma API clobTokenIds field
     yes_token_id: str = ""
     no_token_id: str = ""

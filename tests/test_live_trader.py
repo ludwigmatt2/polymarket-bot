@@ -849,3 +849,47 @@ class TestClaimWinnings:
         from weather.position_monitor import print_divergences
         print_divergences([])
         assert "matches on-chain" in capsys.readouterr().out
+
+
+class TestExecutionLeakFixes:
+    """PR-A fixes from the Jul-7 audit: idempotency rollback on no-fill and the
+    edge-preserving price cap."""
+
+    def test_unfilled_order_releases_idempotency_key(self, tmp_path):
+        """A killed FAK must not burn the market's key for the rest of the day."""
+        trader = _make_trader(tmp_path)
+        trader._client = _make_mock_client(filled=0.0, status="open")
+        sig = _make_signal()
+        result = trader.execute_signal(sig)
+        assert result["status"] == "unfilled"
+        assert trader._is_duplicate(sig) is False  # retryable next scan
+
+    def test_filled_order_keeps_idempotency_key(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        trader._client = _make_mock_client(filled=15.0)
+        sig = _make_signal()
+        trader.execute_signal(sig)
+        assert trader._is_duplicate(sig) is True
+
+    def test_price_cap_bound_by_edge_floor_on_thin_edge(self, tmp_path):
+        """With a marginal edge, the cap must sit at the edge-preserving price,
+        NOT quote×1.03 — slippage may never eat below Gate 4's floor."""
+        from weather.config import MIN_NET_EV_PP, ROUND_TRIP_FEE
+        trader = _make_trader(tmp_path, bankroll=500.0)
+        trader._client = _make_mock_client(filled=15.0)
+        trader.kelly_size_usd = lambda signal: 10.0
+        # YES @ 0.35, model_p 0.47 → gross edge 12pp = exactly the Gate-4 floor.
+        trader.execute_signal(_make_signal(market_p=0.35, model_p=0.47))
+        order_args = trader._client.create_and_post_market_order.call_args.args[0]
+        expected_cap = 0.47 - ROUND_TRIP_FEE - MIN_NET_EV_PP  # = the quote itself
+        assert order_args.price == pytest.approx(expected_cap, abs=1e-6)
+        assert order_args.price < round(0.35 * 1.03, 4)  # tighter than slippage cap
+
+    def test_price_cap_bound_by_slippage_on_fat_edge(self, tmp_path):
+        """With a fat edge the slippage cap binds (edge cap is far above)."""
+        trader = _make_trader(tmp_path, bankroll=500.0)
+        trader._client = _make_mock_client(filled=15.0)
+        trader.kelly_size_usd = lambda signal: 10.0
+        trader.execute_signal(_make_signal(market_p=0.35, model_p=0.65))
+        order_args = trader._client.create_and_post_market_order.call_args.args[0]
+        assert order_args.price == pytest.approx(0.36, abs=1e-6)  # 0.35×1.03 → tick

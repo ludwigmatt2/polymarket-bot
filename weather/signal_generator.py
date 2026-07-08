@@ -32,6 +32,7 @@ from .config import (
     GATE8_SPREAD_WEIGHT,
     GATE8_TIMING_WEIGHT,
     LEAD_TIME_DECAY_PER_DAY,
+    MAX_BOOK_SPREAD,
     MAX_ENTRY_DAYS_AHEAD,
     MAX_ENSEMBLE_SPREAD,
     MAX_FORECAST_AGE_HOURS,
@@ -229,18 +230,35 @@ class SignalGenerator:
         if prob.ensemble_spread > MAX_ENSEMBLE_SPREAD:
             return False, f"gate2.7_high_spread:{prob.ensemble_spread:.3f}", 0.0
 
-        # Gate 5: Liquidity.
+        # Gate 5: Liquidity — checked on the book side the trade actually consumes.
+        # The signal direction is implied by calibrated_p vs price (shrinkage anchors
+        # at the market price, so it can't flip — same inference gates 9.6-9.8 use).
+        # A NO buy consumes NO-token asks; validating YES-ask depth for it checks a
+        # book the order never touches (Jul-7 audit).
         # Two separate checks, not a fallback for the same metric:
-        #   book_depth_usd = live ask-side CLOB depth (fetched when sidecar is running)
+        #   side ask depth = live CLOB depth (fetched when sidecar is running)
         #     → must be ≥ BOOK_DEPTH_MIN_MULTIPLIER × MIN_MARKET_LIQUIDITY_USD (3×)
         #   liquidity_usd = volumeClob (cumulative, always available)
         #     → used only when depth is unavailable (paper mode / sidecar down)
-        if market.book_depth_usd > 0.0:
+        side_is_yes = prob.calibrated_p > market.yes_price
+        side_depth = market.book_depth_usd if side_is_yes else market.no_book_depth_usd
+        side_tag = "yes" if side_is_yes else "no"
+        if side_depth > 0.0:
             min_depth = MIN_MARKET_LIQUIDITY_USD * BOOK_DEPTH_MIN_MULTIPLIER
-            if market.book_depth_usd < min_depth:
-                return False, f"gate5_low_book_depth:{market.book_depth_usd:.0f}_required:{min_depth:.0f}", 0.0
+            if side_depth < min_depth:
+                return False, f"gate5_low_book_depth_{side_tag}:{side_depth:.0f}_required:{min_depth:.0f}", 0.0
         elif market.liquidity_usd < MIN_MARKET_LIQUIDITY_USD:
             return False, f"gate5_low_liquidity:{market.liquidity_usd:.0f}", 0.0
+
+        # Gate 5.5: Bid-ask spread on the traded side. A wide book silently eats
+        # the modeled edge on entry (nothing else caps it — the 12pp edge floor is
+        # computed off the Gamma quote, not the executable ask).
+        best_ask, best_bid = ((market.yes_best_ask, market.yes_best_bid) if side_is_yes
+                              else (market.no_best_ask, market.no_best_bid))
+        if best_ask > 0.0 and best_bid > 0.0:
+            spread = best_ask - best_bid
+            if spread > MAX_BOOK_SPREAD:
+                return False, f"gate5.5_wide_spread_{side_tag}:{spread:.3f}_max:{MAX_BOOK_SPREAD}", 0.0
 
         # Gate 7: Valid price range
         if not (0.0 < market.yes_price < 1.0):

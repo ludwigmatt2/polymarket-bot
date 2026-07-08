@@ -367,3 +367,45 @@ class TestShrinkageAnchoredAtMarket:
         far = gen.evaluate(_make_market(yes_price=0.30, days_out=5))
         assert far.edge_pp < near.edge_pp
         assert near.direction == far.direction == "YES"
+
+
+class TestSideAwareLiquidity:
+    """PR-A: Gate 5 checks the traded side's book; Gate 5.5 caps its spread."""
+
+    def _no_side_market(self, **kw):
+        # model_p 0.10 < price 0.60 → implied NO side
+        m = _make_market(yes_price=0.60)
+        for k, v in kw.items():
+            setattr(m, k, v)
+        return m
+
+    def test_no_signal_gated_on_no_side_depth(self):
+        gen = _make_generator(model_p=0.10)
+        # YES book deep, NO book thin — a NO trade must be rejected on the NO book
+        m = self._no_side_market(book_depth_usd=5000.0, no_book_depth_usd=10.0)
+        s = gen.evaluate(m)
+        assert s.quality_gate_passed is False
+        assert "gate5_low_book_depth_no" in s.rejection_reason
+
+    def test_no_signal_passes_on_deep_no_book(self):
+        gen = _make_generator(model_p=0.10)
+        m = self._no_side_market(book_depth_usd=10.0, no_book_depth_usd=5000.0,
+                                 no_best_ask=0.41, no_best_bid=0.39)
+        s = gen.evaluate(m)
+        assert s.quality_gate_passed is True
+
+    def test_wide_spread_rejected_on_traded_side(self):
+        from weather.config import MAX_BOOK_SPREAD
+        gen = _make_generator(model_p=0.10)
+        m = self._no_side_market(no_book_depth_usd=5000.0,
+                                 no_best_ask=0.45, no_best_bid=0.45 - MAX_BOOK_SPREAD - 0.02)
+        s = gen.evaluate(m)
+        assert s.quality_gate_passed is False
+        assert "gate5.5_wide_spread_no" in s.rejection_reason
+
+    def test_missing_quotes_skip_spread_gate(self):
+        # Paper mode / sidecar down: no best quotes fetched → spread gate stands down
+        gen = _make_generator(model_p=0.10)
+        m = self._no_side_market(no_book_depth_usd=5000.0)
+        s = gen.evaluate(m)
+        assert s.quality_gate_passed is True

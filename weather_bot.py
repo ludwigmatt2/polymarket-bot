@@ -77,6 +77,10 @@ def run_scan(
     signals = [generator.evaluate(m) for m in markets]
     actionable = [s for s in signals if s.quality_gate_passed]
     rejected = [s for s in signals if not s.quality_gate_passed]
+    # Execute strongest edges first: with a small bankroll the in-scan budget can
+    # run out mid-list, and scan order would fund weak signals before strong ones.
+    # (Also propagates to the per-user fan-out, which receives this list.)
+    actionable.sort(key=lambda s: s.edge_pp, reverse=True)
     print(f"{len(actionable)} signals pass quality gates")
 
     geo = check_geoblock() if (live_trader and actionable) else None
@@ -926,6 +930,16 @@ def main() -> None:
     while True:
         scan_count += 1
         print(f"─── Scan #{scan_count} ────────────────────────────────────────────")
+        # Re-read the wallet every scan: Kelly must size off the CURRENT bankroll.
+        # The old start-once snapshot drifted for days — over-betting after losses,
+        # under-betting after wins (Jul-7 audit). Keep the last value on a failed
+        # fetch (the per-order spendable-balance guard still prevents overdraw).
+        if live_trader is not None:
+            try:
+                live_trader.bankroll_usd = min(args.bankroll, live_trader.fetch_balance())
+            except Exception as e:  # noqa: BLE001
+                print(f"  ⚠ bankroll refresh failed ({e}) — keeping "
+                      f"${live_trader.bankroll_usd:.2f}", file=sys.stderr)
         try:
             run_scan(scanner, generator, paper, log_dir, monitor, live_trader=live_trader,
                      all_users=args.all_users)

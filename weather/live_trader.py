@@ -21,6 +21,8 @@ from .config import (
     KELLY_FRACTION,
     MAX_LIVE_TRADE_USD,
     MAX_SLIPPAGE,
+    MIN_NET_EV_PP,
+    ROUND_TRIP_FEE,
 )
 from .models import Signal
 from .paper_trader import PaperTrader, _brier
@@ -369,10 +371,20 @@ class LiveTrader:
         tick_size = signal.market.tick_size or "0.01"
         tick = float(tick_size)
 
-        # Slippage cap: a marketable BUY must not fill above this price. The
-        # market-order FAK fills only depth at/under the cap and kills the rest,
-        # so a thin book can't drag the fill far from the weather edge.
-        price_cap = min(round(ep * (1.0 + MAX_SLIPPAGE) / tick) * tick, 1.0 - tick)
+        # Price cap: a marketable BUY must not fill above the LOWER of
+        #   (a) the slippage cap — quote × (1+MAX_SLIPPAGE), and
+        #   (b) the edge-preserving cap — the highest price at which the trade
+        #       still clears Gate 4's edge floor (win-prob − margin − min edge).
+        # (b) is what makes the edge executable: Gate 4 was computed off the Gamma
+        # quote, but the FAK fills off the book — without this, up to 3% slippage
+        # silently came straight out of the modeled edge (Jul-7 audit). Floored to
+        # tick so the cap never rounds ABOVE the edge-preserving price.
+        # The FAK fills only depth at/under the cap and kills the rest, so a thin
+        # or worse-priced book yields an unfilled order, never a bad fill.
+        p_win = signal.model_p if signal.direction == "YES" else 1.0 - signal.model_p
+        cap_edge = math.floor((p_win - ROUND_TRIP_FEE - MIN_NET_EV_PP) / tick) * tick
+        cap_slip = round(ep * (1.0 + MAX_SLIPPAGE) / tick) * tick
+        price_cap = min(cap_slip, cap_edge, 1.0 - tick)
         price_cap = round(max(price_cap, tick), 6)
 
         # USD to spend — market BUYs take a USD amount (2-decimal clean), unlike
@@ -434,6 +446,12 @@ class LiveTrader:
         )
 
         if filled <= 0:
+            # Release the day's idempotency key: a FAK is atomic — zero filled
+            # means the whole order was killed, nothing rests on the book — so
+            # the market stays retryable next scan when depth returns. Without
+            # this, one thin-book miss forfeited the market's edge for the whole
+            # day (the key is date-scoped; Jul-7 audit).
+            self._remove_idempotency_key(signal)
             # Shape-complete so display callers (which read size_usd/price) never
             # KeyError on a no-fill — now a common outcome with FAK + slippage cap.
             return {"order_id": order_id, "status": "unfilled", "filled": 0.0,
