@@ -194,15 +194,28 @@ class TestDailyPnl:
 
 
 class TestKillSwitch:
-    def test_kill_switch_halts_on_5pct_loss(self, tmp_path):
-        """daily_pnl below -5% bankroll must raise RuntimeError."""
-        trader = _make_trader(tmp_path, bankroll=500.0)
+    def test_kill_switch_halts_on_daily_loss(self, tmp_path):
+        """Resolved loss beyond max(5% bankroll, 2x max order) must raise."""
+        trader = _make_trader(tmp_path, bankroll=500.0)  # limit = max(25, 50) = 50
         today = datetime.now(timezone.utc).date().isoformat()
         _write_live_trades(trader._log_path, [
-            {"submitted_at": f"{today}T10:00:00+00:00", "pnl_usd": "-30.00",
+            {"submitted_at": f"{today}T10:00:00+00:00", "pnl_usd": "-60.00",
              "actual_outcome": "0", "resolved_at": f"{today}T14:00:00+00:00"},
         ])
 
+        with pytest.raises(RuntimeError, match="Daily loss limit hit"):
+            trader.execute_signal(_make_signal())
+
+    def test_kill_switch_sees_yesterdays_trade_resolving_today(self, tmp_path):
+        """The audit bug: keyed on submitted_at, a trade submitted yesterday but
+        RESOLVED today was invisible - the switch could never fire."""
+        trader = _make_trader(tmp_path, bankroll=500.0)
+        today = datetime.now(timezone.utc).date().isoformat()
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).date().isoformat()
+        _write_live_trades(trader._log_path, [
+            {"submitted_at": f"{yesterday}T10:00:00+00:00", "pnl_usd": "-60.00",
+             "actual_outcome": "0", "resolved_at": f"{today}T06:00:00+00:00"},
+        ])
         with pytest.raises(RuntimeError, match="Daily loss limit hit"):
             trader.execute_signal(_make_signal())
 
@@ -304,9 +317,12 @@ class TestFillReconciliation:
         amt1 = trader._client.create_and_post_market_order.call_args.args[0].amount
         assert amt1 == pytest.approx(7.0, abs=0.01)
 
-        # Second order in the SAME scan (distinct market): min($7, $10 − $7) = $3.
+        # Second order in the SAME scan (distinct EVENT — same-event bins are now
+        # blocked by the one-bin-per-event cap): min($7, $10 − $7) = $3.
         trader._client = _make_mock_client(filled=8.57)  # ~8.57 sh * 0.35 = $3
-        trader.execute_signal(_make_signal(market_id="mkt_two", market_p=0.35, model_p=0.65))
+        sig_two = _make_signal(market_id="mkt_two", market_p=0.35, model_p=0.65)
+        sig_two.market.metric = "temperature_2m_min"
+        trader.execute_signal(sig_two)
         amt2 = trader._client.create_and_post_market_order.call_args.args[0].amount
         assert amt2 == pytest.approx(3.0, abs=0.01)
         assert amt1 + amt2 <= 10.0 + 0.01   # scan total never exceeds real balance
@@ -874,15 +890,15 @@ class TestExecutionLeakFixes:
     def test_price_cap_bound_by_edge_floor_on_thin_edge(self, tmp_path):
         """With a marginal edge, the cap must sit at the edge-preserving price,
         NOT quote×1.03 — slippage may never eat below Gate 4's floor."""
-        from weather.config import MIN_NET_EV_PP, ROUND_TRIP_FEE
+        from weather.config import MIN_NET_EV_PP, EDGE_SAFETY_MARGIN_PP
         trader = _make_trader(tmp_path, bankroll=500.0)
         trader._client = _make_mock_client(filled=15.0)
         trader.kelly_size_usd = lambda signal: 10.0
-        # YES @ 0.35, model_p 0.47 → gross edge 12pp = exactly the Gate-4 floor.
-        trader.execute_signal(_make_signal(market_p=0.35, model_p=0.47))
+        # YES @ 0.35, model_p 0.46 → gross edge 11pp = exactly the Gate-4 floor
+        # (margin 3pp + min edge 8pp) → edge cap sits AT the quote.
+        trader.execute_signal(_make_signal(market_p=0.35, model_p=0.46))
         order_args = trader._client.create_and_post_market_order.call_args.args[0]
-        expected_cap = 0.47 - ROUND_TRIP_FEE - MIN_NET_EV_PP  # = the quote itself
-        assert order_args.price == pytest.approx(expected_cap, abs=1e-6)
+        assert order_args.price == pytest.approx(0.35, abs=1e-6)
         assert order_args.price < round(0.35 * 1.03, 4)  # tighter than slippage cap
 
     def test_price_cap_bound_by_slippage_on_fat_edge(self, tmp_path):
@@ -893,3 +909,72 @@ class TestExecutionLeakFixes:
         trader.execute_signal(_make_signal(market_p=0.35, model_p=0.65))
         order_args = trader._client.create_and_post_market_order.call_args.args[0]
         assert order_args.price == pytest.approx(0.36, abs=1e-6)  # 0.35×1.03 → tick
+
+
+class TestExposureCaps:
+    """PR-B: one bin per event; per-resolution-day exposure cap."""
+
+    def test_second_bin_of_same_event_skipped_in_scan(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        trader._client = _make_mock_client(filled=15.0)
+        trader.reset_scan_commitments()
+        first = trader.execute_signal(_make_signal(market_id="mkt_bin_a"))
+        assert first and first.get("filled", 0) > 0
+        # same city/metric/resolution day, different market (adjacent bin)
+        second = trader.execute_signal(_make_signal(market_id="mkt_bin_b"))
+        assert second is None
+
+    def test_open_position_blocks_same_event_across_scans(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        sig = _make_signal(market_id="mkt_bin_b")
+        res = sig.market.resolution_date.isoformat()
+        _write_live_trades(trader._log_path, [
+            {"market_id": "mkt_bin_a", "direction": "YES", "size_usd": "5.00",
+             "lat": sig.market.location.lat, "lon": sig.market.location.lon,
+             "metric": sig.market.metric, "resolution_date": res,
+             "actual_outcome": "", "resolved_at": "", "pnl_usd": ""},
+        ])
+        trader._client = _make_mock_client(filled=15.0)
+        assert trader.execute_signal(sig) is None
+
+    def test_different_event_not_blocked(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        trader._client = _make_mock_client(filled=15.0)
+        trader.reset_scan_commitments()
+        assert trader.execute_signal(_make_signal(market_id="mkt_a")) is not None
+        # different metric = different event (e.g. the "lowest temp" ladder)
+        sig2 = _make_signal(market_id="mkt_b")
+        sig2.market.metric = "temperature_2m_min"
+        assert trader.execute_signal(sig2) is not None
+
+    def test_day_exposure_cap_blocks_new_orders(self, tmp_path):
+        trader = _make_trader(tmp_path, bankroll=40.0)  # day cap = 40 × 0.40 = $16
+        sig = _make_signal(market_id="mkt_new")
+        res = sig.market.resolution_date.isoformat()
+        # $20 already riding on that resolution day (different event)
+        _write_live_trades(trader._log_path, [
+            {"market_id": "mkt_old", "direction": "NO", "size_usd": "20.00",
+             "lat": "10.00", "lon": "10.00", "metric": "temperature_2m_min",
+             "resolution_date": res,
+             "actual_outcome": "", "resolved_at": "", "pnl_usd": ""},
+        ])
+        trader._client = _make_mock_client(filled=15.0)
+        assert trader.execute_signal(sig) is None
+
+
+class TestKellyMarginHaircut:
+    def test_kelly_sizes_on_margin_adjusted_probability(self, tmp_path):
+        from weather.config import EDGE_SAFETY_MARGIN_PP, KELLY_FRACTION
+        trader = _make_trader(tmp_path, bankroll=100.0)
+        sig = _make_signal(market_p=0.35, model_p=0.60, direction="YES")
+        ep = 0.35
+        b = 1 / ep - 1
+        p = 0.60 - EDGE_SAFETY_MARGIN_PP
+        expected = 100.0 * KELLY_FRACTION * ((b * p - (1 - p)) / b)
+        assert trader.kelly_size_usd(sig) == pytest.approx(expected, abs=0.01)
+
+    def test_kelly_zero_when_margin_kills_edge(self, tmp_path):
+        trader = _make_trader(tmp_path, bankroll=100.0)
+        # model_p barely above price: margin-adjusted Kelly must be 0, not tiny-positive
+        sig = _make_signal(market_p=0.35, model_p=0.37, direction="YES")
+        assert trader.kelly_size_usd(sig) == 0.0

@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .city_bias import CityBiasCorrector
-from .config import MIN_NET_EV_PP, ROUND_TRIP_FEE
+from .config import MIN_NET_EV_PP, EDGE_SAFETY_MARGIN_PP
 from .models import Location, WeatherMarket
 from .probability_model import ProbabilityModel
 from .weather_client import WeatherClient
@@ -99,7 +99,7 @@ class PositionMonitor:
             updated_model_p = prob.calibrated_p
             updated_dir     = "YES" if updated_model_p > (1 - entry_p if trade_dir == "NO" else entry_p) else "NO"
             mkt_yes_price   = entry_p if trade_dir == "YES" else (1 - entry_p)
-            current_edge    = abs(updated_model_p - mkt_yes_price) - ROUND_TRIP_FEE
+            current_edge    = abs(updated_model_p - mkt_yes_price) - EDGE_SAFETY_MARGIN_PP
             p_shift         = abs(updated_model_p - orig_model_p)
             direction_flipped = updated_dir != trade_dir
 
