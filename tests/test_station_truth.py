@@ -72,8 +72,20 @@ def test_parse_station_none():
 
 def test_registry_has_actual_resolving_stations():
     # Dallas settles at Love Field (KDAL), NOT DFW; London at EGLC; Tokyo at RJTT.
-    for icao in ("KDAL", "EGLC", "RJTT", "LLBG"):
+    # Jul-8 expansion: Madrid, Dubai, Singapore, Shanghai, Toronto.
+    for icao in ("KDAL", "EGLC", "RJTT", "LLBG",
+                 "LEMD", "OMDB", "WSSS", "ZSPD", "CYYZ"):
         assert iem_client.station_meta(icao) is not None, icao
+
+
+def test_is_us_network_classification():
+    # US = {STATE}_ASOS (two segments, incl. California's CA_ASOS); Canada is
+    # CA_{PROV}_ASOS (three) and intl {CC}__ASOS — neither may classify as US.
+    assert iem_client.is_us("KLGA") is True
+    assert iem_client.is_us("CYYZ") is False   # CA_ON_ASOS — the old test said True
+    assert iem_client.is_us("LFPB") is False
+    # WU location keys depend on this: CYYZ must resolve as CA, not US
+    assert wu_client._country("CYYZ") == "CA"
 
 
 class _Resp:
