@@ -19,9 +19,9 @@ from zoneinfo import ZoneInfo
 from ._io import atomic_write_csv
 from .config import (
     DAILY_LOSS_LIMIT_PCT,
-    MIN_BRIER_SKILL_SCORE,
+    GATE_MIN_DAYS_ELAPSED,
+    GATE_MIN_STATION_RESOLVED,
     MIN_PROFIT_FACTOR,
-    MIN_RESOLVED_TRADES,
     MAX_PAPER_DRAWDOWN_PCT,
     PAPER_TRADE_SIZE_USD,
 )
@@ -44,6 +44,10 @@ CSV_HEADERS = [
     "raw_p", "model_breakdown_json",
     # Phase 1: resolving station (empty on older rows → Open-Meteo resolution path).
     "station_icao", "station_country", "resolve_unit",
+    # Which truth labeled this outcome: "station" (WU→IEM, what Polymarket pays on)
+    # or "grid" (Open-Meteo reanalysis fallback). The re-live gate counts ONLY
+    # station-labeled trades — grid labels disagreed with on-chain 33% of the time.
+    "label_source",
 ]
 
 # Brier score for an uninformed 50/50 forecast (climatology baseline)
@@ -269,6 +273,7 @@ class PaperTrader:
             t["resolved_at"] = now.isoformat()
             t["pnl_usd"] = round(pnl, 4)
             t["brier_score"] = round(_brier(model_p, outcome), 4)
+            t["label_source"] = "station" if use_station else "grid"
             resolved += 1
 
             # Phase 0 fix: the calibrator is applied to raw_p at inference
@@ -337,16 +342,63 @@ class PaperTrader:
             if dd > max_dd:
                 max_dd = dd
 
-        # Go-live gate evaluation
+        # ── Re-live gate (Jul-8 redesign) ─────────────────────────────────────
+        # Counts ONLY station-labeled trades: evidence from the fixed system,
+        # scored on the thermometer Polymarket pays on. The skill test is the
+        # honest one — the model's Brier must beat the MARKET PRICE's Brier on
+        # the same trades (climatology is a strawman; edge means beating the
+        # crowd). Plus a calendar-span floor so one weather regime can't
+        # flatter the record.
+        station = [t for t in resolved if t.get("label_source") == "station"]
+        st_pnls, st_model_sq, st_market_sq, st_sizes = [], [], [], []
+        first_signal = last_signal = None
+        for t in station:
+            try:
+                outcome = float(t["actual_outcome"])
+                ep = float(t["entry_price"])
+                st_pnls.append(float(t["pnl_usd"]))
+                st_sizes.append(float(t["size_usd"]))
+                st_model_sq.append((float(t["model_p"]) - outcome) ** 2)
+                # The market's own forecast is the YES price at entry: for a NO
+                # trade entry_price bought the NO side, so P(YES) = 1 − entry.
+                market_p = ep if t.get("direction") == "YES" else 1.0 - ep
+                st_market_sq.append((market_p - outcome) ** 2)
+                sig = str(t.get("signal_time", ""))[:10]
+                if sig:
+                    first_signal = min(first_signal or sig, sig)
+                    last_signal = max(last_signal or sig, sig)
+            except (KeyError, ValueError, TypeError):
+                continue
+        n_station = len(st_pnls)
+        st_wins = sum(p for p in st_pnls if p > 0)
+        st_losses = sum(-p for p in st_pnls if p < 0)
+        st_pf = (st_wins / st_losses) if st_losses else (float("inf") if st_wins else 0.0)
+        st_model_brier = sum(st_model_sq) / n_station if n_station else _CLIMATOLOGY_BRIER
+        st_market_brier = sum(st_market_sq) / n_station if n_station else _CLIMATOLOGY_BRIER
+        days_elapsed = 0
+        if first_signal and last_signal:
+            from datetime import date as _date
+            days_elapsed = (_date.fromisoformat(last_signal) - _date.fromisoformat(first_signal)).days + 1
+        # station-subset drawdown (equity curve over station pnls)
+        st_capital = max(sum(st_sizes), 1.0)
+        eq = pk = st_dd = 0.0
+        for p in st_pnls:
+            eq += p
+            pk = max(pk, eq)
+            st_dd = max(st_dd, (pk - eq) / st_capital)
+
         failure_reasons = []
-        if n_resolved < MIN_RESOLVED_TRADES:
-            failure_reasons.append(f"need_{MIN_RESOLVED_TRADES}_resolved_have_{n_resolved}")
-        if profit_factor < MIN_PROFIT_FACTOR:
-            failure_reasons.append(f"profit_factor_{profit_factor:.2f}_below_{MIN_PROFIT_FACTOR}")
-        if bss < MIN_BRIER_SKILL_SCORE:
-            failure_reasons.append(f"bss_{bss:.3f}_below_{MIN_BRIER_SKILL_SCORE}")
-        if max_dd > MAX_PAPER_DRAWDOWN_PCT:
-            failure_reasons.append(f"drawdown_{max_dd:.1%}_above_{MAX_PAPER_DRAWDOWN_PCT:.0%}")
+        if n_station < GATE_MIN_STATION_RESOLVED:
+            failure_reasons.append(f"need_{GATE_MIN_STATION_RESOLVED}_station_resolved_have_{n_station}")
+        if days_elapsed < GATE_MIN_DAYS_ELAPSED:
+            failure_reasons.append(f"need_{GATE_MIN_DAYS_ELAPSED}_days_have_{days_elapsed}")
+        if st_pf < MIN_PROFIT_FACTOR:
+            failure_reasons.append(f"station_profit_factor_{st_pf:.2f}_below_{MIN_PROFIT_FACTOR}")
+        if st_model_brier >= st_market_brier:
+            failure_reasons.append(
+                f"model_brier_{st_model_brier:.4f}_not_below_market_{st_market_brier:.4f}")
+        if st_dd > MAX_PAPER_DRAWDOWN_PCT:
+            failure_reasons.append(f"station_drawdown_{st_dd:.1%}_above_{MAX_PAPER_DRAWDOWN_PCT:.0%}")
 
         return PaperTradingStats(
             total_trades=total,
@@ -360,6 +412,11 @@ class PaperTrader:
             max_drawdown_pct=round(max_dd, 4),
             ready_for_live=len(failure_reasons) == 0,
             failure_reasons=failure_reasons,
+            station_resolved=n_station,
+            station_profit_factor=round(st_pf, 3) if st_pf != float("inf") else st_pf,
+            station_model_brier=round(st_model_brier, 4),
+            station_market_brier=round(st_market_brier, 4),
+            days_elapsed=days_elapsed,
         )
 
     def print_dashboard(self) -> None:
@@ -368,12 +425,19 @@ class PaperTrader:
         print(f"  Total trades:      {stats.total_trades}")
         print(f"  Resolved:          {stats.resolved_trades}")
         print(f"  Win rate:          {stats.win_rate:.1%}")
-        print(f"  Profit factor:     {stats.profit_factor:.2f}  (need ≥ {MIN_PROFIT_FACTOR})")
-        print(f"  Brier Skill Score: {stats.brier_skill_score:+.3f}  (need ≥ {MIN_BRIER_SKILL_SCORE})")
+        print(f"  Profit factor:     {stats.profit_factor:.2f}")
+        print(f"  Brier Skill Score: {stats.brier_skill_score:+.3f}  (vs climatology; display only)")
         print(f"  Mean Brier:        {stats.mean_brier_score:.4f}  (0.25 = random)")
-        print(f"  Total paper PnL:   €{stats.total_paper_pnl:.2f}")
+        print(f"  Total paper PnL:   ${stats.total_paper_pnl:.2f}")
         print(f"  Avg edge:          {stats.avg_edge_pp:.1%}")
         print(f"  Max drawdown:      {stats.max_drawdown_pct:.1%}  (limit: {MAX_PAPER_DRAWDOWN_PCT:.0%})")
+        print()
+        print("  ── Re-live gate (station-labeled trades only) ──")
+        print(f"  Station resolved:  {stats.station_resolved}  (need ≥ {GATE_MIN_STATION_RESOLVED})")
+        print(f"  Days elapsed:      {stats.days_elapsed}  (need ≥ {GATE_MIN_DAYS_ELAPSED})")
+        print(f"  Station PF:        {stats.station_profit_factor:.2f}  (need ≥ {MIN_PROFIT_FACTOR})")
+        print(f"  Model vs market:   Brier {stats.station_model_brier:.4f} vs {stats.station_market_brier:.4f}"
+              f"  ({'model BEATS market' if stats.station_model_brier < stats.station_market_brier else 'model does NOT beat market'})")
         print()
         if stats.ready_for_live:
             print("  ✓ ALL GATES PASSED — ready for live trading")

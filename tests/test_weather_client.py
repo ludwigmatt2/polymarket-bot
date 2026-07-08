@@ -84,3 +84,34 @@ class TestRateLimitRetry:
         monkeypatch.setattr(wc_module.time, "sleep", lambda s: None)
         with pytest.raises(req.HTTPError):
             _get_with_retry("http://x", {}, 5)
+
+
+class TestControlMemberExtraction:
+    """Jul-8 fix: the control run arrives under the bare variable name and was
+    silently dropped by the 'member'-only filter."""
+
+    def test_control_member_included(self):
+        from datetime import date
+        from weather.weather_client import _extract_members
+        daily = {
+            "time": ["2026-07-08", "2026-07-09"],
+            "temperature_2m_max": [30.0, 31.0],                # control run
+            "temperature_2m_max_member01": [29.5, 30.5],
+            "temperature_2m_max_member02": [30.5, 31.5],
+            "temperature_2m_min_member01": [20.0, 21.0],       # other metric
+        }
+        members = _extract_members(daily, "temperature_2m_max", date(2026, 7, 8))
+        assert sorted(members) == [29.5, 30.0, 30.5]           # control included
+
+    def test_other_metric_control_not_leaked(self):
+        from datetime import date
+        from weather.weather_client import _extract_members
+        daily = {
+            "time": ["2026-07-08"],
+            "temperature_2m_max": [30.0],
+            "temperature_2m_min": [20.0],
+            "temperature_2m_min_member01": [19.0],
+        }
+        # temperature_2m_min starts with... itself only; max must not pick it up
+        assert _extract_members(daily, "temperature_2m_max", date(2026, 7, 8)) == [30.0]
+        assert sorted(_extract_members(daily, "temperature_2m_min", date(2026, 7, 8))) == [19.0, 20.0]

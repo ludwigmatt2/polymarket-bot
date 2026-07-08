@@ -116,9 +116,18 @@ MAX_SLIPPAGE = float(os.environ.get("MAX_SLIPPAGE", "0.03"))  # market-buy price
 MAX_DAY_EXPOSURE_PCT = 0.40
 
 # ── Go-live gates (all must pass before real money) ────────────────────────────
-MIN_RESOLVED_TRADES = 20
+MIN_RESOLVED_TRADES = 20        # legacy floor (overall record; display only)
 MIN_PROFIT_FACTOR = 1.5         # Gross wins / gross losses
-MIN_BRIER_SKILL_SCORE = 0.0     # Must beat climatology (BSS ≥ 0)
+MIN_BRIER_SKILL_SCORE = 0.0     # Must beat climatology (BSS ≥ 0) — display only
+# ── Re-live gate (Jul-8 redesign) ──────────────────────────────────────────────
+# Going live again requires evidence from the FIXED system only: trades resolved
+# on STATION truth (label_source == "station"), enough of them, spanning enough
+# calendar time that one weather regime can't flatter the record, profitable,
+# and — the honest skill test — the model's Brier must beat the MARKET PRICE's
+# Brier on the same trades (beating climatology is trivial; edge means beating
+# the crowd). The gate unlocks live order placement; flipping mode stays manual.
+GATE_MIN_STATION_RESOLVED = 150
+GATE_MIN_DAYS_ELAPSED = 21
 MAX_PAPER_DRAWDOWN_PCT = 0.20   # Max hypothetical drawdown allowed
 
 # ── Open-Meteo API ────────────────────────────────────────────────────────────

@@ -2329,6 +2329,27 @@ async def check_alerts(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         # Resolved trades alert — enhanced with wallet context
         res_new = _read_json_if_new(resolved_file, _seen_resolved_mtimes, uid)
         if res_new is not None:
+            # Re-live gate flip: announce ONCE when the station-truth gate goes
+            # green (going live stays a manual /mymode decision). Re-arms if the
+            # gate later drops back below threshold.
+            if uid == ADMIN_ID:
+                gate_ready = bool(res_new[0].get("gate_ready"))
+                if gate_ready and not ctx.bot_data.get("gate_was_ready"):
+                    ctx.bot_data["gate_was_ready"] = True
+                    try:
+                        await bot.send_message(
+                            ADMIN_ID,
+                            "🎉 *Re-live gate PASSED* — the station-truth record now "
+                            f"meets all criteria ({res_new[0].get('gate_station_resolved', '?')} "
+                            "station-resolved trades, PF, model-beats-market Brier, "
+                            "drawdown, time span).\n"
+                            "Going live stays manual: review /paperstats, then /mymode.",
+                            parse_mode="Markdown",
+                        )
+                    except Exception:
+                        pass
+                elif not gate_ready:
+                    ctx.bot_data.pop("gate_was_ready", None)
             resolved = res_new[0].get("resolved", [])
             if resolved:
                 batch_pnl = sum(float(t.get("pnl_usd") or 0) for t in resolved)
