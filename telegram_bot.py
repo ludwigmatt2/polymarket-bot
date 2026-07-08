@@ -991,7 +991,11 @@ def _scan_cooldown_remaining(uid: int) -> float:
 def _scan_args(mode: str) -> list[str]:
     """weather_bot.py CLI for a one-shot root run in `mode` (+ fan-out to all users).
     Both scan modes run one-shot; a *live* root scan is what actually places the
-    admin's live orders — paper never does. Resolve modes are already loop-free."""
+    admin's live orders — paper never does. Resolve modes are already loop-free.
+    The intraday loop is root-only (no fan-out): it re-evaluates the watchlist
+    into the root paper log, which is what the gate and stats read."""
+    if mode == "intraday":
+        return [PYTHON, "weather_bot.py", "--mode", "intraday"]
     args = [PYTHON, "weather_bot.py", "--mode", mode, "--all-users"]
     if mode in ("paper", "live"):
         args += ["--interval", "0"]
@@ -2665,6 +2669,42 @@ async def _daily_digest(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             pass
 
 
+async def _intraday_scan(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """I1: 15-min watchlist re-scan (event-day station markets, fresh obs +
+    executable quotes). Quiet by design — it notifies only when it actually
+    trades; systemic failures alert once per error per day like the full scan."""
+    stdout, stderr, rc = await run_bot_async("intraday", ADMIN_ID)
+    if rc == -2:
+        return  # a scan/resolve holds the lock — this tick is expendable
+    if rc != 0:
+        err = (stderr or stdout)[-300:].strip()
+        sig = (err, datetime.now(timezone.utc).date().isoformat())
+        if ctx.bot_data.get("last_intraday_fail") != sig:
+            ctx.bot_data["last_intraday_fail"] = sig
+            try:
+                await ctx.bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ Intraday loop failed (repeats muted until this changes)\n"
+                    f"```\n{err}\n```",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+        return
+    ctx.bot_data.pop("last_intraday_fail", None)
+    trades = [ln.strip() for ln in (stdout or "").splitlines() if "NEW INTRADAY TRADE" in ln]
+    if trades:
+        body = "\n".join(f"`{t.replace('NEW INTRADAY TRADE: ', '')[:100]}`" for t in trades[:5])
+        try:
+            await ctx.bot.send_message(
+                ADMIN_ID,
+                f"⚡ *Intraday tape trade(s)* — {len(trades)}\n{body}",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+
+
 async def _auto_resolve(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Scheduled job: auto-resolve pending trades. Runs every AUTO_RESOLVE_INTERVAL seconds."""
     stdout, stderr, rc = await run_bot_async("auto-resolve", ADMIN_ID)
@@ -2770,6 +2810,14 @@ async def _run() -> None:
             app.job_queue.run_repeating(_auto_scan,    interval=scan_interval,    first=300)
         if resolve_interval > 0:
             app.job_queue.run_repeating(_auto_resolve, interval=resolve_interval, first=600)
+
+        # I1: intraday event-day loop — re-evaluates the watchlist with fresh
+        # obs + executable quotes between full scans. Set 0 to disable.
+        from weather.config import INTRADAY_SCAN_INTERVAL_S
+        intraday_interval = int(os.environ.get("INTRADAY_SCAN_INTERVAL",
+                                               str(INTRADAY_SCAN_INTERVAL_S)))
+        if intraday_interval > 0:
+            app.job_queue.run_repeating(_intraday_scan, interval=intraday_interval, first=420)
 
         # Daily morning digest DM'd to each active user (default 06:00 UTC ≈ 08:00
         # Munich). Set DIGEST_HOUR_UTC=-1 to disable.

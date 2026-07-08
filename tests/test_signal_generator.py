@@ -204,7 +204,12 @@ class TestQualityGates:
         assert signal.quality_gate_passed is False
         assert "gate1_too_early" in signal.rejection_reason
 
-    def test_rejects_too_late_to_resolution(self):
+    def test_rejects_too_late_to_resolution(self, monkeypatch):
+        # Feed down → no tape info → the too-late cut must hold (blind late
+        # entry is pure adverse selection). With an observation it now passes —
+        # covered by TestEventDayEntryWindow.
+        from weather import station_obs
+        monkeypatch.setattr(station_obs, "running_extreme_c", lambda *a: None)
         gen = _make_generator(model_p=0.80)
         market = WeatherMarket(
             market_id="test_mkt",
@@ -456,3 +461,30 @@ class TestRunningObsWiring:
         gen = _make_generator(model_p=0.10)
         gen.evaluate(self._event_day_market().__class__ and _make_market(yes_price=0.60, station_icao=""))
         assert not called
+
+
+class TestEventDayEntryWindow:
+    """Gate 1's too-late cut is bypassed exactly when a live running extreme is
+    in hand — the tape-informed window, not a blind one."""
+
+    def _late_market(self):
+        from datetime import datetime, timedelta, timezone
+        m = _make_market(yes_price=0.60)
+        m.resolution_date = datetime.now(timezone.utc) + timedelta(minutes=1)  # < 4h
+        return m
+
+    def test_late_entry_allowed_with_observation(self, monkeypatch):
+        from weather import station_obs
+        monkeypatch.setattr(station_obs, "running_extreme_c", lambda *a: 33.0)
+        gen = _make_generator(model_p=0.10)
+        sig = gen.evaluate(self._late_market())
+        assert sig.quality_gate_passed is True
+        assert sig.running_obs_c == pytest.approx(33.0)
+
+    def test_late_entry_blocked_when_feed_down(self, monkeypatch):
+        from weather import station_obs
+        monkeypatch.setattr(station_obs, "running_extreme_c", lambda *a: None)
+        gen = _make_generator(model_p=0.10)
+        sig = gen.evaluate(self._late_market())
+        assert sig.quality_gate_passed is False
+        assert "gate1_too_late" in sig.rejection_reason

@@ -73,6 +73,23 @@ def run_scan(
         print("  No tradeable weather markets found. Check logs/unparseable_markets.csv")
         return []
 
+    # Hand event-day station markets to the intraday loop (I1): between hourly
+    # scans, only the tape and the books change — the 15-min loop re-evaluates
+    # just these with fresh obs/quotes instead of re-scanning Gamma.
+    try:
+        from weather import station_obs
+        from weather.watchlist import save_watchlist
+        eventday = [m for m in markets
+                    if m.station_icao
+                    and m.metric in ("temperature_2m_max", "temperature_2m_min")
+                    and m.forecast_start_date is None
+                    and station_obs.is_event_day(m.resolution_date, m.location.timezone)]
+        n_watch = save_watchlist(eventday, log_dir / "intraday_watchlist.json")
+        if n_watch:
+            print(f"  [watchlist] {n_watch} event-day market(s) handed to intraday loop")
+    except Exception as e:  # noqa: BLE001 — watchlist is an enhancement
+        print(f"  [watchlist] write failed: {e}", file=sys.stderr)
+
     print(f"  [2/3] Evaluating {len(markets)} markets...", end=" ", flush=True)
     signals = [generator.evaluate(m) for m in markets]
     actionable = [s for s in signals if s.quality_gate_passed]
@@ -396,6 +413,44 @@ def _write_resolved_file(paper: "PaperTrader", resolved_count: int, log_dir: Pat
     }))
 
 
+def mode_intraday(scanner, generator, log_dir: Path = DEFAULT_LOG_DIR) -> None:
+    """I1: re-evaluate the watchlist (event-day station markets from the last
+    full scan) with fresh observations and fresh executable book quotes. Paper
+    only — the live path gets wired at the re-live decision. Trades logged with
+    scan_source='intraday' so the loop's PnL contribution is separable."""
+    from weather import station_obs
+    from weather.config import WATCHLIST_MAX_AGE_S
+    from weather.watchlist import load_watchlist, refresh_from_books
+
+    markets, age = load_watchlist(log_dir / "intraday_watchlist.json")
+    if not markets:
+        print("  [intraday] watchlist empty — nothing to do")
+        return
+    if age > WATCHLIST_MAX_AGE_S:
+        print(f"  [intraday] watchlist stale ({age:.0f}s) — waiting for next full scan")
+        return
+
+    paper = PaperTrader(log_path=log_dir / "paper_trades.csv")
+    checked = traded = 0
+    for wm in markets:
+        # crossed local midnight since the full scan → no longer the event day
+        if not station_obs.is_event_day(wm.resolution_date, wm.location.timezone):
+            continue
+        try:
+            if not refresh_from_books(scanner, wm):
+                continue  # books unusable this tick — never price off stale quotes
+        except Exception:  # noqa: BLE001 — one bad book must not kill the tick
+            continue
+        checked += 1
+        sig = generator.evaluate(wm)
+        if sig.quality_gate_passed and paper.log_trade(sig, scan_source="intraday"):
+            traded += 1
+            obs = f"{sig.running_obs_c:.1f}C" if sig.running_obs_c is not None else "-"
+            print(f"  NEW INTRADAY TRADE: {sig.direction} {wm.title[:60]} "
+                  f"@ {sig.entry_price:.3f} edge={sig.edge_pp:.3f} obs={obs}")
+    print(f"  [intraday] {len(markets)} watched · {checked} evaluated · {traded} new trade(s)")
+
+
 def _print_scan_summary(signals: list[Signal], actionable: list[Signal], rejected: list[Signal]) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"\n[{ts}] {len(signals)} evaluated  |  {len(actionable)} actionable  |  {len(rejected)} rejected")
@@ -716,7 +771,7 @@ def mode_resolve(paper: PaperTrader) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Weather model arbitrage bot")
-    parser.add_argument("--mode", choices=["scan", "paper", "live", "stats", "resolve", "auto-resolve", "backfill-calibration", "debug", "backtest", "backtest-temp", "backtest-live", "arb"],
+    parser.add_argument("--mode", choices=["scan", "paper", "live", "intraday", "stats", "resolve", "auto-resolve", "backfill-calibration", "debug", "backtest", "backtest-temp", "backtest-live", "arb"],
                         default="paper", help="Operating mode (default: paper)")
     parser.add_argument("--interval", type=int, default=3600,
                         help="Re-scan interval in seconds for paper/live mode (default: 3600)")
@@ -845,6 +900,10 @@ def main() -> None:
 
     if args.mode == "scan":
         run_scan(scanner, generator, paper=None, log_dir=log_dir, monitor=monitor)
+        return
+
+    if args.mode == "intraday":
+        mode_intraday(scanner, generator, log_dir)
         return
 
     live_trader = None

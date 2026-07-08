@@ -63,6 +63,15 @@ MAX_BOOK_SPREAD = 0.04
 # protects (never fade a market watching a live feed we didn't have — the
 # adverse-selection channel Gate 9.5 crudely approximates).
 RUNNING_OBS_ENABLED = True
+
+# ── Intraday event-day loop (I1) ───────────────────────────────────────────────
+# Between hourly full scans, re-evaluate ONLY the event-day station markets
+# (handed over via the watchlist file) with fresh observations and fresh
+# executable book quotes. This is where the running-max clip earns: the tape
+# decides buckets intraday and an hourly sample misses most of the reprice
+# window. A stale watchlist (no full scan for 2h) stands the loop down.
+INTRADAY_SCAN_INTERVAL_S = 900
+WATCHLIST_MAX_AGE_S = 7200
 MIN_MARKET_PRICE = 0.03         # Avoid illiquid extremes
 MAX_MARKET_PRICE = 0.97
 # Gate 9.5: skip "equal" direction markets where crowd is this confident —

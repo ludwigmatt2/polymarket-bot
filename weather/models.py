@@ -175,6 +175,8 @@ class PaperTrade:
     # Running-extreme clip: the observed station max/min (°C) applied at signal
     # time, "" /None when the feature stood down — separates its PnL contribution.
     running_obs_c: float | None = None
+    # Which loop produced the trade ("hourly" full scan / "intraday" watchlist).
+    scan_source: str = "hourly"
     # Phase 0: persist the calibrator input (raw_p) and per-model breakdown so the
     # calibrator trains on the same scale it is applied to, and so per-model skill
     # (Phase 4) can be scored from history. raw_p is pre-calibration, pre-shrinkage.
