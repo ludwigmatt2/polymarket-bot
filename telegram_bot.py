@@ -2534,15 +2534,24 @@ async def _auto_scan(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if rc == -2:
         return  # a scan/resolve was already running — skip silently
     if rc != 0:
-        try:
-            await ctx.bot.send_message(
-                ADMIN_ID,
-                f"⚠️ Auto-scan failed\n```\n{(stderr or stdout)[-300:].strip()}\n```",
-                parse_mode="Markdown",
-            )
-        except Exception:
-            pass
+        # De-spam: the go-live gate is re-checked every scheduled scan, so a
+        # persistent gate failure (e.g. PF sitting under 1.5 after the Jul-7
+        # relabel) would otherwise alert every hour, all day. Alert once per
+        # distinct error per day; a NEW error (or the next day) always alerts.
+        err = (stderr or stdout)[-300:].strip()
+        sig = (err, datetime.now(timezone.utc).date().isoformat())
+        if ctx.bot_data.get("last_scan_fail") != sig:
+            ctx.bot_data["last_scan_fail"] = sig
+            try:
+                await ctx.bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ Auto-scan failed (repeats muted until this changes)\n```\n{err}\n```",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
         return
+    ctx.bot_data.pop("last_scan_fail", None)  # recovered → re-arm alerting
 
     # Success → heartbeat summary so every scheduled scan is visible, even quiet ones.
     new_trades = max(0, _count_trades(ADMIN_ID) - before)
