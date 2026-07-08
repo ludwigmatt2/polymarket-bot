@@ -243,9 +243,19 @@ class WeatherMarketScanner:
         for wm in tradeable:
             summary = self._fetch_book_summary(wm.yes_token_id)
             wm.book_depth_usd = summary.get("depth_usd", 0.0)
+            wm.yes_best_ask = summary.get("best_ask", 0.0)
+            wm.yes_best_bid = summary.get("best_bid", 0.0)
             for attr in ("tick_size", "min_order_size", "neg_risk"):
                 if attr in summary:
                     setattr(wm, attr, summary[attr])
+            # The bot's signals are overwhelmingly NO-side, which consumes asks on
+            # the NO token — a book Gate 5 never saw (it validated YES-ask depth
+            # the bot doesn't touch; Jul-7 audit). Fetch the NO book too so depth
+            # and spread are checked on the side actually traded.
+            no_summary = self._fetch_book_summary(wm.no_token_id)
+            wm.no_book_depth_usd = no_summary.get("depth_usd", 0.0)
+            wm.no_best_ask = no_summary.get("best_ask", 0.0)
+            wm.no_best_bid = no_summary.get("best_bid", 0.0)
         print(f"    tradeable after filters: {len(tradeable)} / {len(parsed)}")
         self.last_funnel = {
             "fetched": len(raw_markets),
@@ -532,8 +542,14 @@ class WeatherMarketScanner:
                 self._clob_client = ClobClient(host="https://clob.polymarket.com", chain_id=137)
             ob = self._clob_client.get_order_book(yes_token_id)
             asks = ob.get("asks", [])
+            bids = ob.get("bids", [])
             depth_usd = sum(float(a["price"]) * float(a["size"]) for a in asks) if asks else 0.0
             summary: dict = {"depth_usd": depth_usd}
+            # Best quotes for the spread gate and executable-price edge checks.
+            if asks:
+                summary["best_ask"] = min(float(a["price"]) for a in asks)
+            if bids:
+                summary["best_bid"] = max(float(b["price"]) for b in bids)
             # Keep the book's tick only if it's one the order builder accepts,
             # else let the Gamma-derived value stand.
             tick = _normalize_tick(ob.get("tick_size"))
