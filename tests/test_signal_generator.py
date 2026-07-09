@@ -490,3 +490,14 @@ class TestEventDayEntryWindow:
         sig = gen.evaluate(self._late_market())
         assert sig.quality_gate_passed is False
         assert "gate1_too_late" in sig.rejection_reason
+
+
+class TestPrecipBlocked:
+    def test_precipitation_market_rejected(self):
+        gen = _make_generator(model_p=0.10)
+        m = _make_market(yes_price=0.60)
+        m.metric = "precipitation_sum"
+        m.station_icao = "KMIA"  # even WITH a station tag: no precip truth path
+        sig = gen.evaluate(m)
+        assert sig.quality_gate_passed is False
+        assert "gate0.5_no_station_truth" in sig.rejection_reason
