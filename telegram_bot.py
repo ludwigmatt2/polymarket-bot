@@ -1002,11 +1002,29 @@ def _scan_args(mode: str) -> list[str]:
     return args
 
 
-async def run_bot_async(mode: str, uid: int) -> tuple[str, str, int]:
-    """Run weather_bot.py globally: root scan/resolve + fan-out to all users."""
-    if _bot_run_lock.locked():
+# Subprocess kill timeouts per mode. Full scans grew past the old 300s ceiling
+# when the event-day window widened the universe (~420 tradeable markets, two
+# book fetches each, M1 hourly fetches) — every hourly scan was killed
+# mid-evaluation for a day before anyone noticed (watchlist written, signals
+# never). Intraday stays tight: its whole point is a small, fast tick.
+_MODE_TIMEOUTS = {"live": 900, "paper": 900, "scan": 900, "intraday": 300}
+
+
+async def run_bot_async(mode: str, uid: int, wait: bool = False) -> tuple[str, str, int]:
+    """Run weather_bot.py globally: root scan/resolve + fan-out to all users.
+
+    wait=False (scans/ticks): skip if something else holds the lock — piling
+    up scans is worse than missing a tick. wait=True (auto-resolve): BLOCK for
+    the lock. Resolution must never starve — with hourly scans and 15-min
+    intraday ticks sharing the lock, skip-on-busy left trades unresolved for a
+    day (rc=-2 is silent by design)."""
+    try:
+        # non-wait callers get a near-immediate acquire-or-skip (the tiny timeout
+        # closes the check-then-acquire race); resolve waits out congestion.
+        await asyncio.wait_for(_bot_run_lock.acquire(), timeout=1200 if wait else 0.1)
+    except asyncio.TimeoutError:
         return "", "A scan or resolve is already running — try again in a minute.", -2
-    async with _bot_run_lock:
+    try:
         args = _scan_args(mode)
         proc = await asyncio.create_subprocess_exec(
             *args,
@@ -1015,15 +1033,15 @@ async def run_bot_async(mode: str, uid: int) -> tuple[str, str, int]:
             cwd=ROOT,
             env=os.environ.copy(),
         )
-        # Live scans add per-order placement + fill polling on top of the ~2-3 min
-        # market scan, so give them more headroom before the kill.
-        timeout = 600 if mode == "live" else 300
+        timeout = _MODE_TIMEOUTS.get(mode, 300)
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
             proc.kill()
             return "", f"Timed out after {timeout}s.", -1
         return stdout.decode(), stderr.decode(), proc.returncode or 0
+    finally:
+        _bot_run_lock.release()
 
 
 # ── Command handlers ───────────────────────────────────────────────────────────
@@ -2707,7 +2725,7 @@ async def _intraday_scan(ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _auto_resolve(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Scheduled job: auto-resolve pending trades. Runs every AUTO_RESOLVE_INTERVAL seconds."""
-    stdout, stderr, rc = await run_bot_async("auto-resolve", ADMIN_ID)
+    stdout, stderr, rc = await run_bot_async("auto-resolve", ADMIN_ID, wait=True)
     # claim_winnings() never raises, so a failed redemption leaves rc=0 — scan the
     # output for the skip marker so a silently-stuck claim still alerts the owner.
     claim_failed = "claim skipped (" in (stdout or "") + (stderr or "")

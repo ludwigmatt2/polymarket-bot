@@ -423,8 +423,10 @@ class TestRunningObsWiring:
     def _event_day_market(self, days_out=0):
         from datetime import datetime, timedelta, timezone
         m = _make_market(yes_price=0.60)
-        # resolution deadline later today (station-local "now" is the event day)
-        m.resolution_date = datetime.now(timezone.utc) + timedelta(hours=6)
+        # +1 minute: the same instant is trivially the same LOCAL date at the
+        # station — (+6h landed on tomorrow when the suite ran in the US
+        # evening, a time-of-day flake).
+        m.resolution_date = datetime.now(timezone.utc) + timedelta(minutes=1)
         return m
 
     def test_observation_fetched_and_passed_on_event_day(self, monkeypatch):
