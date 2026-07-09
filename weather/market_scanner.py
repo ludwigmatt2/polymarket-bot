@@ -14,6 +14,7 @@ import csv
 import json
 import logging
 import re
+import time as _time
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
@@ -238,26 +239,21 @@ class WeatherMarketScanner:
                 }], _ALARM_FIELDS)
 
         tradeable = self._filter_tradeable(parsed)
-        # Fetch the live CLOB order book only for markets that survived all other
-        # filters. Beyond depth, the book carries the authoritative tick_size,
-        # min_order_size and neg_risk — prefer them over the Gamma-derived values.
-        for wm in tradeable:
-            summary = self._fetch_book_summary(wm.yes_token_id)
-            wm.book_depth_usd = summary.get("depth_usd", 0.0)
-            wm.yes_best_ask = summary.get("best_ask", 0.0)
-            wm.yes_best_bid = summary.get("best_bid", 0.0)
-            for attr in ("tick_size", "min_order_size", "neg_risk"):
-                if attr in summary:
-                    setattr(wm, attr, summary[attr])
-            # The bot's signals are overwhelmingly NO-side, which consumes asks on
-            # the NO token — a book Gate 5 never saw (it validated YES-ask depth
-            # the bot doesn't touch; Jul-7 audit). Fetch the NO book too so depth
-            # and spread are checked on the side actually traded.
-            no_summary = self._fetch_book_summary(wm.no_token_id)
-            wm.no_book_depth_usd = no_summary.get("depth_usd", 0.0)
-            wm.no_best_ask = no_summary.get("best_ask", 0.0)
-            wm.no_best_bid = no_summary.get("best_bid", 0.0)
-        print(f"    tradeable after filters: {len(tradeable)} / {len(parsed)}")
+        # Fetch live CLOB books only for NEAR-TERM markets (entry ≤48h out or the
+        # kept past-endDate event-day ones) — that's where entries actually happen
+        # and where Gates 5/5.5 need executable quotes. Far-dated ladders keep the
+        # volume fallback; fetching 2 books × 420 markets sequentially took the
+        # hourly scan past its kill-timeout (Jul-9 outage). Fetches run on a small
+        # thread pool: the public book endpoint tolerates it and the scan is
+        # otherwise pure serial network wait.
+        t0 = _time.monotonic()
+        now = datetime.now(timezone.utc)
+        near = [wm for wm in tradeable
+                if (wm.resolution_date.replace(tzinfo=wm.resolution_date.tzinfo or timezone.utc)
+                    - now).total_seconds() < 48 * 3600]
+        self._fetch_books_bulk(near)
+        print(f"    tradeable after filters: {len(tradeable)} / {len(parsed)} "
+              f"(books: {len(near)} near-term markets in {_time.monotonic() - t0:.0f}s)")
         self.last_funnel = {
             "fetched": len(raw_markets),
             "parsed": len(parsed),
@@ -525,7 +521,40 @@ class WeatherMarketScanner:
 
         return True
 
-    def _fetch_book_summary(self, yes_token_id: str) -> dict:
+    def _fetch_books_bulk(self, markets: list[WeatherMarket], max_workers: int = 8) -> None:
+        """Populate both sides' book fields for `markets` concurrently. Each
+        worker thread holds its own ClobClient (requests sessions aren't
+        thread-safe); one failed book leaves that market's fields at their
+        defaults — same degradation as the old sequential path."""
+        import concurrent.futures
+        import threading
+
+        tl = threading.local()
+
+        def _client():
+            if getattr(tl, "clob", None) is None:
+                from py_clob_client_v2 import ClobClient
+                tl.clob = ClobClient(host="https://clob.polymarket.com", chain_id=137)
+            return tl.clob
+
+        def _one(wm: WeatherMarket) -> None:
+            summary = self._fetch_book_summary(wm.yes_token_id, _client())
+            wm.book_depth_usd = summary.get("depth_usd", 0.0)
+            wm.yes_best_ask = summary.get("best_ask", 0.0)
+            wm.yes_best_bid = summary.get("best_bid", 0.0)
+            for attr in ("tick_size", "min_order_size", "neg_risk"):
+                if attr in summary:
+                    setattr(wm, attr, summary[attr])
+            # NO-side book: the side the bot's (overwhelmingly NO) orders consume.
+            no_summary = self._fetch_book_summary(wm.no_token_id, _client())
+            wm.no_book_depth_usd = no_summary.get("depth_usd", 0.0)
+            wm.no_best_ask = no_summary.get("best_ask", 0.0)
+            wm.no_best_bid = no_summary.get("best_bid", 0.0)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            list(ex.map(_one, markets))
+
+    def _fetch_book_summary(self, yes_token_id: str, client=None) -> dict:
         """B4: Fetch the live CLOB order book for the YES outcome and extract the
         order-placement constraints the API hands us authoritatively.
 
@@ -538,10 +567,12 @@ class WeatherMarketScanner:
         if not yes_token_id:
             return {}
         try:
-            if self._clob_client is None:
-                from py_clob_client_v2 import ClobClient
-                self._clob_client = ClobClient(host="https://clob.polymarket.com", chain_id=137)
-            ob = self._clob_client.get_order_book(yes_token_id)
+            if client is None:
+                if self._clob_client is None:
+                    from py_clob_client_v2 import ClobClient
+                    self._clob_client = ClobClient(host="https://clob.polymarket.com", chain_id=137)
+                client = self._clob_client
+            ob = client.get_order_book(yes_token_id)
             asks = ob.get("asks", [])
             bids = ob.get("bids", [])
             depth_usd = sum(float(a["price"]) * float(a["size"]) for a in asks) if asks else 0.0
