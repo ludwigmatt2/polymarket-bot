@@ -137,6 +137,8 @@ class Signal:
     # Station's running max/min (°C) used to clip members when scanned on the
     # event day; None when the feature stood down. Logged for PnL attribution.
     running_obs_c: float | None = None
+    # M1: True when members were rest-of-day extremes (hourly), not full-day.
+    restofday: bool = False
 
     @property
     def entry_price(self) -> float:
@@ -177,6 +179,16 @@ class PaperTrade:
     running_obs_c: float | None = None
     # Which loop produced the trade ("hourly" full scan / "intraday" watchlist).
     scan_source: str = "hourly"
+    # M1: 1 when the signal priced rest-of-day hourly members instead of
+    # full-day daily members (only possible with a live observation in hand).
+    restofday: int = 0
+    # X1 exit simulation — filled by the intraday loop when the exit rule fires
+    # (bid ≥ model value + margin). SIMULATION ONLY: pnl_usd stays the
+    # hold-to-resolution truth; exit_pnl_usd is the counterfactual stream.
+    exit_time: datetime | None = None
+    exit_price: float | None = None
+    exit_pnl_usd: float | None = None
+    exit_reason: str = ""
     # Phase 0: persist the calibrator input (raw_p) and per-model breakdown so the
     # calibrator trains on the same scale it is applied to, and so per-model skill
     # (Phase 4) can be scored from history. raw_p is pre-calibration, pre-shrinkage.
@@ -232,3 +244,7 @@ class PaperTradingStats:
     station_model_brier: float = 0.25   # model's Brier on station trades
     station_market_brier: float = 0.25  # the MARKET PRICE's Brier on the same trades
     days_elapsed: int = 0               # calendar span of station-labeled record
+    # X1: the counterfactual with-exits PnL over the SAME resolved trades
+    # (exit_pnl_usd where an exit fired, else pnl_usd) vs hold-to-resolution.
+    exit_sim_pnl: float = 0.0
+    exit_sim_count: int = 0             # resolved trades that had a simulated exit

@@ -11,7 +11,7 @@ from __future__ import annotations
 import calendar
 import logging
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -245,6 +245,83 @@ class WeatherClient:
         )
         # Cache only usable results — a transient failure should be retried by
         # the next market in the block, not pinned for the TTL.
+        if member_arrays:
+            self._forecast_cache[cache_key] = (time.monotonic(), forecast)
+        return forecast
+
+    def get_restofday_ensemble(
+        self,
+        location: Location,
+        target_date: date,
+        metric: str,
+        models: list[str] | None = None,
+    ) -> EnsembleForecast:
+        """M1: per-member REST-OF-DAY extreme for the event day.
+
+        On the event day a full-day daily member overstates what's still
+        achievable when the morning underperformed its forecast — part of that
+        member's max is already history. This fetches the HOURLY ensemble and
+        reduces each member over the REMAINING local hours only (current hour
+        included: it is still accumulating). Combined with the running-extreme
+        clip downstream (final = max(observed, rest-of-day)) the distribution
+        becomes exact instead of an approximation.
+
+        Returns an EnsembleForecast whose members are rest-of-day extremes;
+        empty member_arrays when the fetch fails or no hours remain — callers
+        must fall back to the daily forecast. model_means is left empty: the
+        live path derives spread from per-model probabilities, not means.
+        Cached per UTC-hour (the remaining-hours window moves)."""
+        models = models or ENSEMBLE_MODELS
+        if metric not in ("temperature_2m_max", "temperature_2m_min"):
+            raise ValueError(f"rest-of-day only supports temperature extremes, got '{metric}'")
+        reducer = max if metric.endswith("max") else min
+
+        try:
+            tz = ZoneInfo(location.timezone)
+        except Exception:  # noqa: BLE001
+            tz = timezone.utc
+        now_local = datetime.now(tz)
+        empty = EnsembleForecast(lat=location.lat, lon=location.lon,
+                                 target_date=target_date, metric=metric,
+                                 member_arrays={}, model_means={},
+                                 fetched_at=datetime.utcnow())
+        if now_local.date() != target_date:
+            return empty  # not the event day at the station — caller misuse
+        cutoff_naive = now_local.replace(minute=0, second=0, microsecond=0, tzinfo=None)
+
+        cache_key = ("restofday", location.lat, location.lon, target_date, metric,
+                     tuple(models), datetime.utcnow().strftime("%Y%m%dT%H"))
+        cached = self._forecast_cache.get(cache_key)
+        if cached is not None and time.monotonic() - cached[0] < self.FORECAST_CACHE_TTL_S:
+            return cached[1]
+
+        member_arrays: dict[str, list[float]] = {}
+        for model in models:
+            try:
+                params = {
+                    "latitude": location.lat,
+                    "longitude": location.lon,
+                    "models": model,
+                    "hourly": "temperature_2m",
+                    "start_date": target_date.isoformat(),
+                    "end_date": target_date.isoformat(),
+                    "timezone": location.timezone,
+                }
+                r = _get_with_retry(OPEN_METEO_ENSEMBLE_URL, params, OPEN_METEO_REQUEST_TIMEOUT)
+                members = _restofday_members(r.json().get("hourly", {}), reducer, cutoff_naive)
+                if members:
+                    member_arrays[model] = members
+            except Exception as exc:  # noqa: BLE001 — degrade to remaining models
+                _log.warning("Rest-of-day fetch failed: %s %s %s: %s",
+                             location.city, target_date, model, exc)
+                continue
+
+        forecast = EnsembleForecast(
+            lat=location.lat, lon=location.lon,
+            target_date=target_date, metric=metric,
+            member_arrays=member_arrays, model_means={},
+            fetched_at=datetime.utcnow(),
+        )
         if member_arrays:
             self._forecast_cache[cache_key] = (time.monotonic(), forecast)
         return forecast
@@ -536,6 +613,29 @@ def _find_time_index(daily: dict, target_date: date) -> int | None:
     times = daily.get("time", [])
     target_str = target_date.isoformat()
     return times.index(target_str) if target_str in times else None
+
+
+def _restofday_members(hourly: dict, reducer, cutoff_naive: datetime) -> list[float]:
+    """Per-member extreme over the REMAINING local hours of the event day.
+    `hourly` is an Open-Meteo hourly block (times are naive LOCAL strings when
+    the request carries a timezone); the control run arrives under the bare
+    'temperature_2m' key, members under '_memberNN' suffixes. Members with no
+    valid remaining values are dropped; [] when no hours remain (late night)."""
+    times = hourly.get("time", [])
+    idx = [i for i, t in enumerate(times)
+           if datetime.fromisoformat(t) >= cutoff_naive]
+    if not idx:
+        return []
+    members: list[float] = []
+    for key, values in hourly.items():
+        if key == "time" or not key.startswith("temperature_2m"):
+            continue
+        if key != "temperature_2m" and "member" not in key:
+            continue
+        vals = [values[i] for i in idx if i < len(values) and values[i] is not None]
+        if vals:
+            members.append(float(reducer(vals)))
+    return members
 
 
 def _extract_members(daily: dict, metric: str, target_date: date) -> list[float]:

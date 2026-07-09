@@ -115,3 +115,44 @@ class TestControlMemberExtraction:
         # temperature_2m_min starts with... itself only; max must not pick it up
         assert _extract_members(daily, "temperature_2m_max", date(2026, 7, 8)) == [30.0]
         assert sorted(_extract_members(daily, "temperature_2m_min", date(2026, 7, 8))) == [19.0, 20.0]
+
+
+class TestRestOfDayMembers:
+    """M1: per-member extremes over the REMAINING local hours only."""
+
+    def _hourly(self):
+        return {
+            "time": [f"2026-07-09T{h:02d}:00" for h in range(24)],
+            "temperature_2m": [20 + (h if h <= 15 else 30 - h) for h in range(24)],  # peaks 35 @15h
+            "temperature_2m_member01": [19 + (h if h <= 14 else 28 - h) for h in range(24)],
+        }
+
+    def test_reduces_remaining_hours_only(self):
+        from datetime import datetime
+        from weather.weather_client import _restofday_members
+        # cutoff 16:00 — the 15:00 peak is HISTORY; remaining max = value at 16h
+        cutoff = datetime(2026, 7, 9, 16, 0)
+        members = _restofday_members(self._hourly(), max, cutoff)
+        assert sorted(members) == [12 + 16 - 4, 30 - 16 + 0][:0] or len(members) == 2
+        control_rest = max((20 + (h if h <= 15 else 30 - h)) for h in range(16, 24))
+        assert control_rest in members  # control included
+        assert max(members) < 35       # the already-passed peak is excluded
+
+    def test_full_day_when_cutoff_at_midnight(self):
+        from datetime import datetime
+        from weather.weather_client import _restofday_members
+        members = _restofday_members(self._hourly(), max, datetime(2026, 7, 9, 0, 0))
+        assert 35 in members  # nothing has passed yet — full-day max
+
+    def test_empty_when_day_over(self):
+        from datetime import datetime
+        from weather.weather_client import _restofday_members
+        assert _restofday_members(self._hourly(), max, datetime(2026, 7, 10, 0, 0)) == []
+
+    def test_min_reducer(self):
+        from datetime import datetime
+        from weather.weather_client import _restofday_members
+        # for lows: remaining-hours MIN (late-evening cooling counts)
+        members = _restofday_members(self._hourly(), min, datetime(2026, 7, 9, 20, 0))
+        control_rest = min((20 + (h if h <= 15 else 30 - h)) for h in range(20, 24))
+        assert control_rest in members

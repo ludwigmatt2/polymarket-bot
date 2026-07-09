@@ -54,6 +54,10 @@ CSV_HEADERS = [
     # Which loop produced the trade: "hourly" (full scan) or "intraday" (I1
     # watchlist re-scan) — separates the intraday loop's PnL contribution.
     "scan_source",
+    # M1: 1 = signal priced rest-of-day hourly members instead of full-day.
+    "restofday",
+    # X1 exit simulation (counterfactual only — pnl_usd stays hold-to-resolution):
+    "exit_time", "exit_price", "exit_pnl_usd", "exit_reason",
 ]
 
 # Brier score for an uninformed 50/50 forecast (climatology baseline)
@@ -117,6 +121,7 @@ class PaperTrader:
             station_country=signal.market.station_country,
             running_obs_c=getattr(signal, "running_obs_c", None),
             scan_source=scan_source,
+            restofday=int(getattr(signal, "restofday", False)),
             resolve_unit=signal.market.resolve_unit,
         )
         self._append_trade(trade)
@@ -307,6 +312,44 @@ class PaperTrader:
 
         return resolved, skipped
 
+    def apply_exit_sims(self, exits: list[dict]) -> int:
+        """X1: record simulated exits on OPEN trades, once per trade. Each entry:
+        {market_id, direction, bid, p_win_now, reason}. Exit proceeds are marked
+        at the live bid (shares × bid); pnl_usd stays untouched — the exit stream
+        is a counterfactual, evaluated against hold-to-resolution when the trade
+        eventually settles. Returns the number of exits recorded."""
+        if not exits:
+            return 0
+        by_key = {(e["market_id"], e["direction"]): e for e in exits}
+        trades = self._load_all()
+        applied = 0
+        now_iso = datetime.now(timezone.utc).isoformat()
+        for t in trades:
+            key = (t.get("market_id"), t.get("direction"))
+            if key not in by_key:
+                continue
+            if t.get("actual_outcome") not in (None, "", "None"):
+                continue  # already resolved — nothing to exit
+            if t.get("exit_price") not in (None, ""):
+                continue  # one exit per trade
+            e = by_key[key]
+            try:
+                entry = float(t["entry_price"])
+                size = float(t["size_usd"])
+            except (KeyError, ValueError):
+                continue
+            if not (0.0 < entry < 1.0):
+                continue
+            shares = size / entry
+            t["exit_time"] = now_iso
+            t["exit_price"] = round(float(e["bid"]), 4)
+            t["exit_pnl_usd"] = round(shares * float(e["bid"]) - size, 4)
+            t["exit_reason"] = str(e.get("reason", ""))[:80]
+            applied += 1
+        if applied:
+            self._rewrite_all(trades)
+        return applied
+
     def compute_stats(self) -> PaperTradingStats:
         """Compute aggregate metrics over all resolved trades."""
         trades = self._load_all()
@@ -326,6 +369,16 @@ class PaperTrader:
             )
 
         pnls = [float(t["pnl_usd"]) for t in resolved if t.get("pnl_usd") not in (None, "")]
+        # X1 counterfactual: same trades, exit taken where the sim fired.
+        exit_sim_pnl, exit_sim_count = 0.0, 0
+        for t in resolved:
+            if t.get("pnl_usd") in (None, ""):
+                continue
+            if t.get("exit_pnl_usd") not in (None, ""):
+                exit_sim_pnl += float(t["exit_pnl_usd"])
+                exit_sim_count += 1
+            else:
+                exit_sim_pnl += float(t["pnl_usd"])
         briers = [float(t["brier_score"]) for t in resolved if t.get("brier_score") not in (None, "")]
         edges = [float(t["edge_pp"]) for t in resolved]
 
@@ -425,6 +478,8 @@ class PaperTrader:
             station_model_brier=round(st_model_brier, 4),
             station_market_brier=round(st_market_brier, 4),
             days_elapsed=days_elapsed,
+            exit_sim_pnl=round(exit_sim_pnl, 2),
+            exit_sim_count=exit_sim_count,
         )
 
     def print_dashboard(self) -> None:
@@ -446,6 +501,9 @@ class PaperTrader:
         print(f"  Station PF:        {stats.station_profit_factor:.2f}  (need ≥ {MIN_PROFIT_FACTOR})")
         print(f"  Model vs market:   Brier {stats.station_model_brier:.4f} vs {stats.station_market_brier:.4f}"
               f"  ({'model BEATS market' if stats.station_model_brier < stats.station_market_brier else 'model does NOT beat market'})")
+        if stats.exit_sim_count:
+            print(f"  Exit sim (X1):     ${stats.exit_sim_pnl:.2f} with exits "
+                  f"vs ${stats.total_paper_pnl:.2f} hold  ({stats.exit_sim_count} exits fired)")
         print()
         if stats.ready_for_live:
             print("  ✓ ALL GATES PASSED — ready for live trading")
@@ -497,6 +555,8 @@ class PaperTrader:
                 "running_obs_c": ("" if trade.running_obs_c is None
                                   else round(trade.running_obs_c, 2)),
                 "scan_source": trade.scan_source,
+                "restofday": trade.restofday,
+                "exit_time": "", "exit_price": "", "exit_pnl_usd": "", "exit_reason": "",
             })
 
     def _load_all(self) -> list[dict]:

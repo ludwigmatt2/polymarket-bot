@@ -430,8 +430,20 @@ def mode_intraday(scanner, generator, log_dir: Path = DEFAULT_LOG_DIR) -> None:
         print(f"  [intraday] watchlist stale ({age:.0f}s) — waiting for next full scan")
         return
 
+    from weather.config import EXIT_MARGIN_PP
+
     paper = PaperTrader(log_path=log_dir / "paper_trades.csv")
+    # X1: open positions indexed by (market_id, direction) — while a watchlist
+    # market is being re-evaluated anyway, check whether the book bids MORE than
+    # the freshly-computed model value of a position we hold. If so, simulate an
+    # exit at the bid (counterfactual stream; hold-to-resolution stays primary).
+    open_keys: set[tuple] = set()
+    for t in paper._load_all():
+        if t.get("actual_outcome") in (None, "", "None") and t.get("exit_price") in (None, ""):
+            open_keys.add((t.get("market_id"), t.get("direction")))
+
     checked = traded = 0
+    exits: list[dict] = []
     for wm in markets:
         # crossed local midnight since the full scan → no longer the event day
         if not station_obs.is_event_day(wm.resolution_date, wm.location.timezone):
@@ -448,7 +460,22 @@ def mode_intraday(scanner, generator, log_dir: Path = DEFAULT_LOG_DIR) -> None:
             obs = f"{sig.running_obs_c:.1f}C" if sig.running_obs_c is not None else "-"
             print(f"  NEW INTRADAY TRADE: {sig.direction} {wm.title[:60]} "
                   f"@ {sig.entry_price:.3f} edge={sig.edge_pp:.3f} obs={obs}")
-    print(f"  [intraday] {len(markets)} watched · {checked} evaluated · {traded} new trade(s)")
+        # X1 exit check — both directions, using the side's own live bid
+        for direction, bid in (("YES", wm.yes_best_bid), ("NO", wm.no_best_bid)):
+            if (wm.market_id, direction) not in open_keys or bid <= 0.0:
+                continue
+            p_win_now = sig.model_p if direction == "YES" else 1.0 - sig.model_p
+            if bid >= p_win_now + EXIT_MARGIN_PP:
+                exits.append({"market_id": wm.market_id, "direction": direction,
+                              "bid": bid, "p_win_now": p_win_now,
+                              "reason": f"bid_{bid:.2f}_vs_model_{p_win_now:.2f}"})
+    n_exits = paper.apply_exit_sims(exits)
+    if n_exits:
+        for e in exits:
+            print(f"  EXIT SIM: {e['direction']} {e['market_id'][:10]} "
+                  f"bid={e['bid']:.2f} model_value={e['p_win_now']:.2f}")
+    print(f"  [intraday] {len(markets)} watched · {checked} evaluated · "
+          f"{traded} new trade(s) · {n_exits} exit sim(s)")
 
 
 def _print_scan_summary(signals: list[Signal], actionable: list[Signal], rejected: list[Signal]) -> None:

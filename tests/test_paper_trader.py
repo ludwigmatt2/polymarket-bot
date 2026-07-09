@@ -414,3 +414,62 @@ class TestReliveGate:
         _add_station_trades(trader, 1, win_rate=0.0, span_days=1)
         stats = trader.compute_stats()
         assert stats.station_market_brier == pytest.approx((0.70 - 1.0) ** 2, abs=1e-4)
+
+
+class TestExitSimulation:
+    """X1: counterfactual exits — pnl_usd stays hold-to-resolution truth."""
+
+    def _open_trade_file(self, trader, entry=0.5, size=25.0):
+        rows = [{
+            "trade_id": "x1", "market_id": "mkt_exit", "market_title": "T",
+            "signal_time": "2026-07-09T10:00:00+00:00",
+            "entry_price": entry, "model_p": 0.4, "direction": "NO",
+            "size_usd": size, "edge_pp": 0.12,
+            "resolution_date": "2026-07-09T12:00:00+00:00",
+            "actual_outcome": "", "resolved_at": "", "pnl_usd": "",
+        }]
+        with open(trader.log_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=CSV_HEADERS, extrasaction="ignore")
+            w.writeheader(); w.writerows(rows)
+
+    def test_exit_recorded_with_correct_pnl(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        self._open_trade_file(trader, entry=0.5, size=25.0)  # 50 shares
+        n = trader.apply_exit_sims([{"market_id": "mkt_exit", "direction": "NO",
+                                     "bid": 0.60, "p_win_now": 0.5, "reason": "r"}])
+        assert n == 1
+        row = trader._load_all()[0]
+        assert float(row["exit_price"]) == pytest.approx(0.60)
+        assert float(row["exit_pnl_usd"]) == pytest.approx(50 * 0.60 - 25.0)  # +5.00
+        assert row["pnl_usd"] in ("", None)  # hold-to-resolution untouched
+
+    def test_exit_only_once(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        self._open_trade_file(trader)
+        e = [{"market_id": "mkt_exit", "direction": "NO", "bid": 0.6,
+              "p_win_now": 0.5, "reason": "r"}]
+        assert trader.apply_exit_sims(e) == 1
+        assert trader.apply_exit_sims(e) == 0  # second fire is a no-op
+
+    def test_resolved_trade_not_exited(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        _add_station_trades(trader, 1, win_rate=1.0, span_days=1)  # resolved row
+        rows = trader._load_all()
+        n = trader.apply_exit_sims([{"market_id": rows[0]["market_id"],
+                                     "direction": "NO", "bid": 0.9,
+                                     "p_win_now": 0.1, "reason": "r"}])
+        assert n == 0
+
+    def test_stats_compare_exit_vs_hold(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        _add_station_trades(trader, 4, win_rate=0.5, span_days=2)
+        rows = trader._load_all()
+        # pretend one LOSER had exited at 0.40 (entry 0.30 NO, size 25 → 83.3 sh)
+        loser = next(r for r in rows if float(r["pnl_usd"]) < 0)
+        loser["exit_price"] = 0.40
+        loser["exit_pnl_usd"] = round(25.0 / 0.30 * 0.40 - 25.0, 4)  # +8.33 vs −25
+        trader._rewrite_all(rows)
+        stats = trader.compute_stats()
+        assert stats.exit_sim_count == 1
+        assert stats.exit_sim_pnl == pytest.approx(
+            stats.total_paper_pnl + 25.0 + 8.3333, abs=0.01)

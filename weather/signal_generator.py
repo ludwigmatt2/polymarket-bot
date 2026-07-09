@@ -103,6 +103,7 @@ class SignalGenerator:
         # down) → feature stands down. Logged per trade (running_obs_c) so its
         # PnL contribution is separable in the validation data.
         observed_c = None
+        restofday = False
         if (
             RUNNING_OBS_ENABLED
             and market.station_icao
@@ -113,6 +114,20 @@ class SignalGenerator:
             kind = "max" if market.metric.endswith("max") else "min"
             event_day = station_obs.local_event_date(market.resolution_date, market.location.timezone)
             observed_c = station_obs.running_extreme_c(market.station_icao, event_day, kind)
+            # M1: with tape in hand, swap the full-day members for REST-OF-DAY
+            # extremes — a full-day member overstates what's still achievable
+            # once part of its day is history. Downstream the clip completes
+            # the exact identity: final = extreme(observed, rest-of-day).
+            # Fallback to the daily forecast when hourly data is unavailable.
+            if observed_c is not None:
+                try:
+                    rest = self.client.get_restofday_ensemble(
+                        market.location, event_day, market.metric)
+                    if rest.n_members >= MIN_ENSEMBLE_MEMBERS and len(rest.member_arrays) >= 2:
+                        forecast = rest
+                        restofday = True
+                except Exception:  # noqa: BLE001 — enhancement, never a blocker
+                    pass
 
         # Bias correction. Phase 1 MOS (member-shift inside compute_probability) owns
         # temperature correction where it has data; in that case the flat Phase-2 city
@@ -201,6 +216,7 @@ class SignalGenerator:
             forecast=forecast,
             prob_result=prob_result,
             running_obs_c=observed_c,
+            restofday=restofday,
         )
 
     def _quality_gates(
