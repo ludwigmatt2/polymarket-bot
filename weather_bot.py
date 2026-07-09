@@ -91,7 +91,9 @@ def run_scan(
         print(f"  [watchlist] write failed: {e}", file=sys.stderr)
 
     print(f"  [2/3] Evaluating {len(markets)} markets...", end=" ", flush=True)
+    _t_eval = time.time()
     signals = [generator.evaluate(m) for m in markets]
+    print(f"({time.time() - _t_eval:.0f}s)", end=" ", flush=True)
     actionable = [s for s in signals if s.quality_gate_passed]
     rejected = [s for s in signals if not s.quality_gate_passed]
     # Execute strongest edges first: with a small bankroll the in-scan budget can
@@ -420,7 +422,7 @@ def mode_intraday(scanner, generator, log_dir: Path = DEFAULT_LOG_DIR) -> None:
     scan_source='intraday' so the loop's PnL contribution is separable."""
     from weather import station_obs
     from weather.config import WATCHLIST_MAX_AGE_S
-    from weather.watchlist import load_watchlist, refresh_from_books
+    from weather.watchlist import load_watchlist
 
     markets, age = load_watchlist(log_dir / "intraday_watchlist.json")
     if not markets:
@@ -431,6 +433,7 @@ def mode_intraday(scanner, generator, log_dir: Path = DEFAULT_LOG_DIR) -> None:
         return
 
     from weather.config import EXIT_MARGIN_PP
+    from weather.watchlist import apply_book_mid
 
     paper = PaperTrader(log_path=log_dir / "paper_trades.csv")
     # X1: open positions indexed by (market_id, direction) — while a watchlist
@@ -442,17 +445,22 @@ def mode_intraday(scanner, generator, log_dir: Path = DEFAULT_LOG_DIR) -> None:
         if t.get("actual_outcome") in (None, "", "None") and t.get("exit_price") in (None, ""):
             open_keys.add((t.get("market_id"), t.get("direction")))
 
+    # Crossed local midnight since the full scan → no longer the event day.
+    live_markets = [wm for wm in markets
+                    if station_obs.is_event_day(wm.resolution_date, wm.location.timezone)]
+    # One threaded bulk pass for all books (the sequential per-market refresh
+    # was the tick's dominant cost as the watchlist grew past ~200 markets).
+    try:
+        scanner._fetch_books_bulk(live_markets)
+    except Exception as e:  # noqa: BLE001
+        print(f"  [intraday] book bulk fetch failed: {e}", file=sys.stderr)
+        return
+
     checked = traded = 0
     exits: list[dict] = []
-    for wm in markets:
-        # crossed local midnight since the full scan → no longer the event day
-        if not station_obs.is_event_day(wm.resolution_date, wm.location.timezone):
-            continue
-        try:
-            if not refresh_from_books(scanner, wm):
-                continue  # books unusable this tick — never price off stale quotes
-        except Exception:  # noqa: BLE001 — one bad book must not kill the tick
-            continue
+    for wm in live_markets:
+        if not apply_book_mid(wm):
+            continue  # books unusable this tick — never price off stale quotes
         checked += 1
         sig = generator.evaluate(wm)
         if sig.quality_gate_passed and paper.log_trade(sig, scan_source="intraday"):

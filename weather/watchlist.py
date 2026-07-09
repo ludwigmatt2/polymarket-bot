@@ -56,6 +56,16 @@ def load_watchlist(path: Path) -> tuple[list[WeatherMarket], float]:
         return [], float("inf")
 
 
+def apply_book_mid(wm: WeatherMarket) -> bool:
+    """Adopt the live YES-book mid as the executable quote, using book fields
+    already populated (e.g. by scanner._fetch_books_bulk). False → books
+    unusable this tick; the market must be skipped, never priced stale."""
+    if not (wm.yes_best_ask > 0.0 and wm.yes_best_bid > 0.0):
+        return False
+    wm.yes_price = round((wm.yes_best_ask + wm.yes_best_bid) / 2.0, 4)
+    return True
+
+
 def refresh_from_books(scanner, wm: WeatherMarket) -> bool:
     """Fresh EXECUTABLE quotes for an intraday tick: yes_price becomes the mid
     of the live YES book (the hour-old Gamma quote is exactly what the intraday
