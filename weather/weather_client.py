@@ -52,9 +52,70 @@ class WeatherClient:
     # Open-Meteo's per-minute limit mid-scan and whole city/date blocks silently
     # come back with 0 members (rejected by gate 2.5).
     FORECAST_CACHE_TTL_S = 900
+    # Cross-PROCESS disk cache TTL. Every scheduled run (hourly scan, 15-min
+    # intraday ticks) is a fresh subprocess with a cold in-memory cache — without
+    # a shared cache the fleet re-fetched every ensemble every tick (~13-17k
+    # calls/day vs Open-Meteo's ~10k free tier), and the resulting sustained
+    # 429s + 2s retry sleeps dragged evaluation past the scan kill-timeout
+    # (Jul-9/10 outage, part 3). Ensembles update ~6-hourly; 45 min is fresh.
+    DISK_CACHE_TTL_S = 2700
+    # A combo that failed entirely (usually a 429 burst) is not retried for this
+    # long — one bad combo must not re-fail once per bucket market in its block.
+    NEGATIVE_CACHE_TTL_S = 180
 
     def __init__(self) -> None:
         self._forecast_cache: dict[tuple, tuple[float, EnsembleForecast]] = {}
+        self._negative_cache: dict[tuple, float] = {}
+
+    # ── shared disk cache (all weather_bot subprocesses) ─────────────────────
+    @staticmethod
+    def _disk_cache_path(cache_key: tuple):
+        import hashlib
+        from .paths import DATA_DIR
+        d = DATA_DIR / "cache" / "ensembles"
+        return d / (hashlib.md5(repr(cache_key).encode()).hexdigest() + ".json")
+
+    def _disk_cache_get(self, cache_key: tuple) -> "EnsembleForecast | None":
+        import json
+        p = self._disk_cache_path(cache_key)
+        try:
+            if not p.exists() or time.time() - p.stat().st_mtime > self.DISK_CACHE_TTL_S:
+                return None
+            d = json.loads(p.read_text())
+            return EnsembleForecast(
+                lat=d["lat"], lon=d["lon"],
+                target_date=date.fromisoformat(d["target_date"]),
+                metric=d["metric"],
+                member_arrays=d["member_arrays"],
+                model_means=d.get("model_means", {}),
+                # fetched_at = when the DATA was fetched, so Gate 0 freshness
+                # judges the forecast's true age, not the cache read.
+                fetched_at=datetime.utcfromtimestamp(d["fetched_ts"]),
+            )
+        except Exception:  # noqa: BLE001 — cache is an optimization, never a blocker
+            return None
+
+    def _disk_cache_put(self, cache_key: tuple, fc: EnsembleForecast) -> None:
+        import json
+        p = self._disk_cache_path(cache_key)
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps({
+                "lat": fc.lat, "lon": fc.lon,
+                "target_date": fc.target_date.isoformat(),
+                "metric": fc.metric,
+                "member_arrays": fc.member_arrays,
+                "model_means": fc.model_means,
+                "fetched_ts": time.time(),
+            }))
+            tmp.replace(p)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _negative_cached(self, cache_key: tuple) -> bool:
+        ts = self._negative_cache.get(cache_key)
+        return ts is not None and time.monotonic() - ts < self.NEGATIVE_CACHE_TTL_S
 
     METRIC_DAILY_PARAMS = {
         "temperature_2m_max": "temperature_2m_max",
@@ -216,6 +277,15 @@ class WeatherClient:
         cached = self._forecast_cache.get(cache_key)
         if cached is not None and time.monotonic() - cached[0] < self.FORECAST_CACHE_TTL_S:
             return cached[1]
+        disk = self._disk_cache_get(cache_key)
+        if disk is not None:
+            self._forecast_cache[cache_key] = (time.monotonic(), disk)
+            return disk
+        if self._negative_cached(cache_key):
+            return EnsembleForecast(lat=location.lat, lon=location.lon,
+                                    target_date=target_date, metric=metric,
+                                    member_arrays={}, model_means={},
+                                    fetched_at=datetime.utcnow())
 
         member_arrays: dict[str, list[float]] = {}
 
@@ -243,10 +313,13 @@ class WeatherClient:
             model_means=model_means,
             fetched_at=datetime.utcnow(),
         )
-        # Cache only usable results — a transient failure should be retried by
-        # the next market in the block, not pinned for the TTL.
+        # Cache only usable results; total failures get a short negative-cache so
+        # one 429'd combo doesn't re-fail once per bucket market in its block.
         if member_arrays:
             self._forecast_cache[cache_key] = (time.monotonic(), forecast)
+            self._disk_cache_put(cache_key, forecast)
+        else:
+            self._negative_cache[cache_key] = time.monotonic()
         return forecast
 
     def get_restofday_ensemble(
@@ -294,6 +367,12 @@ class WeatherClient:
         cached = self._forecast_cache.get(cache_key)
         if cached is not None and time.monotonic() - cached[0] < self.FORECAST_CACHE_TTL_S:
             return cached[1]
+        disk = self._disk_cache_get(cache_key)
+        if disk is not None:
+            self._forecast_cache[cache_key] = (time.monotonic(), disk)
+            return disk
+        if self._negative_cached(cache_key):
+            return empty
 
         member_arrays: dict[str, list[float]] = {}
         for model in models:
@@ -324,6 +403,9 @@ class WeatherClient:
         )
         if member_arrays:
             self._forecast_cache[cache_key] = (time.monotonic(), forecast)
+            self._disk_cache_put(cache_key, forecast)
+        else:
+            self._negative_cache[cache_key] = time.monotonic()
         return forecast
 
     def get_historical_ensemble_forecast(
