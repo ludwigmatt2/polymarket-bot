@@ -72,6 +72,14 @@ RUNNING_OBS_ENABLED = True
 # window. A stale watchlist (no full scan for 2h) stands the loop down.
 INTRADAY_SCAN_INTERVAL_S = 900
 WATCHLIST_MAX_AGE_S = 7200
+
+# X1 exit simulation: sell (on paper) when the book BIDS more than the model
+# says the position is worth, by at least this margin — i.e. the market
+# overvalues our position under our own beliefs (the canonical trigger: the
+# tape killed our bucket and someone still bids 40-60¢ for it). The margin
+# respects model error and avoids churn; tune from the exit-vs-hold comparison
+# once the counterfactual stream accumulates.
+EXIT_MARGIN_PP = 0.05
 MIN_MARKET_PRICE = 0.03         # Avoid illiquid extremes
 MAX_MARKET_PRICE = 0.97
 # Gate 9.5: skip "equal" direction markets where crowd is this confident —
