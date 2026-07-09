@@ -352,6 +352,14 @@ class TestReliveGate:
     """Jul-8 gate: station-labeled trades only, calendar span, PF, and the
     model-must-beat-the-market Brier test."""
 
+    @pytest.fixture(autouse=True)
+    def _open_era(self, monkeypatch):
+        # These tests build synthetic histories with past signal_times; the
+        # era boundary (Jul-10 addition) is opened so they test the gate rules
+        # themselves. Era filtering has its own dedicated test below.
+        import weather.paper_trader as pt
+        monkeypatch.setattr(pt, "GATE_ERA_START", "2000-01-01")
+
     def test_gate_passes_on_good_station_record(self, tmp_path):
         trader = _make_trader(tmp_path)
         # 160 station trades over 30 days, 80% NO win rate.
@@ -473,3 +481,31 @@ class TestExitSimulation:
         assert stats.exit_sim_count == 1
         assert stats.exit_sim_pnl == pytest.approx(
             stats.total_paper_pnl + 25.0 + 8.3333, abs=0.01)
+
+
+class TestGateEraScoping:
+    """Jul-10: trades signaled under the old poisoned calibrator must not count
+    toward the gate — a validation record measures ONE system."""
+
+    def test_pre_era_station_trades_excluded(self, tmp_path, monkeypatch):
+        import weather.paper_trader as pt
+        trader = _make_trader(tmp_path)
+        _add_station_trades(trader, 40, win_rate=0.8, span_days=10)
+        rows = trader._load_all()
+        # era boundary AFTER every signal → nothing counts
+        latest = max(r["signal_time"] for r in rows)
+        monkeypatch.setattr(pt, "GATE_ERA_START", "2099-01-01")
+        assert trader.compute_stats().station_resolved == 0
+        # era boundary BEFORE every signal → all count
+        monkeypatch.setattr(pt, "GATE_ERA_START", "2000-01-01")
+        assert trader.compute_stats().station_resolved == 40
+
+    def test_era_boundary_splits_record(self, tmp_path, monkeypatch):
+        import weather.paper_trader as pt
+        from datetime import datetime, timedelta, timezone
+        trader = _make_trader(tmp_path)
+        _add_station_trades(trader, 40, win_rate=0.8, span_days=10)
+        rows = trader._load_all()
+        mid = sorted(r["signal_time"] for r in rows)[20]
+        monkeypatch.setattr(pt, "GATE_ERA_START", mid)
+        assert 0 < trader.compute_stats().station_resolved < 40

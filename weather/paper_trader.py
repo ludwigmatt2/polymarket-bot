@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 from ._io import atomic_write_csv
 from .config import (
     DAILY_LOSS_LIMIT_PCT,
+    GATE_ERA_START,
     GATE_MIN_DAYS_ELAPSED,
     GATE_MIN_STATION_RESOLVED,
     MIN_PROFIT_FACTOR,
@@ -410,7 +411,12 @@ class PaperTrader:
         # the same trades (climatology is a strawman; edge means beating the
         # crowd). Plus a calendar-span floor so one weather regime can't
         # flatter the record.
-        station = [t for t in resolved if t.get("label_source") == "station"]
+        # Era scope: only trades SIGNALED after GATE_ERA_START — earlier entries
+        # were made by a different system (poisoned calibrator) and belong to its
+        # record, not this one. GATE_ERA_START is patched by tests.
+        station = [t for t in resolved
+                   if t.get("label_source") == "station"
+                   and str(t.get("signal_time", "")) >= GATE_ERA_START]
         st_pnls, st_model_sq, st_market_sq, st_sizes = [], [], [], []
         first_signal = last_signal = None
         for t in station:

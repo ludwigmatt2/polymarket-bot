@@ -28,6 +28,7 @@ from scipy.stats import gaussian_kde
 from .city_bias import _haversine
 from .config import (
     HISTORICAL_SKILL_PATH,
+    MAX_CALIBRATION_SHIFT,
     MAX_ENSEMBLE_SPREAD,
     MIN_ENSEMBLE_MEMBERS,
     MIN_SKILL_OBS,
@@ -293,10 +294,19 @@ class ProbabilityModel:
     def _apply_calibration(self, raw_p: float, direction: str = "") -> float:
         # Direction-specific calibrator takes priority
         if direction and direction in self._calibrators_by_dir:
-            return _predict(self._calibrators_by_dir[direction], raw_p)
-        if self._calibrator is not None:
-            return _predict(self._calibrator, raw_p)
-        return raw_p
+            calibrated = _predict(self._calibrators_by_dir[direction], raw_p)
+        elif self._calibrator is not None:
+            calibrated = _predict(self._calibrator, raw_p)
+        else:
+            return raw_p
+        # Sanity guard: calibration corrects bias, it doesn't overrule the model.
+        # Clamp the correction to ±MAX_CALIBRATION_SHIFT so a sick fit can temper
+        # extreme confidence but never invert it across the coin-flip line (the
+        # Jul-10 Shanghai failure: raw 0.999 → calibrated 0.393 → bet against
+        # the model's own near-certainty, total loss).
+        lo = max(raw_p - MAX_CALIBRATION_SHIFT, 0.001)
+        hi = min(raw_p + MAX_CALIBRATION_SHIFT, 0.999)
+        return float(min(max(calibrated, lo), hi))
 
     def _fit_calibrator(self) -> None:
         """Refit global and per-direction calibrators from current observations."""

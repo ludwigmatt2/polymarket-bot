@@ -144,6 +144,15 @@ MAX_DAY_EXPOSURE_PCT = 0.40
 MIN_RESOLVED_TRADES = 20        # legacy floor (overall record; display only)
 MIN_PROFIT_FACTOR = 1.5         # Gross wins / gross losses
 MIN_BRIER_SKILL_SCORE = 0.0     # Must beat climatology (BSS ≥ 0) — display only
+# Calibrator sanity guard: a learned correction may move raw_p by at most this
+# much. Calibration exists to fix systematic bias, not to overrule the model —
+# the old poisoned calibrator compressed every raw_p into ~0.35-0.49 and once
+# INVERTED a 99.9% raw certainty into a NO bet (Jul-10 Shanghai total loss).
+# With the cap, extreme confidence can be tempered but never flipped across the
+# coin-flip line (0.999 → ≥0.749). Structural guard, active for every future
+# calibrator fit — not a patch for one bad dataset.
+MAX_CALIBRATION_SHIFT = 0.25
+
 # ── Re-live gate (Jul-8 redesign) ──────────────────────────────────────────────
 # Going live again requires evidence from the FIXED system only: trades resolved
 # on STATION truth (label_source == "station"), enough of them, spanning enough
@@ -153,6 +162,13 @@ MIN_BRIER_SKILL_SCORE = 0.0     # Must beat climatology (BSS ≥ 0) — display 
 # the crowd). The gate unlocks live order placement; flipping mode stays manual.
 GATE_MIN_STATION_RESOLVED = 150
 GATE_MIN_DAYS_ELAPSED = 21
+# Era boundary: only trades SIGNALED after this instant count for the gate.
+# Trades before it were entered under the old poisoned calibrator (it compressed
+# every raw_p into ~0.35-0.49, once inverting the model's own 99.9% certainty
+# into a NO bet — the Jul-10 Shanghai total loss). Same era-scoping principle
+# as the Jul-9 calibration-log cutover: a validation record must measure ONE
+# system. Set to the first clean post-cutover signal window.
+GATE_ERA_START = "2026-07-09T08:00"
 MAX_PAPER_DRAWDOWN_PCT = 0.20   # Max hypothetical drawdown allowed
 
 # ── Open-Meteo API ────────────────────────────────────────────────────────────
