@@ -267,3 +267,37 @@ class TestRoundingPreimage:
         r = model.compute_probability(fc, 31.0, "equal", resolve_unit="F")
         assert r.direction == "equal"
         assert r.threshold == 31.0  # original edge, not the widened one
+
+
+class TestCalibratorSanityGuard:
+    """Jul-10: a learned correction may temper the model but never overrule it —
+    the poisoned calibrator once inverted raw 0.999 into 0.393 (Shanghai loss)."""
+
+    def _sick_model(self, tmp_path):
+        # Fit a pathological calibrator: high raw_p labeled as losses → the fit
+        # wants to map high probabilities DOWN hard.
+        m = ProbabilityModel(calibration_log_path=tmp_path / "cal.csv")
+        for _ in range(20):
+            m.log_observation(0.9, False)
+            m.log_observation(0.1, True)
+        m._fit_calibrator()
+        assert m._calibrator is not None
+        return m
+
+    def test_extreme_confidence_never_inverted(self, tmp_path):
+        m = self._sick_model(tmp_path)
+        c = m._apply_calibration(0.999)
+        assert c >= 0.999 - 0.25 - 1e-9   # tempered at most, never flipped
+        c_low = m._apply_calibration(0.001)
+        assert c_low <= 0.001 + 0.25 + 1e-9
+
+    def test_correction_distance_capped(self, tmp_path):
+        from weather.config import MAX_CALIBRATION_SHIFT
+        m = self._sick_model(tmp_path)
+        for raw in (0.05, 0.2, 0.5, 0.8, 0.95):
+            c = m._apply_calibration(raw)
+            assert abs(c - raw) <= MAX_CALIBRATION_SHIFT + 1e-9
+
+    def test_uncalibrated_passthrough_unaffected(self, tmp_path):
+        m = ProbabilityModel(calibration_log_path=tmp_path / "none.csv")
+        assert m._apply_calibration(0.42) == 0.42
