@@ -40,10 +40,21 @@ way to get a genuine "full history" backtest via this endpoint. WINDOW_DAYS
 reflects this; don't raise it expecting more data to appear.
 
 Run:  venv/bin/python scripts/historical_backtest.py
+      venv/bin/python scripts/historical_backtest.py --lambda-sweep
+
+The default run also collects a REPLAY file (historical_backtest_replay.jsonl):
+one row per city-day holding the fetched member arrays plus every PRICED
+bucket's market price and station outcome (gated or not — calibration quality
+must be measured on the full population, not the gate-selected one). The
+--lambda-sweep mode then recomputes raw_p offline per variance-inflation λ
+against that file — no network, seconds per λ — reporting Brier overall and
+per temporal half so an unstable λ can't sneak through (see config
+VARIANCE_INFLATION).
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import sys
@@ -90,6 +101,8 @@ WINDOW_DAYS = 32
 # Blended (ECMWF+GEFS) run writes to a SEPARATE file from the single-model
 # pilot (historical_backtest.csv) so the underdispersion comparison survives.
 OUT_CSV = Path(__file__).resolve().parent.parent / "data" / "logs" / "historical_backtest_blended.csv"
+# Replay data for offline λ sweeps: members + priced buckets + outcomes.
+REPLAY_JSONL = OUT_CSV.with_name("historical_backtest_replay.jsonl")
 
 
 def _get_json(url: str, timeout: int = 20):
@@ -147,6 +160,20 @@ def _already_done(path: Path) -> set[tuple[str, str]]:
         return {(r["city"], r["event_day"]) for r in csv.DictReader(f)}
 
 
+def _replay_done(path: Path) -> set[tuple[str, str]]:
+    if not path.exists():
+        return set()
+    done = set()
+    with open(path) as f:
+        for line in f:
+            try:
+                r = json.loads(line)
+                done.add((r["city"], r["event_day"]))
+            except (ValueError, KeyError):
+                continue
+    return done
+
+
 def summarize(path: Path) -> None:
     if not path.exists():
         print("no results yet"); return
@@ -177,7 +204,11 @@ def main() -> None:
     since = date.today() - timedelta(days=WINDOW_DAYS)
     scanner = WeatherMarketScanner()
     model = ProbabilityModel()
-    done = _already_done(OUT_CSV)
+    # Resume off the REPLAY file (the sweep's dataset), not the trade CSV: a
+    # day already in the CSV from an old run may still lack replay data. CSV
+    # rows are deduped separately so re-visiting such a day can't double-log.
+    done = _replay_done(REPLAY_JSONL)
+    csv_done = _already_done(OUT_CSV)
     new_file = not OUT_CSV.exists()
     OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
     out_f = open(OUT_CSV, "a", newline="")
@@ -268,6 +299,8 @@ def main() -> None:
                                       12, tzinfo=timezone.utc).timestamp())
 
             n_trades_today = 0
+            day_truth_cache: dict = {}  # one WU/IEM probe covers all buckets
+            replay_buckets: list[dict] = []
             for wm, gm in pairs:
                 n_markets += 1
                 prob = model.compute_probability(
@@ -280,6 +313,22 @@ def main() -> None:
                     continue
                 n_priced += 1
 
+                # Outcome for EVERY priced bucket (not just gated trades): the
+                # λ sweep must score calibration on the full population. The
+                # shared cache keeps this at one network probe per city-day.
+                yes_cond, src, station_val = station_truth.station_outcome(
+                    wm.station_icao, wm.station_country, wm.resolve_unit, event_day,
+                    wm.metric, wm.threshold, wm.threshold_high, wm.direction,
+                    cache=day_truth_cache)
+                if yes_cond is None:
+                    continue
+                replay_buckets.append({
+                    "title": wm.title[:70], "threshold": wm.threshold,
+                    "threshold_high": wm.threshold_high, "direction": wm.direction,
+                    "resolve_unit": wm.resolve_unit, "market_p": round(market_p, 4),
+                    "outcome": int(yes_cond),
+                })
+
                 model_p = prob.calibrated_p
                 edge_pp = abs(model_p - market_p)
                 net_ev = edge_pp - EDGE_SAFETY_MARGIN_PP
@@ -289,17 +338,14 @@ def main() -> None:
                 direction = "YES" if model_p > market_p else "NO"
                 entry_price = market_p if direction == "YES" else (1.0 - market_p)
 
-                yes_cond, src, station_val = station_truth.station_outcome(
-                    wm.station_icao, wm.station_country, wm.resolve_unit, event_day,
-                    wm.metric, wm.threshold, wm.threshold_high, wm.direction)
-                if yes_cond is None:
-                    continue
-
                 bet_wins = yes_cond if direction == "YES" else not yes_cond
                 pnl = _trade_pnl(25.0, entry_price, bet_wins)
                 brier = _brier(model_p, yes_cond)
                 market_brier = _brier(market_p, yes_cond)
 
+                if (city, event_day.isoformat()) in csv_done:
+                    n_trades_today += 1  # counted, already logged by an old run
+                    continue
                 writer.writerow({
                     "city": city, "event_day": event_day.isoformat(),
                     "title": wm.title[:70], "direction": direction,
@@ -312,6 +358,16 @@ def main() -> None:
                 })
                 out_f.flush()
                 n_trades_today += 1
+
+            if replay_buckets:
+                with open(REPLAY_JSONL, "a") as rf:
+                    rf.write(json.dumps({
+                        "city": city, "event_day": event_day.isoformat(),
+                        "metric": wm0.metric,
+                        "member_arrays": {m: [round(v, 3) for v in vals]
+                                           for m, vals in member_arrays.items()},
+                        "buckets": replay_buckets,
+                    }) + "\n")
             print(f"  [{day_idx+1}/{total_days}] {city} {event_day}: {n_members} members "
                   f"(ecmwf={len(ecmwf_members)},gfs={len(gefs_members)}) in {fetch_s:.0f}s, "
                   f"{len(pairs)} buckets -> {n_trades_today} trades", flush=True)
@@ -328,5 +384,71 @@ def main() -> None:
     summarize(OUT_CSV)
 
 
+def lambda_sweep(grid: list[float]) -> None:
+    """Offline Brier sweep over variance-inflation λ against the replay file.
+    raw_p only (no calibrator, no MOS): isolates the ensemble-dispersion effect
+    from every downstream correction. Prints overall + per-temporal-half Brier
+    per λ — adopt a λ only if both halves agree on the direction."""
+    from weather import probability_model as pm
+    from weather.probability_model import ProbabilityModel
+
+    if not REPLAY_JSONL.exists():
+        print(f"no replay file at {REPLAY_JSONL} — run the default collect pass first")
+        return
+    days = []
+    with open(REPLAY_JSONL) as f:
+        for line in f:
+            try:
+                days.append(json.loads(line))
+            except ValueError:
+                continue
+    days.sort(key=lambda d: (d["event_day"], d["city"]))
+    n_buckets = sum(len(d["buckets"]) for d in days)
+    print(f"replay: {len(days)} city-days, {n_buckets} priced buckets "
+          f"({days[0]['event_day']} .. {days[-1]['event_day']})\n")
+    mid = len(days) // 2
+
+    model = ProbabilityModel(calibration_log_path=Path("/nonexistent-calibration.csv"),
+                             skill_corrector=None)
+    market_sq = [(b["market_p"] - b["outcome"]) ** 2 for d in days for b in d["buckets"]]
+    print(f"market Brier (constant baseline): {sum(market_sq)/len(market_sq):.4f}\n")
+    print(f"{'λ':>5} | {'Brier':>7} | {'1st half':>8} | {'2nd half':>8}")
+    print("-" * 40)
+
+    saved = pm.VARIANCE_INFLATION, pm.VARIANCE_INFLATION_ENABLED
+    try:
+        pm.VARIANCE_INFLATION_ENABLED = True
+        for lam in grid:
+            pm.VARIANCE_INFLATION = lam
+            halves: list[list[float]] = [[], []]
+            for i, d in enumerate(days):
+                fc = EnsembleForecast(
+                    lat=0.0, lon=0.0, target_date=date.fromisoformat(d["event_day"]),
+                    metric=d["metric"], member_arrays=d["member_arrays"],
+                    fetched_at=datetime.now(timezone.utc))
+                month = date.fromisoformat(d["event_day"]).month
+                for b in d["buckets"]:
+                    prob = model.compute_probability(
+                        forecast=fc, threshold=b["threshold"], direction=b["direction"],
+                        threshold_high=b["threshold_high"], lead_day=1, month=month,
+                        resolve_unit=b["resolve_unit"], observed_extreme=None)
+                    halves[0 if i < mid else 1].append((prob.raw_p - b["outcome"]) ** 2)
+            all_sq = halves[0] + halves[1]
+            print(f"{lam:>5.2f} | {sum(all_sq)/len(all_sq):>7.4f} | "
+                  f"{sum(halves[0])/max(len(halves[0]),1):>8.4f} | "
+                  f"{sum(halves[1])/max(len(halves[1]),1):>8.4f}")
+    finally:
+        pm.VARIANCE_INFLATION, pm.VARIANCE_INFLATION_ENABLED = saved
+
+
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--lambda-sweep", action="store_true",
+                    help="offline Brier sweep over VARIANCE_INFLATION against the replay file")
+    ap.add_argument("--grid", default="1.0,1.1,1.2,1.3,1.4,1.5,1.6,1.8",
+                    help="comma-separated λ values for --lambda-sweep")
+    args = ap.parse_args()
+    if args.lambda_sweep:
+        lambda_sweep([float(x) for x in args.grid.split(",")])
+    else:
+        main()

@@ -129,6 +129,26 @@ def run_scan(
         logged = [paper.log_trade(s) for s in actionable]
         print(f"{sum(1 for t in logged if t)} logged")
 
+    # Long-shot harvest (paper-only, isolated track): among the REJECTED
+    # signals, log the sub-3¢ deep-disagreement YES shape the Jul-2026 backtest
+    # showed as fragile-but-positive (5/167 wins, net +$3.5k on flat stakes).
+    # These stay blocked in the real flow (Gate 9.7); this track only gathers
+    # sample size. Rows are tagged scan_source="longshot" and excluded from
+    # stats/gate/calibration (see PaperTrader.log_experimental).
+    if paper:
+        from weather.config import LONGSHOT_MAX_PRICE, LONGSHOT_MIN_RATIO
+        longshots = [
+            s for s in rejected
+            if s.direction == "YES"  # the harvested shape is a cheap YES buy
+            and 0.0 < s.market.yes_price < LONGSHOT_MAX_PRICE
+            and s.prob_result is not None
+            and s.prob_result.raw_p >= LONGSHOT_MIN_RATIO * s.market.yes_price
+        ]
+        if longshots:
+            n_ls = sum(1 for s in longshots if paper.log_experimental(s))
+            if n_ls:
+                print(f"  [longshot] {n_ls} experimental long-shot trade(s) logged")
+
     _print_scan_summary(signals, actionable, rejected)
     funnel = _build_funnel(scanner, signals, actionable, rejected)
     _write_signals_file(actionable, log_dir, funnel)
@@ -890,6 +910,10 @@ def main() -> None:
             # the model now produces, so they must not train the calibrator.
             if str(t.get("restofday", "")) == "1" or str(t.get("running_obs_c", "")).strip():
                 skipped_clip += 1
+                continue
+            # Experimental long-shot rows are gate-rejected sample-gathering,
+            # never calibrator food (see PaperTrader.log_experimental).
+            if t.get("scan_source") == "longshot":
                 continue
             try:
                 model.log_observation(

@@ -86,7 +86,25 @@ class PaperTrader:
         """
         if not signal.quality_gate_passed:
             return None
+        size_factor = getattr(signal, "size_factor", 1.0)
+        return self._log(signal, scan_source,
+                          size_usd=round(PAPER_TRADE_SIZE_USD * size_factor, 2),
+                          size_factor=size_factor)
 
+    def log_experimental(self, signal: Signal, scan_source: str = "longshot",
+                          size_usd: float = 5.0) -> PaperTrade | None:
+        """Record a GATE-REJECTED signal on an isolated experimental track.
+
+        Used for the long-shot harvest (sub-3¢ YES buys the backtest showed as
+        a fragile-but-positive pattern, 5/167 wins): these are blocked by Gate
+        9.7 in the real flow and must stay blocked there — this path exists to
+        gather sample size, not to trade. Flat tiny stake, no size_factor.
+        Rows carry scan_source="longshot" and are EXCLUDED from compute_stats
+        (topline + re-live gate) and from calibrator training."""
+        return self._log(signal, scan_source, size_usd=size_usd, size_factor=1.0)
+
+    def _log(self, signal: Signal, scan_source: str,
+              size_usd: float, size_factor: float) -> PaperTrade | None:
         if self._existing_keys is None:
             self._existing_keys = {(r["market_id"], r["direction"]) for r in self._load_all()}
 
@@ -94,7 +112,6 @@ class PaperTrader:
         if key in self._existing_keys:
             return None
 
-        size_factor = getattr(signal, "size_factor", 1.0)
         trade = PaperTrade(
             trade_id=str(uuid.uuid4())[:8],
             market_id=signal.market.market_id,
@@ -103,7 +120,7 @@ class PaperTrader:
             entry_price=signal.market_p if signal.direction == "YES" else (1.0 - signal.market_p),
             model_p=signal.model_p,
             direction=signal.direction,
-            size_usd=round(PAPER_TRADE_SIZE_USD * size_factor, 2),
+            size_usd=size_usd,
             size_factor=size_factor,
             edge_pp=signal.edge_pp,
             ensemble_spread=signal.ensemble_spread,
@@ -187,6 +204,7 @@ class PaperTrader:
             model_p=model_p,
             direction=direction,
             size_usd=size_usd,
+            size_factor=float(target.get("size_factor") or 1.0),
             edge_pp=float(target["edge_pp"]),
             ensemble_spread=float(target["ensemble_spread"]),
             confidence_score=float(target["confidence_score"]),
@@ -298,9 +316,12 @@ class PaperTrader:
             # disabled) running-extreme clip was active carry a raw_p from the
             # clipped distribution — resolving them must not train the
             # calibrator the current model uses. Matches backfill-calibration.
+            # The experimental long-shot track is likewise excluded: those are
+            # gate-rejected signals logged only for sample-gathering.
             clip_tainted = (str(t.get("restofday", "")) == "1"
                             or str(t.get("running_obs_c", "")).strip())
-            if model is not None and not clip_tainted:
+            is_experimental = t.get("scan_source") == "longshot"
+            if model is not None and not clip_tainted and not is_experimental:
                 raw_p = float(t.get("raw_p") or t["model_p"])
                 model.log_observation(raw_p, outcome, direction=w_dir)
 
@@ -360,6 +381,10 @@ class PaperTrader:
     def compute_stats(self) -> PaperTradingStats:
         """Compute aggregate metrics over all resolved trades."""
         trades = self._load_all()
+        # The experimental long-shot track never enters the record: it exists
+        # to gather sample size on gate-REJECTED signals (see log_experimental)
+        # and would corrupt both the topline and the re-live gate if counted.
+        trades = [t for t in trades if t.get("scan_source") != "longshot"]
         resolved = [t for t in trades if t.get("actual_outcome") in ("0", "1", 0, 1)]
 
         total = len(trades)

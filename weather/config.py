@@ -237,6 +237,29 @@ MODEL_WEIGHTS = {"ecmwf_ifs025": 1.1, "icon_seamless": 1.1, "gfs_seamless": 1.0}
 # Kill switch — False reverts to equal member pooling (no weighting).
 MODEL_WEIGHTING_ENABLED = True
 
+# ── Variance inflation (EMOS-lite, Aug 2026) ───────────────────────────────────
+# Raw ensembles are UNDERDISPERSED: the forward calibration curve showed raw_p
+# in [0,0.10) resolving YES 34.9% of the time — the members' spread understates
+# real forecast uncertainty, so tail buckets get near-zero probability that
+# reality contradicts. Standard post-processing fix (EMOS-lite): widen each
+# model's members about their own mean, v' = mean + λ·(v − mean), BEFORE the
+# clip/pre-image/counting stages, so raw counting and KDE both see the wider
+# distribution. λ is fit OFFLINE by Brier-sweep on the ECMWF+GEFS replay
+# harness (scripts/historical_backtest.py --lambda-sweep); 1.0 = no-op.
+# The MAX_CALIBRATION_SHIFT clamp stays untouched as the downstream safety net.
+VARIANCE_INFLATION = 1.0
+VARIANCE_INFLATION_ENABLED = True
+
+# ── Long-shot harvest track (paper-only, Aug 2026) ─────────────────────────────
+# The Jul-2026 backtest found sub-3¢ YES buys with deep model disagreement won
+# only 5/167 but netted +$3.5k on flat stakes — a real but fragile pattern that
+# 5 observations cannot justify trading. Gate 9.7 keeps them blocked in the
+# real flow; run_scan logs matching REJECTED signals to an isolated paper track
+# (scan_source="longshot", flat $5, excluded from stats/gate/calibration) purely
+# to gather forward sample size.
+LONGSHOT_MAX_PRICE = 0.03       # market YES price below this = long-shot territory
+LONGSHOT_MIN_RATIO = 10.0       # raw_p must be ≥ this multiple of the market price
+
 # Deterministic models used for cross-model spread (uncertainty proxy)
 FORECAST_MODELS = ["gfs_seamless", "ecmwf_ifs025", "icon_seamless"]
 
