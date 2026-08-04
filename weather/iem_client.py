@@ -58,6 +58,8 @@ _STATION_REGISTRY: dict[str, tuple[str, str, str, float, float]] = {
     "ZSPD": ("CN__ASOS", "ZSPD", "Asia/Shanghai", 31.1167, 121.7667),    # Shanghai / Pudong (°C)
     # Canadian networks are CA_{PROVINCE}_ASOS (three segments — see is_us()).
     "CYYZ": ("CA_ON_ASOS", "CYYZ", "America/Toronto", 43.6772, -79.6306),  # Toronto / Pearson (°C)
+    # Jul-10 registry expansion (scripts/discover_stations.py — IEM+WU verified):
+    "ZGSZ": ("CN__ASOS", "ZGSZ", "Asia/Shanghai", 22.5500, 114.1000),  # Shenzhen Bao'an (°C)
 }
 
 
