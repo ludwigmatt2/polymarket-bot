@@ -33,6 +33,7 @@ from .config import (
     GATE8_TIMING_WEIGHT,
     LEAD_TIME_DECAY_PER_DAY,
     MAX_BOOK_SPREAD,
+    MAX_EDGE_PP,
     MAX_ENTRY_DAYS_AHEAD,
     MAX_ENSEMBLE_SPREAD,
     MAX_FORECAST_AGE_HOURS,
@@ -347,6 +348,14 @@ class SignalGenerator:
         net_ev = gross_ev - EDGE_SAFETY_MARGIN_PP
         if net_ev < MIN_NET_EV_PP:
             return False, f"gate4_margin_adjusted_edge:{net_ev:.3f}_required:{MIN_NET_EV_PP}", 0.0
+
+        # Gate 4.5: edge CEILING — a claimed edge this large is evidence of model
+        # error, not opportunity (>0.20pp ran PF 0.66-0.81 in both halves of the
+        # 1,023-trade station-truth backtest and lost forward; see config).
+        # Checked pre-shrinkage only: shrinkage moves model_p toward the market
+        # price, so it can only reduce the edge below this bound, never exceed it.
+        if gross_ev > MAX_EDGE_PP:
+            return False, f"gate4.5_edge_ceiling:{gross_ev:.3f}_max:{MAX_EDGE_PP}", 0.0
 
         # Gate 6: Odds velocity — fast movement signals informed flow
         if self.price_tracker is not None:

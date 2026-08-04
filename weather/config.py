@@ -9,6 +9,12 @@ import os
 MIN_NET_EV_PP = 0.08            # Gate 4: minimum edge after subtracting round-trip fees
                                 # Raised 0.04→0.08 (Jun 2026): 5-10% gross-edge trades earned
                                 # only +28.6% ROI vs +50.8% for >20% edge (577-trade dataset).
+# Gate 4.5: edge CEILING — reject signals claiming MORE gross edge than this.
+# The model is most wrong exactly when it claims the most disagreement with the
+# market: >0.20pp edge ran PF 0.66-0.81 in BOTH temporal halves of the 1,023-trade
+# station-truth backtest (Jul 2026) AND lost money forward (n=42, Jul 8-Aug 4).
+# A huge claimed edge is evidence of model error, not opportunity.
+MAX_EDGE_PP = 0.20
 MAX_DAYS_TO_RESOLUTION = 31     # Include monthly (May) markets
 MAX_ENSEMBLE_SPREAD = 0.20      # Allow slightly more uncertainty for monthly markets
 MIN_ENSEMBLE_MEMBERS = 3        # Minimum model count for a valid ensemble
@@ -62,7 +68,17 @@ MAX_BOOK_SPREAD = 0.04
 # exact math. It both creates signals (market slow to react to the tape) and
 # protects (never fade a market watching a live feed we didn't have — the
 # adverse-selection channel Gate 9.5 crudely approximates).
-RUNNING_OBS_ENABLED = True
+#
+# DISABLED Aug 2026: 26 days of forward validation split by this feature —
+# clip fired: PF 0.67 (−$455, n=113); clip off: PF 1.22 (+$195, n=105). The
+# clip asserts near-certainty while the day still has room to move (obs lag,
+# whole-degree rounding at the boundary, temp still rising past the peak-so-far
+# reading): clipped trades averaged model_p 0.43 vs a 0.59 real outcome rate.
+# Re-enable only WITH a proper fix (widened uncertainty near the clip bound).
+# Side effect (intended): observed_c stays None → the Gate-1 late-window
+# bypass (intraday_ok) closes, so the intraday loop stops logging late-window
+# trades — that was the losing segment. Loop + watchlist plumbing stays.
+RUNNING_OBS_ENABLED = False
 
 # ── Intraday event-day loop (I1) ───────────────────────────────────────────────
 # Between hourly full scans, re-evaluate ONLY the event-day station markets
@@ -127,7 +143,11 @@ PAPER_TRADE_SIZE_USD = 25.0
 PAPER_BANKROLL_USD = 1000.0
 
 # ── Live trading (Kelly sizing) ────────────────────────────────────────────────
-KELLY_FRACTION = 0.25           # Quarter Kelly — conservative for uncertain edge
+# Eighth Kelly (0.25 → 0.125, Aug 2026): Kelly sizing off a miscalibrated
+# probability compounds the damage — the forward calibration curve showed raw_p
+# in [0,0.10) resolving YES 34.9% of the time. Restore quarter Kelly only after
+# the variance-inflation calibration fix is validated forward.
+KELLY_FRACTION = 0.125
 MAX_LIVE_TRADE_USD = float(os.environ.get("MAX_LIVE_TRADE_USD", "25.0"))  # overrideable via env or /setmaxbet
 # Kill switch: halt for the day when resolved losses exceed
 # max(DAILY_LOSS_LIMIT_PCT × bankroll, 2 × max order) — the floor keeps a small
@@ -163,12 +183,12 @@ MAX_CALIBRATION_SHIFT = 0.25
 GATE_MIN_STATION_RESOLVED = 150
 GATE_MIN_DAYS_ELAPSED = 21
 # Era boundary: only trades SIGNALED after this instant count for the gate.
-# Trades before it were entered under the old poisoned calibrator (it compressed
-# every raw_p into ~0.35-0.49, once inverting the model's own 99.9% certainty
-# into a NO bet — the Jul-10 Shanghai total loss). Same era-scoping principle
-# as the Jul-9 calibration-log cutover: a validation record must measure ONE
-# system. Set to the first clean post-cutover signal window.
-GATE_ERA_START = "2026-07-09T08:00"
+# A validation record must measure ONE system (the Jul-9 lesson). Bumped
+# 2026-07-09 → 2026-08-05 at the Phase-1 fix deploy: the running-extreme clip
+# was disabled and the edge ceiling added — both change which trades exist and
+# how they're priced, so the prior era's 206 trades (PF 0.90, clip-tainted)
+# belong to the old system's record. Fresh 0/150 run from here.
+GATE_ERA_START = "2026-08-05T00:00"
 MAX_PAPER_DRAWDOWN_PCT = 0.20   # Max hypothetical drawdown allowed
 
 # ── Open-Meteo API ────────────────────────────────────────────────────────────

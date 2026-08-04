@@ -73,8 +73,12 @@ class TestSignalDirection:
 
 
 class TestQualityGates:
+    # "Clean" fixtures use model_p=0.48 vs market 0.30: gross edge 0.18 sits
+    # inside the tradeable band — above Gate 4's floor (net 0.15 ≥ 0.08) and
+    # below Gate 4.5's ceiling (0.18 ≤ MAX_EDGE_PP). The old 0.80 fixture's
+    # 0.50 edge is now itself a rejection (see TestEdgeCeiling).
     def test_passes_clean_signal(self):
-        gen = _make_generator(model_p=0.80)
+        gen = _make_generator(model_p=0.48)
         signal = gen.evaluate(_make_market(yes_price=0.30))
         assert signal.quality_gate_passed is True
         assert signal.rejection_reason is None
@@ -116,7 +120,7 @@ class TestQualityGates:
     def test_gate5_passes_on_sufficient_book_depth(self):
         """Gate 5 passes when book_depth_usd meets the 3x threshold."""
         from weather.config import MIN_MARKET_LIQUIDITY_USD, BOOK_DEPTH_MIN_MULTIPLIER
-        gen = _make_generator(model_p=0.80)
+        gen = _make_generator(model_p=0.48)
         market = _make_market(yes_price=0.30, liquidity=10_000.0)
         market.book_depth_usd = MIN_MARKET_LIQUIDITY_USD * BOOK_DEPTH_MIN_MULTIPLIER + 1.0
         signal = gen.evaluate(market)
@@ -125,7 +129,7 @@ class TestQualityGates:
     def test_gate5_falls_back_to_volume_when_depth_zero(self):
         """When book_depth_usd == 0 (sidecar unavailable), fall back to volume check."""
         from weather.config import MIN_MARKET_LIQUIDITY_USD
-        gen = _make_generator(model_p=0.80)
+        gen = _make_generator(model_p=0.48)
         # volume is good, depth is 0 (not fetched) → should fall back and pass
         market = _make_market(yes_price=0.30, liquidity=MIN_MARKET_LIQUIDITY_USD + 100.0)
         market.book_depth_usd = 0.0
@@ -235,7 +239,7 @@ class TestQualityGates:
     def test_rejects_informed_flow(self):
         tracker_mock = MagicMock()
         tracker_mock.get_velocity.return_value = 0.20  # 20pp > MAX_PRICE_VELOCITY_PP=0.15
-        gen = _make_generator(model_p=0.80, price_tracker=tracker_mock)
+        gen = _make_generator(model_p=0.48, price_tracker=tracker_mock)
         signal = gen.evaluate(_make_market(yes_price=0.30))
         assert signal.quality_gate_passed is False
         assert "gate6_informed_flow" in signal.rejection_reason
@@ -255,10 +259,10 @@ class TestQualityGates:
         # Very high spread → spread_component near 0
         client.get_ensemble_forecast.return_value = _make_forecast(spread=0.0)
         model.compute_probability.return_value = RawProbabilityResult(
-            raw_p=0.80, calibrated_p=0.80,
+            raw_p=0.48, calibrated_p=0.48,  # edge 0.18: inside gate 4/4.5 band
             ensemble_spread=0.19,  # just under MAX so gate 2.7 passes
             n_members=5, is_calibrated=False,
-            model_breakdown={"gfs_seamless": 0.80, "ecmwf_ifs025": 0.70},
+            model_breakdown={"gfs_seamless": 0.55, "ecmwf_ifs025": 0.41},
             threshold=90.0, direction="above", metric="temperature_2m_max",
             n_models=2,
         )
@@ -268,6 +272,32 @@ class TestQualityGates:
         signal = gen.evaluate(_make_market(yes_price=0.30, days_out=5))
         assert signal.quality_gate_passed is False
         assert "gate8_low_confidence" in signal.rejection_reason
+
+
+class TestEdgeCeiling:
+    """Gate 4.5 — a claimed edge above MAX_EDGE_PP is evidence of model error,
+    not opportunity (PF 0.66-0.81 above 0.20 in both backtest halves + forward)."""
+
+    def test_rejects_edge_above_ceiling(self):
+        from weather.config import MAX_EDGE_PP
+        gen = _make_generator(model_p=0.30 + MAX_EDGE_PP + 0.01)
+        signal = gen.evaluate(_make_market(yes_price=0.30))
+        assert signal.quality_gate_passed is False
+        assert "gate4.5_edge_ceiling" in signal.rejection_reason
+
+    def test_passes_edge_just_below_ceiling(self):
+        from weather.config import MAX_EDGE_PP
+        gen = _make_generator(model_p=0.30 + MAX_EDGE_PP - 0.01)
+        signal = gen.evaluate(_make_market(yes_price=0.30))
+        assert signal.quality_gate_passed is True
+
+    def test_ceiling_applies_to_no_side_too(self):
+        from weather.config import MAX_EDGE_PP
+        # model far BELOW market: |0.05 − 0.60| = 0.55 > ceiling
+        gen = _make_generator(model_p=0.05)
+        signal = gen.evaluate(_make_market(yes_price=0.60))
+        assert signal.quality_gate_passed is False
+        assert "gate4.5_edge_ceiling" in signal.rejection_reason
 
 
 class TestModelDiversity:
@@ -378,8 +408,9 @@ class TestSideAwareLiquidity:
     """PR-A: Gate 5 checks the traded side's book; Gate 5.5 caps its spread."""
 
     def _no_side_market(self, **kw):
-        # model_p 0.10 < price 0.60 → implied NO side
-        m = _make_market(yes_price=0.60)
+        # model_p 0.10 < price 0.28 → implied NO side (gross edge 0.18: above
+        # Gate 4's floor, below Gate 4.5's ceiling)
+        m = _make_market(yes_price=0.28)
         for k, v in kw.items():
             setattr(m, k, v)
         return m
@@ -418,11 +449,19 @@ class TestSideAwareLiquidity:
 
 class TestRunningObsWiring:
     """The running-extreme observation is fetched only on the event day for
-    station markets, passed into the model, and logged on the Signal."""
+    station markets, passed into the model, and logged on the Signal.
+    RUNNING_OBS_ENABLED is False in prod (Aug 2026 — clipped trades ran PF 0.67
+    vs 1.22 without); these tests patch it on because the plumbing is retained
+    for a future re-enable with a proper uncertainty fix."""
+
+    @pytest.fixture(autouse=True)
+    def _enable_running_obs(self, monkeypatch):
+        from weather import signal_generator as sg
+        monkeypatch.setattr(sg, "RUNNING_OBS_ENABLED", True)
 
     def _event_day_market(self, days_out=0):
         from datetime import datetime, timedelta, timezone
-        m = _make_market(yes_price=0.60)
+        m = _make_market(yes_price=0.28)  # vs model 0.10: edge inside 4/4.5 band
         # +1 minute: the same instant is trivially the same LOCAL date at the
         # station — (+6h landed on tomorrow when the suite ran in the US
         # evening, a time-of-day flake).
@@ -467,11 +506,18 @@ class TestRunningObsWiring:
 
 class TestEventDayEntryWindow:
     """Gate 1's too-late cut is bypassed exactly when a live running extreme is
-    in hand — the tape-informed window, not a blind one."""
+    in hand — the tape-informed window, not a blind one. Patched on like
+    TestRunningObsWiring: with RUNNING_OBS_ENABLED=False (prod, Aug 2026) no
+    observation is ever in hand, so the late window simply stays shut."""
+
+    @pytest.fixture(autouse=True)
+    def _enable_running_obs(self, monkeypatch):
+        from weather import signal_generator as sg
+        monkeypatch.setattr(sg, "RUNNING_OBS_ENABLED", True)
 
     def _late_market(self):
         from datetime import datetime, timedelta, timezone
-        m = _make_market(yes_price=0.60)
+        m = _make_market(yes_price=0.28)  # vs model 0.10: edge inside 4/4.5 band
         m.resolution_date = datetime.now(timezone.utc) + timedelta(minutes=1)  # < 4h
         return m
 

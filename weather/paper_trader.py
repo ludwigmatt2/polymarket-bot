@@ -294,7 +294,13 @@ class PaperTrader:
             # (probability_model.py: calibrated_p = _apply_calibration(raw_p, ...)),
             # so it must be TRAINED on raw_p — not the calibrated+shrunk model_p.
             # Fall back to model_p only for pre-Phase-0 rows that lack raw_p.
-            if model is not None:
+            # Clip-taint guard (Aug 2026): trades signaled while the (now
+            # disabled) running-extreme clip was active carry a raw_p from the
+            # clipped distribution — resolving them must not train the
+            # calibrator the current model uses. Matches backfill-calibration.
+            clip_tainted = (str(t.get("restofday", "")) == "1"
+                            or str(t.get("running_obs_c", "")).strip())
+            if model is not None and not clip_tainted:
                 raw_p = float(t.get("raw_p") or t["model_p"])
                 model.log_observation(raw_p, outcome, direction=w_dir)
 

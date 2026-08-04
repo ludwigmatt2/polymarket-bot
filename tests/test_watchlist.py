@@ -86,8 +86,10 @@ class TestScanSourceColumn:
         from weather.paper_trader import PaperTrader
         from tests.test_signal_generator import _make_generator, _make_market
 
+        # yes_price 0.28 vs model 0.10: gross edge 0.18 sits inside the
+        # Gate 4 floor / Gate 4.5 ceiling band.
         gen = _make_generator(model_p=0.10)
-        sig = gen.evaluate(_make_market(yes_price=0.60))
+        sig = gen.evaluate(_make_market(yes_price=0.28))
         assert sig.quality_gate_passed
         paper = PaperTrader(log_path=tmp_path / "paper_trades.csv")
         t = paper.log_trade(sig, scan_source="intraday")
@@ -100,7 +102,7 @@ class TestScanSourceColumn:
         from weather.paper_trader import PaperTrader
         from tests.test_signal_generator import _make_generator, _make_market
         gen = _make_generator(model_p=0.10)
-        sig = gen.evaluate(_make_market(yes_price=0.60))
+        sig = gen.evaluate(_make_market(yes_price=0.28))
         paper = PaperTrader(log_path=tmp_path / "paper_trades.csv")
         t = paper.log_trade(sig)
         assert t.scan_source == "hourly"

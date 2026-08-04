@@ -876,12 +876,20 @@ def main() -> None:
         paper = PaperTrader(log_path=log_dir / "paper_trades.csv")
         model = ProbabilityModel(calibration_log_path=log_dir / "calibration_log.csv")
         resolved = [t for t in paper._load_all() if t.get("actual_outcome") not in (None, "", "None")]
-        count = 0
+        count = skipped_clip = 0
         for t in resolved:
             # Phase-0 rule: the calibrator is applied to raw_p, so it must be
             # trained on raw_p. Rows without raw_p (pre-Phase-0) are skipped —
             # backfilling model_p would re-poison the scale (Jul 7 audit).
             if t.get("raw_p") in (None, ""):
+                continue
+            # Clip-taint rule (Aug 2026): the running-extreme clip distorted
+            # raw_p on every trade it touched (clipped trades ran model_p 0.43
+            # vs a 0.59 real outcome rate — the reason the feature was disabled).
+            # Those raw_p values describe the CLIPPED distribution, not the one
+            # the model now produces, so they must not train the calibrator.
+            if str(t.get("restofday", "")) == "1" or str(t.get("running_obs_c", "")).strip():
+                skipped_clip += 1
                 continue
             try:
                 model.log_observation(
@@ -895,7 +903,8 @@ def main() -> None:
         n_obs = model.n_calibration_obs
         active = model._calibrator is not None
         dirs   = list(model._calibrators_by_dir.keys())
-        print(f"  Backfilled {count} observations into {log_dir / 'calibration_log.csv'}")
+        print(f"  Backfilled {count} observations into {log_dir / 'calibration_log.csv'}"
+              f"  ({skipped_clip} clip-tainted rows excluded)")
         print(f"  Total obs: {n_obs}  |  global calibrator active: {active}  |  per-direction: {dirs or 'none'}")
         return
 
