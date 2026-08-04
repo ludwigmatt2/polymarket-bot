@@ -36,6 +36,8 @@ from .config import (
     MODEL_WEIGHTS,
     MOS_ENABLED,
     MOS_METRICS,
+    VARIANCE_INFLATION,
+    VARIANCE_INFLATION_ENABLED,
 )
 from .models import EnsembleForecast, RawProbabilityResult
 from .paths import DATA_DIR
@@ -183,6 +185,24 @@ class ProbabilityModel:
             )
             if shift is not None:
                 member_arrays = {m: [v - shift for v in vals] for m, vals in member_arrays.items()}
+
+        # Variance inflation (EMOS-lite) — AFTER the MOS shift (bias first, then
+        # dispersion), BEFORE the clip (the observation clips the FORECAST
+        # distribution, so it must clip the inflated one). Each model's members
+        # widen about their own mean: v' = mean + λ·(v − mean). Corrects raw
+        # ensemble underdispersion at the source — tail buckets regain the
+        # probability mass reality showed they deserve (raw_p<0.10 resolved YES
+        # 34.9% forward). λ=1 is an exact no-op; fit offline (see config).
+        if VARIANCE_INFLATION_ENABLED and VARIANCE_INFLATION != 1.0:
+            lam = VARIANCE_INFLATION
+            inflated = {}
+            for m, vals in member_arrays.items():
+                if not vals:
+                    inflated[m] = vals
+                    continue
+                mean = sum(vals) / len(vals)
+                inflated[m] = [mean + lam * (v - mean) for v in vals]
+            member_arrays = inflated
 
         # Running-extreme clip — AFTER the MOS shift (the observation is ground
         # truth, not forecast; shifting after clipping could push members back

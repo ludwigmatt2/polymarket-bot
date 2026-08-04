@@ -129,6 +129,26 @@ def run_scan(
         logged = [paper.log_trade(s) for s in actionable]
         print(f"{sum(1 for t in logged if t)} logged")
 
+    # Long-shot harvest (paper-only, isolated track): among the REJECTED
+    # signals, log the sub-3¢ deep-disagreement YES shape the Jul-2026 backtest
+    # showed as fragile-but-positive (5/167 wins, net +$3.5k on flat stakes).
+    # These stay blocked in the real flow (Gate 9.7); this track only gathers
+    # sample size. Rows are tagged scan_source="longshot" and excluded from
+    # stats/gate/calibration (see PaperTrader.log_experimental).
+    if paper:
+        from weather.config import LONGSHOT_MAX_PRICE, LONGSHOT_MIN_RATIO
+        longshots = [
+            s for s in rejected
+            if s.direction == "YES"  # the harvested shape is a cheap YES buy
+            and 0.0 < s.market.yes_price < LONGSHOT_MAX_PRICE
+            and s.prob_result is not None
+            and s.prob_result.raw_p >= LONGSHOT_MIN_RATIO * s.market.yes_price
+        ]
+        if longshots:
+            n_ls = sum(1 for s in longshots if paper.log_experimental(s))
+            if n_ls:
+                print(f"  [longshot] {n_ls} experimental long-shot trade(s) logged")
+
     _print_scan_summary(signals, actionable, rejected)
     funnel = _build_funnel(scanner, signals, actionable, rejected)
     _write_signals_file(actionable, log_dir, funnel)
@@ -876,12 +896,24 @@ def main() -> None:
         paper = PaperTrader(log_path=log_dir / "paper_trades.csv")
         model = ProbabilityModel(calibration_log_path=log_dir / "calibration_log.csv")
         resolved = [t for t in paper._load_all() if t.get("actual_outcome") not in (None, "", "None")]
-        count = 0
+        count = skipped_clip = 0
         for t in resolved:
             # Phase-0 rule: the calibrator is applied to raw_p, so it must be
             # trained on raw_p. Rows without raw_p (pre-Phase-0) are skipped —
             # backfilling model_p would re-poison the scale (Jul 7 audit).
             if t.get("raw_p") in (None, ""):
+                continue
+            # Clip-taint rule (Aug 2026): the running-extreme clip distorted
+            # raw_p on every trade it touched (clipped trades ran model_p 0.43
+            # vs a 0.59 real outcome rate — the reason the feature was disabled).
+            # Those raw_p values describe the CLIPPED distribution, not the one
+            # the model now produces, so they must not train the calibrator.
+            if str(t.get("restofday", "")) == "1" or str(t.get("running_obs_c", "")).strip():
+                skipped_clip += 1
+                continue
+            # Experimental long-shot rows are gate-rejected sample-gathering,
+            # never calibrator food (see PaperTrader.log_experimental).
+            if t.get("scan_source") == "longshot":
                 continue
             try:
                 model.log_observation(
@@ -895,7 +927,8 @@ def main() -> None:
         n_obs = model.n_calibration_obs
         active = model._calibrator is not None
         dirs   = list(model._calibrators_by_dir.keys())
-        print(f"  Backfilled {count} observations into {log_dir / 'calibration_log.csv'}")
+        print(f"  Backfilled {count} observations into {log_dir / 'calibration_log.csv'}"
+              f"  ({skipped_clip} clip-tainted rows excluded)")
         print(f"  Total obs: {n_obs}  |  global calibrator active: {active}  |  per-direction: {dirs or 'none'}")
         return
 
