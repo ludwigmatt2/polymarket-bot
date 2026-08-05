@@ -59,6 +59,7 @@ import csv
 import json
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
@@ -105,9 +106,47 @@ OUT_CSV = Path(__file__).resolve().parent.parent / "data" / "logs" / "historical
 REPLAY_JSONL = OUT_CSV.with_name("historical_backtest_replay.jsonl")
 
 
-def _get_json(url: str, timeout: int = 20):
-    with urllib.request.urlopen(urllib.request.Request(url, headers=_UA), timeout=timeout) as r:
-        return json.loads(r.read().decode())
+# Politeness + resilience for the public endpoints. The Jul-2026 run fired
+# ~11 CLOB calls per city-day back-to-back (one probe + one per bucket) across
+# 15 cities with no delay; that burst tripped CLOB's rate limiter, which
+# answers 403. The old handler swallowed the 403 as "no data" and silently
+# dropped every day from Jul-18 on. Fix: a small inter-request delay + explicit
+# backoff retry on 403/429/5xx. A genuinely-expired market still answers 200
+# with an empty history, so "blocked" and "no data" no longer look alike.
+_MIN_REQUEST_GAP_S = 0.35
+_last_request_ts = [0.0]
+
+
+def _throttle() -> None:
+    import time as _t
+    gap = _t.monotonic() - _last_request_ts[0]
+    if gap < _MIN_REQUEST_GAP_S:
+        _t.sleep(_MIN_REQUEST_GAP_S - gap)
+    _last_request_ts[0] = _t.monotonic()
+
+
+def _get_json(url: str, timeout: int = 20, retries: int = 6):
+    import time as _t
+    last_err = None
+    for attempt in range(retries):
+        _throttle()
+        try:
+            with urllib.request.urlopen(
+                urllib.request.Request(url, headers=_UA), timeout=timeout
+            ) as r:
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code in (403, 429) or 500 <= e.code < 600:
+                # exponential backoff: 1, 2, 4, 8, 16, 32s (+ throttle floor)
+                _t.sleep(2 ** attempt)
+                continue
+            raise  # 4xx other than rate-limit is a real error (bad token etc.)
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+            last_err = e
+            _t.sleep(2 ** attempt)
+            continue
+    raise last_err if last_err else RuntimeError(f"unreachable: {url}")
 
 
 def fetch_series_events(series_id: str, since: date) -> list[dict]:
@@ -134,11 +173,13 @@ def fetch_series_events(series_id: str, since: date) -> list[dict]:
 
 
 def clob_price_near(token_id: str, target_ts: int) -> float | None:
+    """Nearest hourly price to target_ts. None means CLOB answered 200 with an
+    EMPTY history — the market is genuinely outside the ~30-day window. A
+    persistent fetch error (rate-limit surviving all retries) PROPAGATES so
+    callers don't mistake 'blocked' for 'no data' (the Jul-2026 silent-drop
+    bug)."""
     url = f"{_CLOB_HIST}?market={token_id}&interval=max&fidelity=60"
-    try:
-        d = _get_json(url, timeout=30)
-    except Exception:  # noqa: BLE001
-        return None
+    d = _get_json(url, timeout=30)  # raises on persistent 403/429/5xx
     hist = d.get("history") or []
     if not hist:
         return None
@@ -240,8 +281,11 @@ def main() -> None:
           flush=True)
 
     n_events = n_markets = n_priced = n_gated = 0
+    aborted = False
 
     for day_idx, event_day in enumerate(sorted(by_day)):
+        if aborted:
+            break
         by_city: dict[str, list[tuple[object, object]]] = {}
         for city, wm, gm in by_day[event_day]:
             by_city.setdefault(city, []).append((wm, gm))
@@ -254,10 +298,21 @@ def main() -> None:
 
             # Fail fast: CLOB /prices-history is a rolling ~30-day window
             # regardless of market age (see WINDOW_DAYS comment). Skip the
-            # ~100s forecast fetch entirely if this day is already unpriceable.
+            # ~100s forecast fetch only when the probe CONFIRMS the day is
+            # unpriceable (200 + empty history). A propagated fetch error means
+            # blocked, not empty — bail the whole run rather than silently drop
+            # retrievable days (the Jul-2026 bug).
             probe_ts = int(datetime(run_date.year, run_date.month, run_date.day,
                                      12, tzinfo=timezone.utc).timestamp())
-            if clob_price_near(pairs[0][1].yes_token_id, probe_ts) is None:
+            try:
+                probe_price = clob_price_near(pairs[0][1].yes_token_id, probe_ts)
+            except Exception as exc:  # noqa: BLE001
+                print(f"  ! CLOB unreachable after retries at {city} {event_day}: {exc}\n"
+                      f"    stopping — rerun to resume (progress is checkpointed).",
+                      flush=True)
+                aborted = True
+                break
+            if probe_price is None:
                 print(f"  [{day_idx+1}/{total_days}] {city} {event_day}: "
                       f"no CLOB price history (>30d old), skipping", flush=True)
                 continue
@@ -308,7 +363,10 @@ def main() -> None:
                     threshold_high=wm.threshold_high, lead_day=1, month=event_day.month,
                     resolve_unit=wm.resolve_unit, observed_extreme=None,
                 )
-                market_p = clob_price_near(gm.yes_token_id, signal_ts)
+                try:
+                    market_p = clob_price_near(gm.yes_token_id, signal_ts)
+                except Exception:  # noqa: BLE001 — one bucket's block: skip it, not the day
+                    continue
                 if market_p is None or not (0.01 < market_p < 0.99):
                     continue
                 n_priced += 1
