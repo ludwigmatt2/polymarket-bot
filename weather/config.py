@@ -247,7 +247,14 @@ MODEL_WEIGHTING_ENABLED = True
 # distribution. λ is fit OFFLINE by Brier-sweep on the ECMWF+GEFS replay
 # harness (scripts/historical_backtest.py --lambda-sweep); 1.0 = no-op.
 # The MAX_CALIBRATION_SHIFT clamp stays untouched as the downstream safety net.
-VARIANCE_INFLATION = 1.0
+#
+# λ = 2.0 fit Aug 2026: three sweeps on a growing replay window (Jul 4-13 →
+# 711 buckets, Jul 4-17 → 1029, Jul 4-20 → 1218) all bottomed at λ 2.0-2.2
+# with BOTH temporal halves agreeing; the Brier curve is flat across 2.0-2.4.
+# The raw ensemble's spread needs ≈doubling to match reality. This closes the
+# tail miscalibration but NOT the full gap to the market (model Brier ~0.144
+# vs market ~0.119 on the same buckets) — the calibrator retrain stacks on top.
+VARIANCE_INFLATION = 2.0
 VARIANCE_INFLATION_ENABLED = True
 
 # ── Long-shot harvest track (paper-only, Aug 2026) ─────────────────────────────

@@ -18,13 +18,15 @@ def model(tmp_path):
 
 @pytest.fixture
 def forecast_above(target_date=None):
-    """All members above threshold."""
+    """All members COMFORTABLY above threshold — clear of the boundary so the
+    production variance inflation (λ=2.0 widens members ±2× about the mean)
+    can't push any across 90 and change the invariant this fixture asserts."""
     return EnsembleForecast(
         lat=25.77, lon=-80.19,
         target_date=date(2026, 5, 1),
         metric="temperature_2m_max",
-        member_arrays={"gfs_seamless": [92.0, 93.0, 94.0, 91.0, 95.0]},
-        model_means={"gfs_seamless": 93.0, "ecmwf_ifs025": 91.0},
+        member_arrays={"gfs_seamless": [96.0, 97.0, 98.0, 95.0, 99.0]},
+        model_means={"gfs_seamless": 97.0, "ecmwf_ifs025": 95.0},
     )
 
 
@@ -105,13 +107,15 @@ class TestComputeProbability:
     def test_ensemble_spread_uses_per_model_probabilities(self, model):
         # Two models that completely disagree on the threshold:
         # GFS all above (P=1.0), ICON all below (P=0.0). Spread = std([1.0, 0.0]) = 0.5.
+        # Members kept clear of 90 so λ=2.0 inflation can't straddle the boundary
+        # (a member landing exactly on 90.0 would flip a per-model P off 1.0/0.0).
         forecast = EnsembleForecast(
             lat=25.77, lon=-80.19,
             target_date=date(2026, 5, 1),
             metric="temperature_2m_max",
             member_arrays={
-                "gfs_seamless": [92.0, 93.0, 94.0, 95.0, 96.0],
-                "icon_seamless": [80.0, 81.0, 82.0, 83.0, 84.0],
+                "gfs_seamless": [95.0, 96.0, 97.0, 98.0, 99.0],
+                "icon_seamless": [78.0, 79.0, 80.0, 81.0, 82.0],
             },
         )
         result = model.compute_probability(forecast, threshold=90.0, direction="above")
