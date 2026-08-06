@@ -183,12 +183,14 @@ MAX_CALIBRATION_SHIFT = 0.25
 GATE_MIN_STATION_RESOLVED = 150
 GATE_MIN_DAYS_ELAPSED = 21
 # Era boundary: only trades SIGNALED after this instant count for the gate.
-# A validation record must measure ONE system (the Jul-9 lesson). Bumped
-# 2026-07-09 → 2026-08-05 at the Phase-1 fix deploy: the running-extreme clip
-# was disabled and the edge ceiling added — both change which trades exist and
-# how they're priced, so the prior era's 206 trades (PF 0.90, clip-tainted)
-# belong to the old system's record. Fresh 0/150 run from here.
-GATE_ERA_START = "2026-08-05T00:00"
+# A validation record must measure ONE system (the Jul-9 lesson). Set to the
+# actual Phase-1+2 deploy instant (service restarted 2026-08-06 ~12:27 UTC on
+# the new code): clip disabled, edge ceiling added, variance inflation λ=2.0.
+# The prior era's 206 trades (PF 0.90, clip-tainted, λ=1.0) belong to the old
+# system's record; trades signaled Aug-5..deploy were also still old-code, so
+# the boundary is the restart, not a round date. Fresh 0/150 from here; the
+# topline history keeps every trade.
+GATE_ERA_START = "2026-08-06T12:27"
 MAX_PAPER_DRAWDOWN_PCT = 0.20   # Max hypothetical drawdown allowed
 
 # ── Open-Meteo API ────────────────────────────────────────────────────────────
