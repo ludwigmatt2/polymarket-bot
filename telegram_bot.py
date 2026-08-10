@@ -50,6 +50,7 @@ from weather import permissions as perms
 from weather import withdrawal_policy as wpol
 from weather.audit import audit_log, read_audit
 from weather.config import (
+    GATE_ERA_START,
     WITHDRAW_COOLING_OFF_HOURS,
     WITHDRAW_DAILY_CAP_USD,
     WITHDRAW_LARGE_USD,
@@ -439,36 +440,19 @@ def withdraw_rate_limited(uid: int) -> bool:
 
 # ── Stats ─────────────────────────────────────────────────────────────────────
 
-def read_stats(uid: int) -> dict:
-    trades_csv = _trades_csv_path(uid)
-    if not trades_csv.exists():
-        return {}
-    with trades_csv.open() as f:
-        rows = list(csv.DictReader(f))
-
-    resolved = [r for r in rows if r.get("resolved_at")]
+def _track_stats(resolved: list[dict]) -> dict:
+    """WR / PF / PnL / Brier-skill for one bucket of resolved rows."""
     wins   = [r for r in resolved if r.get("pnl_usd") and float(r["pnl_usd"]) > 0]
     losses = [r for r in resolved if r.get("pnl_usd") and float(r["pnl_usd"]) < 0]
-
     gross_win  = sum(float(r["pnl_usd"]) for r in wins)
     gross_loss = abs(sum(float(r["pnl_usd"]) for r in losses))
     pf         = gross_win / gross_loss if gross_loss > 0 else None
     total_pnl  = sum(float(r["pnl_usd"]) for r in resolved if r.get("pnl_usd"))
-
     brier      = [float(r["brier_score"]) for r in resolved if r.get("brier_score")]
     mean_brier = sum(brier) / len(brier) if brier else None
     bss        = 1 - (mean_brier / 0.25) if mean_brier else None
-
-    pending_by_date: dict[str, int] = {}
-    for r in rows:
-        if not r.get("resolved_at") and r.get("resolution_date"):
-            d = r["resolution_date"][:10]
-            pending_by_date[d] = pending_by_date.get(d, 0) + 1
-
     return {
-        "total": len(rows),
         "resolved": len(resolved),
-        "pending": len(rows) - len(resolved),
         "wins": len(wins),
         "losses": len(losses),
         "win_rate": len(wins) / len(resolved) * 100 if resolved else None,
@@ -476,9 +460,53 @@ def read_stats(uid: int) -> dict:
         "total_pnl": total_pnl,
         "mean_brier": mean_brier,
         "bss": bss,
-        "pending_by_date": dict(sorted(pending_by_date.items())),
-        "gates_passed": len(resolved) >= 20 and pf is not None and pf >= 1.5,
     }
+
+
+def read_stats(uid: int) -> dict:
+    trades_csv = _trades_csv_path(uid)
+    if not trades_csv.exists():
+        return {}
+    with trades_csv.open() as f:
+        all_rows = list(csv.DictReader(f))
+
+    # Era scope: only trades SIGNALED after the current model era began count.
+    # Earlier rows belong to a different (clip-tainted, λ=1.0) system — mixing
+    # them muddies the record. Matches the go-live gate's own era logic.
+    rows = [r for r in all_rows if str(r.get("signal_time", "")) >= GATE_ERA_START]
+
+    resolved = [r for r in rows if r.get("resolved_at")]
+    is_longshot = lambda r: (r.get("scan_source") or "") == "longshot"  # noqa: E731
+    mainline_res = [r for r in resolved if not is_longshot(r)]
+    longshot_res = [r for r in resolved if is_longshot(r)]
+
+    s = _track_stats(resolved)                       # combined (era-scoped)
+    s["tracks"] = {
+        "mainline": _track_stats(mainline_res),      # hourly + intraday: live-tradeable
+        "longshot": _track_stats(longshot_res),      # microprice tails: experimental
+    }
+
+    pending_by_date: dict[str, int] = {}
+    for r in rows:
+        if not r.get("resolved_at") and r.get("resolution_date"):
+            d = r["resolution_date"][:10]
+            pending_by_date[d] = pending_by_date.get(d, 0) + 1
+
+    s["total"] = len(rows)
+    s["pending"] = len(rows) - len(resolved)
+    s["pending_by_date"] = dict(sorted(pending_by_date.items()))
+    s["era_start"] = GATE_ERA_START
+
+    # Go-live gate is judged on the MAINLINE track only. The longshot lottery's
+    # PF is driven by a handful of microprice tail hits that can't be filled with
+    # real size, so it must never open the live gate.
+    m = s["tracks"]["mainline"]
+    s["gates_passed"] = (
+        m["resolved"] >= 20
+        and m["profit_factor"] is not None and m["profit_factor"] >= 1.5
+        and m["bss"] is not None and m["bss"] >= 0.0
+    )
+    return s
 
 def read_live_stats(uid: int) -> dict:
     """Real-money stats from live_trades.csv — the clean slate that begins at
@@ -675,16 +703,27 @@ def _fmt_status_paper(uid: int) -> str:
             f"📈 *{ret:+.1f}% return*   (${bal:,.2f} of ${PAPER_BANKROLL_USD:,.0f} paper bankroll)"
         )
 
-    lines.append(f"\n{s['resolved']} resolved · {s['pending']} pending · {s['total']} total")
+    lines.append(f"_Era-scoped · since {s['era_start']} UTC_")
+    lines.append(f"{s['resolved']} resolved · {s['pending']} pending · {s['total']} total")
 
-    if s["win_rate"] is not None:
-        lines.append(f"Win rate:      {s['win_rate']:.1f}%  ({s['wins']}W / {s['losses']}L)")
-    if s["profit_factor"] is not None:
-        e = "✅" if s["profit_factor"] >= 1.5 else "⚠️"
-        lines.append(f"Prof. factor:  {e} {s['profit_factor']:.2f}  (need ≥ 1.5)")
-    if s["bss"] is not None:
-        e = "✅" if s["bss"] >= 0 else "⚠️"
-        lines.append(f"Brier skill:   {e} {s['bss']:+.3f}  (need ≥ 0.0)")
+    def _track_block(title: str, t: dict, note: str) -> list[str]:
+        if t["resolved"] == 0:
+            return [f"\n*{title}*  _{note}_", "  no resolved trades yet"]
+        pf = t["profit_factor"]
+        pf_str = f"{pf:.2f}" if pf is not None else "—"
+        b = [
+            f"\n*{title}*  _{note}_",
+            f"  {t['resolved']} trades · WR {t['win_rate']:.1f}%  ({t['wins']}W / {t['losses']}L)",
+            f"  PnL ${t['total_pnl']:+,.2f} · PF {pf_str}",
+        ]
+        if t["bss"] is not None:
+            b.append(f"  Brier skill {t['bss']:+.3f}")
+        return b
+
+    m = s["tracks"]["mainline"]
+    l = s["tracks"]["longshot"]
+    lines += _track_block("🎯 Mainline (live-tradeable)", m, "hourly + intraday")
+    lines += _track_block("🎰 Longshot (experimental)", l, "microprice tails — not live-fillable")
 
     if scan:
         lines.append(
@@ -692,25 +731,20 @@ def _fmt_status_paper(uid: int) -> str:
             f" · {scan['high_conf']} high-conf / {scan['total']} signals"
         )
 
-    # Go-live gate
-    all_pass = (
-        s["resolved"] >= 20
-        and s["profit_factor"] is not None and s["profit_factor"] >= 1.5
-        and s["bss"] is not None and s["bss"] >= 0.0
-    )
-    if all_pass:
-        lines.append("\n🟢 *All gates passed — ready for live*")
+    # Go-live gate — judged on the MAINLINE track only (see read_stats).
+    if s["gates_passed"]:
+        lines.append("\n🟢 *Mainline gates passed — ready for live*")
     else:
         missing = []
-        if s["resolved"] < 20:
-            missing.append(f"{s['resolved']}/20 trades")
-        if s["profit_factor"] is None or s["profit_factor"] < 1.5:
-            pf_str = f"{s['profit_factor']:.2f}" if s["profit_factor"] else "N/A"
+        if m["resolved"] < 20:
+            missing.append(f"{m['resolved']}/20 trades")
+        if m["profit_factor"] is None or m["profit_factor"] < 1.5:
+            pf_str = f"{m['profit_factor']:.2f}" if m["profit_factor"] else "N/A"
             missing.append(f"PF {pf_str}")
-        if s["bss"] is None or s["bss"] < 0.0:
-            bss_str = f"{s['bss']:+.3f}" if s["bss"] is not None else "N/A"
+        if m["bss"] is None or m["bss"] < 0.0:
+            bss_str = f"{m['bss']:+.3f}" if m["bss"] is not None else "N/A"
             missing.append(f"BSS {bss_str}")
-        lines.append(f"\n🔴 Gates pending: {', '.join(missing)}")
+        lines.append(f"\n🔴 Mainline gates pending: {', '.join(missing)}")
 
     return "\n".join(lines)
 
