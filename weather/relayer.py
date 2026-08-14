@@ -71,6 +71,28 @@ def is_deployed(wallet: str) -> bool:
     return code not in ("0x", "0x0")
 
 
+def chain_outcome(condition_id: str) -> bool | None:
+    """A binary market's resolved outcome read directly from the ConditionalTokens
+    contract's payoutNumerators — Polymarket's actual on-chain settlement, not a
+    weather-truth proxy. True = the "Yes" token (index 0) won, False = "No" (index
+    1). Returns None if the market hasn't resolved on-chain yet, the RPC call
+    failed, or the payout is a non-binary split (e.g. a UMA 50/50) that can't be
+    read as a clean win/loss."""
+    cond_hex = condition_id.lower().replace("0x", "").zfill(64)
+    nums = []
+    for idx in (0, 1):
+        idx_hex = format(idx, "064x")
+        r = _rpc("eth_call", [{"to": pm.CTF,
+                 "data": pm.SEL_PAYOUT_NUMERATORS + cond_hex + idx_hex}, "latest"])
+        if r is None:
+            return None
+        nums.append(int(r, 16))
+    yes_n, no_n = nums
+    if yes_n == no_n:
+        return None  # unresolved (0,0) or an ambiguous 50/50 split
+    return yes_n > no_n
+
+
 def derive_deposit_wallet(eoa: str) -> str | None:
     """The deterministic V2 deposit-wallet address for an owner EOA, via the
     factory's predictWalletAddress(bytes32) read fn (authoritative — equals the

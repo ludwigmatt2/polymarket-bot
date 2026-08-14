@@ -38,6 +38,7 @@ SEL_CTF_REDEEM = "0x01b7037c"          # CTF.redeemPositions(address,bytes32,byt
 SEL_NEGRISK_REDEEM = "0xdbeccb23"      # NegRiskAdapter.redeemPositions(bytes32,uint256[])
 SEL_NONCE = "0xaffed0e0"               # DepositWallet.nonce()
 SEL_PREDICT_WALLET = "0x04f1d3c7"      # factory.predictWalletAddress(bytes32)
+SEL_PAYOUT_NUMERATORS = "0x0504c814"   # CTF.payoutNumerators(bytes32,uint256)
 
 MAX_UINT = (1 << 256) - 1
 ZERO32 = b"\x00" * 32

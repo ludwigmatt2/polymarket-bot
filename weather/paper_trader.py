@@ -27,6 +27,7 @@ from .config import (
     PAPER_TRADE_SIZE_USD,
 )
 from .models import Location, PaperTrade, PaperTradingStats, Signal, _evaluate_outcome
+from .relayer import chain_outcome
 from .station_truth import station_outcome
 
 PAPER_TRADES_LOG = Path("logs/paper_trades.csv")
@@ -45,9 +46,12 @@ CSV_HEADERS = [
     "raw_p", "model_breakdown_json",
     # Phase 1: resolving station (empty on older rows → Open-Meteo resolution path).
     "station_icao", "station_country", "resolve_unit",
-    # Which truth labeled this outcome: "station" (WU→IEM, what Polymarket pays on)
-    # or "grid" (Open-Meteo reanalysis fallback). The re-live gate counts ONLY
-    # station-labeled trades — grid labels disagreed with on-chain 33% of the time.
+    # Which truth labeled this outcome: "onchain" (ConditionalTokens
+    # payoutNumerators — Polymarket's actual settlement, preferred whenever
+    # available), else "station" (WU→IEM) or "grid" (Open-Meteo reanalysis
+    # fallback, used only while a market hasn't settled on-chain yet). Grid
+    # labels disagreed with on-chain outcome on ~1% of longshot trades checked
+    # Aug 2026 — small in count but concentrated in the biggest payouts.
     "label_source",
     # Running-extreme clip: observed station max/min (°C) applied at signal time
     # ("" = feature stood down) — separates the feature's PnL contribution.
@@ -217,10 +221,12 @@ class PaperTrader:
 
     def auto_resolve(self, weather_client, model=None) -> tuple[int, int]:
         """
-        Fetch actual outcomes from the archive API and resolve all eligible trades.
+        Resolve all eligible trades, preferring Polymarket's own on-chain
+        settlement (ConditionalTokens payoutNumerators) over any weather-truth
+        proxy. Station (WU→IEM) then Open-Meteo grid are fallbacks used only
+        while a market hasn't resolved on-chain yet.
 
-        Eligible: resolution_date has passed AND actual_outcome is blank AND
-        the trade has location/threshold data stored (metric, lat, lon fields non-empty).
+        Eligible: resolution_date has passed AND actual_outcome is blank.
 
         Returns (resolved_count, skipped_count).
         """
@@ -245,54 +251,67 @@ class PaperTrader:
             if res_dt > now:
                 continue  # not yet resolved
 
-            metric = t.get("metric", "")
-            lat_str = t.get("lat", "")
-            lon_str = t.get("lon", "")
-            if not metric or not lat_str or not lon_str:
-                skipped += 1
-                continue
-
-            try:
-                lat, lon = float(lat_str), float(lon_str)
-                threshold = float(t["threshold"])
-                threshold_high = float(t["threshold_high"]) if t.get("threshold_high") else None
-                w_dir = t.get("weather_direction", "above")
-            except (ValueError, KeyError):
-                skipped += 1
-                continue
-
+            w_dir = t.get("weather_direction", "above")
             loc_tz = t.get("location_tz") or "UTC"
-            # Wait until the event's local day is over + settled, so we read the
-            # final daily value, not a mid-day forecast. Fetch on the station's LOCAL
-            # calendar day (resolution_date is UTC — can be the adjacent date).
+            # A market can't settle — on-chain or otherwise — before its event has
+            # actually happened. Gate on the same "local day is over" check for
+            # every source up front, so a trade whose event day hasn't ended yet
+            # doesn't burn an RPC round-trip on every single auto_resolve pass.
             if not _settle_ready(res_dt, loc_tz, now):
                 continue
-            event_date = _local_event_date(res_dt, loc_tz)
 
-            station_icao = t.get("station_icao") or ""
-            resolve_unit = t.get("resolve_unit") or ""
-            # Require the unit too — never guess it, or a °F market with a blank unit
-            # would resolve in °C. Missing unit → fall through to the Open-Meteo path.
-            use_station = (station_icao and resolve_unit
-                           and metric in ("temperature_2m_max", "temperature_2m_min"))
-            if use_station:
-                # Phase 1: resolve on the station's Wunderground reading (WU → IEM
-                # fallback), rounded to whole degrees in the market's unit — matching
-                # how Polymarket actually settles.
-                outcome, _src, _val = station_outcome(
-                    station_icao, t.get("station_country") or "", resolve_unit,
-                    event_date, metric, threshold, threshold_high, w_dir, cache=station_cache,
-                )
-                if outcome is None:
-                    skipped += 1
-                    continue
+            # On-chain settlement is Polymarket's actual ground truth — try it
+            # first, independent of weather data; it needs no lat/lon/threshold at
+            # all. Falls through to station/grid only while the market hasn't
+            # resolved on-chain yet (RPC hiccup or UMA dispute window still open).
+            market_id = t.get("market_id") or ""
+            chain_yes = chain_outcome(market_id) if market_id else None
+            if chain_yes is not None:
+                outcome = chain_yes
+                label_source = "onchain"
             else:
-                loc = Location(city="", lat=lat, lon=lon, timezone=loc_tz)
-                actual_val = weather_client.get_historical_actual(loc, event_date, metric)
-                if actual_val is None:
+                metric = t.get("metric", "")
+                lat_str = t.get("lat", "")
+                lon_str = t.get("lon", "")
+                if not metric or not lat_str or not lon_str:
                     skipped += 1
                     continue
-                outcome = _evaluate_outcome(actual_val, threshold, w_dir, threshold_high)
+
+                try:
+                    lat, lon = float(lat_str), float(lon_str)
+                    threshold = float(t["threshold"])
+                    threshold_high = float(t["threshold_high"]) if t.get("threshold_high") else None
+                except (ValueError, KeyError):
+                    skipped += 1
+                    continue
+
+                event_date = _local_event_date(res_dt, loc_tz)
+
+                station_icao = t.get("station_icao") or ""
+                resolve_unit = t.get("resolve_unit") or ""
+                # Require the unit too — never guess it, or a °F market with a blank unit
+                # would resolve in °C. Missing unit → fall through to the Open-Meteo path.
+                use_station = (station_icao and resolve_unit
+                               and metric in ("temperature_2m_max", "temperature_2m_min"))
+                if use_station:
+                    # Phase 1: resolve on the station's Wunderground reading (WU → IEM
+                    # fallback), rounded to whole degrees in the market's unit — matching
+                    # how Polymarket actually settles.
+                    outcome, _src, _val = station_outcome(
+                        station_icao, t.get("station_country") or "", resolve_unit,
+                        event_date, metric, threshold, threshold_high, w_dir, cache=station_cache,
+                    )
+                    if outcome is None:
+                        skipped += 1
+                        continue
+                else:
+                    loc = Location(city="", lat=lat, lon=lon, timezone=loc_tz)
+                    actual_val = weather_client.get_historical_actual(loc, event_date, metric)
+                    if actual_val is None:
+                        skipped += 1
+                        continue
+                    outcome = _evaluate_outcome(actual_val, threshold, w_dir, threshold_high)
+                label_source = "station" if use_station else "grid"
 
             # Compute PnL and Brier in-place to avoid O(n²) load+rewrite per trade
             entry_price = float(t["entry_price"])
@@ -305,7 +324,7 @@ class PaperTrader:
             t["resolved_at"] = now.isoformat()
             t["pnl_usd"] = round(pnl, 4)
             t["brier_score"] = round(_brier(model_p, outcome), 4)
-            t["label_source"] = "station" if use_station else "grid"
+            t["label_source"] = label_source
             resolved += 1
 
             # Phase 0 fix: the calibrator is applied to raw_p at inference
