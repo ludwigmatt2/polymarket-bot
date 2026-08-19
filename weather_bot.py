@@ -143,6 +143,14 @@ def run_scan(
             and 0.0 < s.market.yes_price < LONGSHOT_MAX_PRICE
             and s.prob_result is not None
             and s.prob_result.raw_p >= LONGSHOT_MIN_RATIO * s.market.yes_price
+            # Never harvest a signal Gate 0.5 rejected for having no trusted
+            # resolution source (e.g. Hong Kong: no registered station, resolves
+            # off HKO with a publication lag our own auto_resolve can't verify).
+            # That gate exists so paper_trader.auto_resolve can't fall back to an
+            # untrustworthy grid label for it — harvesting these anyway defeats
+            # that guarantee (Aug 2026: 100% of longshot's on-chain-vs-recorded
+            # PnL flips, twice, traced back to exactly this city).
+            and not (s.rejection_reason or "").startswith("gate0.5")
         ]
         if longshots:
             n_ls = sum(1 for s in longshots if paper.log_experimental(s))
