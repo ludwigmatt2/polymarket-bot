@@ -1126,7 +1126,6 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "/audit [n] — recent audit log",
             "/setwithdrawcap <id> <usd> — set a user's daily withdrawal cap",
             "/setmaxbet <usd> — set global max bet per trade",
-            "/setup <key> [proxy] — save credentials (legacy)",
         ]
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -1651,7 +1650,7 @@ def _log_startup() -> None:
     elif _sec._get_fernet() is not None:
         backend = "Fernet (AES-128, key from POLYMARKET_SECRETS_KEY)"
     else:
-        backend = "NONE — key storage unavailable, /setup will fail"
+        backend = "NONE — key storage unavailable, /wallet_setup will fail"
     print(f"[startup] key backend : {backend}", flush=True)
     print(f"[startup] DATA_DIR    : {DATA_DIR}", flush=True)
     print(f"[startup] PYTHON_BIN  : {PYTHON}", flush=True)
