@@ -1,7 +1,9 @@
 """PR1 — wallet safety: /wallet_setup re-entry + overwrite guards.
 
-The dangerous path is ob_create (and /setup) silently regenerating over an
-existing key, discarding the old wallet + its funds. These tests pin the guard.
+The dangerous path is ob_create silently regenerating over an existing key,
+discarding the old wallet + its funds. These tests pin the guard. (The legacy
+/setup command had its own copy of this guard; removed along with the command
+Aug 2026 — /wallet_setup is the only credential path now.)
 """
 
 import asyncio
@@ -106,30 +108,3 @@ class TestCreateOverwriteGuard:
         assert "0xBEEF" in q.edit_message_text.call_args.args[0]
 
 
-class TestSetupOverwriteGuard:
-    def _run_setup(self, monkeypatch, args, existing_key):
-        import telegram_bot as tb
-        monkeypatch.setattr(tb, "_ensure_authorized", AsyncMock(return_value=True))
-        monkeypatch.setattr(tb, "has_permission", lambda *a, **k: True)
-        monkeypatch.setattr(tb, "get_user_key", lambda uid: existing_key)
-        setk = MagicMock()
-        monkeypatch.setattr(tb, "set_user_key", setk)
-        update = MagicMock()
-        update.effective_user.id = 111
-        update.message.reply_text = AsyncMock()
-        ctx = MagicMock()
-        ctx.args = list(args)
-        _run(lambda: tb.cmd_setup(update, ctx))
-        return update, setk
-
-    def test_refuses_overwrite_without_replace(self, monkeypatch):
-        update, setk = self._run_setup(monkeypatch, ["0xdeadbeef"], existing_key="0xexisting")
-        setk.assert_not_called()
-        assert "already have a wallet" in update.message.reply_text.call_args.args[0].lower()
-
-    def test_replace_token_allows_overwrite(self, monkeypatch):
-        # With `replace`, storage proceeds (set_user_key called).
-        import telegram_bot as tb
-        monkeypatch.setattr(tb, "derive_and_store_clob_creds", lambda uid: {})
-        update, setk = self._run_setup(monkeypatch, ["0xdeadbeef", "replace"], existing_key="0xexisting")
-        setk.assert_called_once()

@@ -30,13 +30,12 @@ BYPASS_SCAN_COOLDOWN = "bypass_scan_cooldown"  # exempt from per-user scan coold
 MANAGE_USERS         = "manage_users"          # add/remove/list/suspend users, invite
 MANAGE_ROLES         = "manage_roles"          # change an existing user's role
 SET_MAXBET           = "set_maxbet"            # global runtime max-bet config
-USE_LEGACY_SETUP     = "use_legacy_setup"      # legacy /setup credential command
 VIEW_USERS           = "view_users"            # list registered users
 WITHDRAW_ANY         = "withdraw_any"          # withdraw from any user (owner; Phase C)
 
 ALL_CAPABILITIES: frozenset[str] = frozenset({
     VIEW, GO_LIVE, DEPOSIT_OWN, WITHDRAW_OWN, TRIGGER_SCAN, BYPASS_SCAN_COOLDOWN,
-    MANAGE_USERS, MANAGE_ROLES, SET_MAXBET, USE_LEGACY_SETUP, VIEW_USERS, WITHDRAW_ANY,
+    MANAGE_USERS, MANAGE_ROLES, SET_MAXBET, VIEW_USERS, WITHDRAW_ANY,
 })
 
 # ── Roles ─────────────────────────────────────────────────────────────────────
@@ -53,7 +52,7 @@ ROLE_CAPABILITIES: dict[str, frozenset[str]] = {
     OWNER: ALL_CAPABILITIES,
     ADMIN: frozenset({
         VIEW, GO_LIVE, DEPOSIT_OWN, WITHDRAW_OWN, TRIGGER_SCAN, BYPASS_SCAN_COOLDOWN,
-        MANAGE_USERS, MANAGE_ROLES, SET_MAXBET, USE_LEGACY_SETUP, VIEW_USERS,
+        MANAGE_USERS, MANAGE_ROLES, SET_MAXBET, VIEW_USERS,
     }),  # NOTE: no WITHDRAW_ANY — only the owner can touch other users' funds.
     TRADER: frozenset({VIEW, GO_LIVE, DEPOSIT_OWN, WITHDRAW_OWN}),
     VIEWER: frozenset({VIEW}),

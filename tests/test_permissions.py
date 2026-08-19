@@ -14,13 +14,13 @@ EXPECTED = {
     perms.OWNER: {
         perms.VIEW, perms.GO_LIVE, perms.DEPOSIT_OWN, perms.WITHDRAW_OWN,
         perms.TRIGGER_SCAN, perms.BYPASS_SCAN_COOLDOWN, perms.MANAGE_USERS,
-        perms.MANAGE_ROLES, perms.SET_MAXBET, perms.USE_LEGACY_SETUP,
+        perms.MANAGE_ROLES, perms.SET_MAXBET,
         perms.VIEW_USERS, perms.WITHDRAW_ANY,
     },
     perms.ADMIN: {
         perms.VIEW, perms.GO_LIVE, perms.DEPOSIT_OWN, perms.WITHDRAW_OWN,
         perms.TRIGGER_SCAN, perms.BYPASS_SCAN_COOLDOWN, perms.MANAGE_USERS,
-        perms.MANAGE_ROLES, perms.SET_MAXBET, perms.USE_LEGACY_SETUP,
+        perms.MANAGE_ROLES, perms.SET_MAXBET,
         perms.VIEW_USERS,  # NO withdraw_any
     },
     perms.TRADER: {perms.VIEW, perms.GO_LIVE, perms.DEPOSIT_OWN, perms.WITHDRAW_OWN},

@@ -30,7 +30,7 @@ from typing import Optional
 
 from dotenv import load_dotenv
 from weather._io import atomic_write_text
-from weather.secrets import derive_and_store_clob_creds, get_user_key, set_user_creds, set_user_key
+from weather.secrets import get_user_key, set_user_creds
 import telegram_views
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -338,6 +338,12 @@ def wallet_stats(uid: int) -> dict:
     if csv_path.exists():
         with csv_path.open() as f:
             rows = list(csv.DictReader(f))
+    # Era-scope + drop the retired longshot track, matching read_stats(). Without
+    # this, PnL/balance here silently mixed in ~2,000 dead longshot rows and
+    # pre-Aug-6 clip-tainted history — a stale number nobody should see again
+    # (see [[longshot_retired]]).
+    rows = [r for r in rows if r.get("signal_time", "") >= GATE_ERA_START
+            and r.get("scan_source") != "longshot"]
 
     resolved = [r for r in rows if r.get("resolved_at")]
     pending  = [r for r in rows if not r.get("resolved_at")]
@@ -1638,81 +1644,6 @@ async def cmd_resolve(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         summary = next((l for l in stdout.splitlines() if "Auto-resolved" in l), "Done.")
         await msg.edit_text(f"✅ {summary.strip()}", reply_markup=main_kb(uid))
 
-@require_perm(perms.USE_LEGACY_SETUP)
-async def cmd_setup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    # Strip an explicit `replace` / `confirm` token from anywhere in the args.
-    replace = any(a.lower() in ("replace", "confirm") for a in ctx.args)
-    args = [a for a in ctx.args if a.lower() not in ("replace", "confirm")]
-    if not args:
-        await update.message.reply_text(
-            "*Setup your Polymarket account*\n\n"
-            "Usage: `/setup <private_key> [proxy_address]`\n\n"
-            "Your private key is stored *encrypted* in `user_keys.enc.json` "
-            "(never in plain text). Send this command in a private chat with the bot.",
-            parse_mode="Markdown",
-        )
-        return
-    # Guard against silently replacing an existing wallet (fund-loss risk).
-    if get_user_key(uid) and not replace:
-        await update.message.reply_text(
-            "⚠️ *You already have a wallet.* `/setup` would replace its key — the old "
-            "key (and any funds) become *unrecoverable* unless backed up.\n\n"
-            "Back up first (`/wallet_setup` → 🔑 reveal), then run "
-            "`/setup <private_key> replace` to proceed.",
-            parse_mode="Markdown",
-        )
-        return
-    # Store key encrypted; scrub the plaintext arg from memory immediately
-    raw_key = args[0]
-    for i in range(len(ctx.args)):
-        ctx.args[i] = "***"
-    try:
-        set_user_key(uid, raw_key)
-    except RuntimeError as exc:
-        await update.message.reply_text(
-            f"❌ Key storage unavailable: {exc}\n"
-            "Set `POLYMARKET_SECRETS_KEY` in `.env` or install `keyring`.",
-            parse_mode="Markdown",
-        )
-        return
-
-    if len(args) > 1:
-        proxy = args[1]
-        set_user_creds(uid, proxy_address=proxy, signature_type="gnosis-safe")
-        with _users_transaction() as users:
-            users[uid]["proxy_address"] = proxy
-            users[uid]["signature_type"] = "gnosis-safe"
-
-    # Best-effort: delete the user's message to remove the key from chat history
-    try:
-        await update.message.delete()
-        key_deleted = True
-    except Exception:
-        key_deleted = False
-
-    # Derive L2 CLOB credentials from L1 key (non-blocking, best-effort)
-    try:
-        import asyncio as _asyncio
-        await _asyncio.wait_for(
-            _asyncio.to_thread(derive_and_store_clob_creds, uid),
-            timeout=20,
-        )
-        l2_note = "🔑 L2 trading credentials derived and stored.\n"
-    except Exception:
-        l2_note = "⚠️ L2 credential derivation failed — balance checks may show $0. Run /setup again to retry.\n"
-
-    reply = (
-        f"✅ Credentials saved (encrypted).\n{l2_note}\n"
-        "Use `/mymode live` to switch to live trading.\n\n"
-    )
-    if not key_deleted:
-        reply += (
-            "⚠️ *Please delete your message containing the private key* — "
-            "it remains visible in this chat and may be stored by Telegram."
-        )
-    await update.message.reply_text(reply, parse_mode="Markdown")
-
 def _log_startup() -> None:
     from weather import secrets as _sec
     if _sec._get_keyring() is not None:
@@ -2474,7 +2405,6 @@ _ADMIN_COMMANDS = _USER_COMMANDS + [
     ("users",       "👥 List all registered users"),
     ("audit",       "🧾 Recent audit log (money/role/live events)"),
     ("setwithdrawcap", "🔐 Set a user's daily withdrawal cap"),
-    ("setup",       "⚙️ Save credentials (legacy)"),
     ("setmaxbet",   "💰 Set max bet size per trade (e.g. /setmaxbet 50)"),
 ]
 
@@ -2821,7 +2751,6 @@ async def _run() -> None:
         ("losses",      cmd_losses),
         ("scan",        cmd_scan),
         ("resolve",     cmd_resolve),
-        ("setup",       cmd_setup),
         ("exportkey",   cmd_exportkey),
         ("mymode",      cmd_mymode),
         ("deposit",     cmd_deposit),
