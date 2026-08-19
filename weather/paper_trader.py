@@ -95,18 +95,6 @@ class PaperTrader:
                           size_usd=round(PAPER_TRADE_SIZE_USD * size_factor, 2),
                           size_factor=size_factor)
 
-    def log_experimental(self, signal: Signal, scan_source: str = "longshot",
-                          size_usd: float = 5.0) -> PaperTrade | None:
-        """Record a GATE-REJECTED signal on an isolated experimental track.
-
-        Used for the long-shot harvest (sub-3¢ YES buys the backtest showed as
-        a fragile-but-positive pattern, 5/167 wins): these are blocked by Gate
-        9.7 in the real flow and must stay blocked there — this path exists to
-        gather sample size, not to trade. Flat tiny stake, no size_factor.
-        Rows carry scan_source="longshot" and are EXCLUDED from compute_stats
-        (topline + re-live gate) and from calibrator training."""
-        return self._log(signal, scan_source, size_usd=size_usd, size_factor=1.0)
-
     def _log(self, signal: Signal, scan_source: str,
               size_usd: float, size_factor: float) -> PaperTrade | None:
         if self._existing_keys is None:
@@ -400,9 +388,9 @@ class PaperTrader:
     def compute_stats(self) -> PaperTradingStats:
         """Compute aggregate metrics over all resolved trades."""
         trades = self._load_all()
-        # The experimental long-shot track never enters the record: it exists
-        # to gather sample size on gate-REJECTED signals (see log_experimental)
-        # and would corrupt both the topline and the re-live gate if counted.
+        # Retired experimental long-shot rows (scan_source="longshot", Aug 2026
+        # harvest — see [[longshot_retired]]) never enter the record: they'd
+        # corrupt both the topline and the re-live gate if counted.
         trades = [t for t in trades if t.get("scan_source") != "longshot"]
         resolved = [t for t in trades if t.get("actual_outcome") in ("0", "1", 0, 1)]
 

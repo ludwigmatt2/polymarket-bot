@@ -259,16 +259,6 @@ MODEL_WEIGHTING_ENABLED = True
 VARIANCE_INFLATION = 2.0
 VARIANCE_INFLATION_ENABLED = True
 
-# ── Long-shot harvest track (paper-only, Aug 2026) ─────────────────────────────
-# The Jul-2026 backtest found sub-3¢ YES buys with deep model disagreement won
-# only 5/167 but netted +$3.5k on flat stakes — a real but fragile pattern that
-# 5 observations cannot justify trading. Gate 9.7 keeps them blocked in the
-# real flow; run_scan logs matching REJECTED signals to an isolated paper track
-# (scan_source="longshot", flat $5, excluded from stats/gate/calibration) purely
-# to gather forward sample size.
-LONGSHOT_MAX_PRICE = 0.03       # market YES price below this = long-shot territory
-LONGSHOT_MIN_RATIO = 10.0       # raw_p must be ≥ this multiple of the market price
-
 # Deterministic models used for cross-model spread (uncertainty proxy)
 FORECAST_MODELS = ["gfs_seamless", "ecmwf_ifs025", "icon_seamless"]
 

@@ -129,21 +129,20 @@ def run_scan(
         logged = [paper.log_trade(s) for s in actionable]
         print(f"{sum(1 for t in logged if t)} logged")
 
-    # Long-shot harvest RETIRED Aug 2026. It logged the sub-3¢ deep-disagreement
+    # Long-shot harvest REMOVED Aug 2026. It logged the sub-3¢ deep-disagreement
     # YES shape among gate-rejected signals as an isolated track
-    # (PaperTrader.log_experimental, scan_source="longshot") to gather sample
-    # size on a Jul-2026 backtest that looked fragile-but-positive. On-chain
-    # settlement validation told a different story: recorded PF 1.68-6.55 was
-    # entirely a weather-truth mislabeling artifact (a handful of huge-payout
-    # cheap tickets resolved YES by our own pipeline that actually settled NO
-    # on-chain) — true PF was 0.41-0.51 both times it was checked. A full
-    # breakdown by city/price/direction found no statistically-solid profitable
-    # sub-segment either (best price band was 5 wins in 162 trades — noise, not
-    # edge). Kept: PaperTrader.log_experimental (tested, still used to interpret
-    # historical rows), the "longshot" track split in telegram_bot.read_stats
-    # (historical data stays visible, just stops growing), and the config
-    # constants (harmless, documents the retired shape). Only the harvest call
-    # site is gone — no more capital, virtual or real, goes toward this idea.
+    # (scan_source="longshot") to gather sample size on a Jul-2026 backtest that
+    # looked fragile-but-positive. On-chain settlement validation told a
+    # different story: recorded PF 1.68-6.55 was entirely a weather-truth
+    # mislabeling artifact (a handful of huge-payout cheap tickets resolved YES
+    # by our own pipeline that actually settled NO on-chain) — true PF was
+    # 0.41-0.51 both times it was checked. A full breakdown by city/price/
+    # direction found no statistically-solid profitable sub-segment either (best
+    # price band was 5 wins in 162 trades — noise, not edge). The logging
+    # method (PaperTrader.log_experimental) and its config knobs were deleted
+    # with it; ~2,000 historical rows stay in paper_trades.csv (still excluded
+    # from stats/gate/calibration — see PaperTrader.compute_stats/auto_resolve)
+    # for anyone who wants to re-run the analysis, but nothing writes new ones.
 
     _print_scan_summary(signals, actionable, rejected)
     funnel = _build_funnel(scanner, signals, actionable, rejected)
@@ -907,8 +906,8 @@ def main() -> None:
             if str(t.get("restofday", "")) == "1" or str(t.get("running_obs_c", "")).strip():
                 skipped_clip += 1
                 continue
-            # Experimental long-shot rows are gate-rejected sample-gathering,
-            # never calibrator food (see PaperTrader.log_experimental).
+            # Retired experimental long-shot rows (see [[longshot_retired]]) are
+            # gate-rejected sample-gathering, never calibrator food.
             if t.get("scan_source") == "longshot":
                 continue
             try:
