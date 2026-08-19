@@ -129,33 +129,21 @@ def run_scan(
         logged = [paper.log_trade(s) for s in actionable]
         print(f"{sum(1 for t in logged if t)} logged")
 
-    # Long-shot harvest (paper-only, isolated track): among the REJECTED
-    # signals, log the sub-3¢ deep-disagreement YES shape the Jul-2026 backtest
-    # showed as fragile-but-positive (5/167 wins, net +$3.5k on flat stakes).
-    # These stay blocked in the real flow (Gate 9.7); this track only gathers
-    # sample size. Rows are tagged scan_source="longshot" and excluded from
-    # stats/gate/calibration (see PaperTrader.log_experimental).
-    if paper:
-        from weather.config import LONGSHOT_MAX_PRICE, LONGSHOT_MIN_RATIO
-        longshots = [
-            s for s in rejected
-            if s.direction == "YES"  # the harvested shape is a cheap YES buy
-            and 0.0 < s.market.yes_price < LONGSHOT_MAX_PRICE
-            and s.prob_result is not None
-            and s.prob_result.raw_p >= LONGSHOT_MIN_RATIO * s.market.yes_price
-            # Never harvest a signal Gate 0.5 rejected for having no trusted
-            # resolution source (e.g. Hong Kong: no registered station, resolves
-            # off HKO with a publication lag our own auto_resolve can't verify).
-            # That gate exists so paper_trader.auto_resolve can't fall back to an
-            # untrustworthy grid label for it — harvesting these anyway defeats
-            # that guarantee (Aug 2026: 100% of longshot's on-chain-vs-recorded
-            # PnL flips, twice, traced back to exactly this city).
-            and not (s.rejection_reason or "").startswith("gate0.5")
-        ]
-        if longshots:
-            n_ls = sum(1 for s in longshots if paper.log_experimental(s))
-            if n_ls:
-                print(f"  [longshot] {n_ls} experimental long-shot trade(s) logged")
+    # Long-shot harvest RETIRED Aug 2026. It logged the sub-3¢ deep-disagreement
+    # YES shape among gate-rejected signals as an isolated track
+    # (PaperTrader.log_experimental, scan_source="longshot") to gather sample
+    # size on a Jul-2026 backtest that looked fragile-but-positive. On-chain
+    # settlement validation told a different story: recorded PF 1.68-6.55 was
+    # entirely a weather-truth mislabeling artifact (a handful of huge-payout
+    # cheap tickets resolved YES by our own pipeline that actually settled NO
+    # on-chain) — true PF was 0.41-0.51 both times it was checked. A full
+    # breakdown by city/price/direction found no statistically-solid profitable
+    # sub-segment either (best price band was 5 wins in 162 trades — noise, not
+    # edge). Kept: PaperTrader.log_experimental (tested, still used to interpret
+    # historical rows), the "longshot" track split in telegram_bot.read_stats
+    # (historical data stays visible, just stops growing), and the config
+    # constants (harmless, documents the retired shape). Only the harvest call
+    # site is gone — no more capital, virtual or real, goes toward this idea.
 
     _print_scan_summary(signals, actionable, rejected)
     funnel = _build_funnel(scanner, signals, actionable, rejected)
