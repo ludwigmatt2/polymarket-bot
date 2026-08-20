@@ -442,18 +442,23 @@ class PaperTrader:
             if dd > max_dd:
                 max_dd = dd
 
-        # ── Re-live gate (Jul-8 redesign) ─────────────────────────────────────
-        # Counts ONLY station-labeled trades: evidence from the fixed system,
-        # scored on the thermometer Polymarket pays on. The skill test is the
-        # honest one — the model's Brier must beat the MARKET PRICE's Brier on
-        # the same trades (climatology is a strawman; edge means beating the
-        # crowd). Plus a calendar-span floor so one weather regime can't
-        # flatter the record.
+        # ── Re-live gate (Jul-8 redesign, widened Aug-19 for on-chain resolution) ──
+        # Counts only verified-truth trades: "station" (WU→IEM) or "onchain"
+        # (ConditionalTokens payoutNumerators — Polymarket's actual settlement,
+        # strictly more trustworthy than station, added Aug 2026). Excludes
+        # "grid" (Open-Meteo fallback, the label that's disagreed with real
+        # settlement before). Variable/field names below still say "station" —
+        # not renamed to keep this a pure widening, not a refactor — but the set
+        # now means "verified", not literally station-only.
+        # The skill test is the honest one — the model's Brier must beat the
+        # MARKET PRICE's Brier on the same trades (climatology is a strawman;
+        # edge means beating the crowd). Plus a calendar-span floor so one
+        # weather regime can't flatter the record.
         # Era scope: only trades SIGNALED after GATE_ERA_START — earlier entries
         # were made by a different system (poisoned calibrator) and belong to its
         # record, not this one. GATE_ERA_START is patched by tests.
         station = [t for t in resolved
-                   if t.get("label_source") == "station"
+                   if t.get("label_source") in ("station", "onchain")
                    and str(t.get("signal_time", "")) >= GATE_ERA_START]
         st_pnls, st_model_sq, st_market_sq, st_sizes = [], [], [], []
         first_signal = last_signal = None
