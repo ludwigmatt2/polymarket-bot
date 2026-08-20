@@ -531,14 +531,36 @@ def read_stats(uid: int) -> dict:
     )
     return s
 
+def _live_era_start(uid: int) -> str:
+    """The most recent live-mode confirmation timestamp — the boundary for what
+    counts as "this" live track record. Unlike the paper GATE_ERA_START (a
+    hardcoded constant someone has to remember to bump), this is read live from
+    live_confirmed_at, which cmd_mymode already updates on every fresh /mymode
+    live confirmation — so each new go-live gets a clean slate automatically,
+    without a code change. Falls back to "" (no filtering) if never set."""
+    return _load_users().get(uid, {}).get("live_confirmed_at", "") or ""
+
 def read_live_stats(uid: int) -> dict:
-    """Real-money stats from live_trades.csv — the clean slate that begins at
-    go-live. Errored rows (order never placed) are excluded."""
+    """Real-money stats from live_trades.csv, scoped to the CURRENT live era
+    (since the most recent /mymode live confirmation) — a prior go-live attempt
+    that was paused and restarted must not bleed into today's numbers (Aug 20
+    2026: the failed Jul 7-8 attempt's -$11.79 was showing up as "All-time" the
+    moment a fresh go-live had zero new trades). Errored rows (order never
+    placed) are excluded."""
     csv_path = _live_trades_csv_path(uid)
     if not csv_path.exists():
         return {}
+    era_start = _live_era_start(uid)
     with csv_path.open() as f:
-        rows = [r for r in csv.DictReader(f) if not r.get("error")]
+        all_rows = [r for r in csv.DictReader(f) if not r.get("error")]
+    rows = [r for r in all_rows if r.get("signal_time", "") >= era_start]
+
+    # Balance reconciliation (live_wallet_stats) needs the TRUE all-time realized
+    # PnL — the wallet's actual on-chain balance already reflects money lost in
+    # a prior era, so era-scoping this figure would overstate the balance, not
+    # just the display. Only the display-facing total_pnl below is era-scoped.
+    all_time_resolved = [r for r in all_rows if r.get("resolved_at")]
+    all_time_pnl = sum(float(r["pnl_usd"]) for r in all_time_resolved if r.get("pnl_usd"))
 
     resolved = [r for r in rows if r.get("resolved_at")]
     wins   = [r for r in resolved if r.get("pnl_usd") and float(r["pnl_usd"]) > 0]
@@ -564,6 +586,7 @@ def read_live_stats(uid: int) -> dict:
         "win_rate": len(wins) / len(resolved) * 100 if resolved else None,
         "profit_factor": pf,
         "total_pnl": total_pnl,
+        "all_time_pnl": all_time_pnl,
         "deployed": deployed,
         "pnl_today": pnl_today,
         "pnl_week": pnl_week,
@@ -572,17 +595,28 @@ def read_live_stats(uid: int) -> dict:
 def live_wallet_stats(uid: int, ls: dict | None = None) -> dict:
     """Wallet view from REAL money: net on-chain deposits + realized live PnL.
     Return % is computed from actual capital invested, not simulated paper deposits.
-    Pass `ls` (a read_live_stats result) to avoid re-parsing live_trades.csv."""
+    Pass `ls` (a read_live_stats result) to avoid re-parsing live_trades.csv.
+
+    Deposited/withdrawn/balance/available are ALL-TIME — they must reconcile
+    against the real on-chain balance regardless of which live era it came
+    from. realized_pnl/return_pct are scoped to the CURRENT era (since the
+    last /mymode live confirmation) so a restarted go-live gets an honest
+    "how has THIS attempt done" figure instead of inheriting a prior attempt's
+    result — see read_live_stats. Balance itself still uses the all-time PnL
+    internally (a paused attempt's real loss already lowered the real
+    balance; era-scoping that too would overstate it, not just re-frame it)."""
     from weather import live_ledger
     t   = live_ledger.totals(_live_wallet_file(uid))
     ls  = ls if ls is not None else (read_live_stats(uid) or {})
-    realized = ls.get("total_pnl", 0.0)
+    realized          = ls.get("total_pnl", 0.0)
+    all_time_realized = ls.get("all_time_pnl", realized)
     deployed = ls.get("deployed", 0.0)
     deposited, withdrawn, net = t["deposited"], t["withdrawn"], t["net"]
 
-    # Accounting balance (deposits − withdrawals + realized PnL). The on-chain pUSD
-    # is the source of truth shown by /deposit; this is the ROI ledger view.
-    balance    = net + realized
+    # Accounting balance (deposits − withdrawals + ALL-TIME realized PnL). The
+    # on-chain pUSD is the source of truth shown by /deposit; this is the ROI
+    # ledger view.
+    balance    = net + all_time_realized
     available  = balance - deployed
     return_pct = (realized / deposited * 100) if deposited > 0 else None
     return {
@@ -668,7 +702,7 @@ def _fmt_status_live(uid: int) -> str:
     ls   = read_live_stats(uid)
     ws   = live_wallet_stats(uid, ls)   # reuse the parse ls already did
     scan = read_last_scan_meta(uid)
-    since = _load_users().get(uid, {}).get("went_live_at", "")[:10]
+    since = _live_era_start(uid)[:10]  # this era's confirmation, not the first-ever go-live
     header = "*📊 Status* — 🟢 LIVE" + (f"  _(since {since})_" if since else "")
 
     if not ls:

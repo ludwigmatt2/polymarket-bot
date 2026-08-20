@@ -9,7 +9,8 @@ os.environ.setdefault("TELEGRAM_ADMIN_ID", "1")
 import telegram_bot as tb
 from weather import live_ledger as L
 
-_LIVE_COLS = ["trade_id", "resolved_at", "pnl_usd", "size_usd", "error", "resolution_date"]
+_LIVE_COLS = ["trade_id", "signal_time", "resolved_at", "pnl_usd", "size_usd", "error",
+              "resolution_date"]
 
 
 def _write_live_csv(path, rows):
@@ -22,14 +23,21 @@ def _write_live_csv(path, rows):
 
 class TestReadLiveStats:
     def test_counts_pnl_deployed_and_excludes_errors(self, tmp_path, monkeypatch):
+        # signal_time must be within the live era (Aug 20 2026 fix: read_live_stats
+        # now scopes to live_confirmed_at, same idea as the paper GATE_ERA_START).
         csv_path = tmp_path / "live_trades.csv"
         _write_live_csv(csv_path, [
-            {"trade_id": "a", "resolved_at": "2026-07-01T00:00:00", "pnl_usd": "5", "size_usd": "10"},
-            {"trade_id": "b", "resolved_at": "2026-07-01T00:00:00", "pnl_usd": "-3", "size_usd": "10"},
-            {"trade_id": "c", "size_usd": "8", "resolution_date": "2026-07-05"},          # open
-            {"trade_id": "d", "size_usd": "5", "error": "insufficient balance"},          # excluded
+            {"trade_id": "a", "signal_time": "2026-07-01T00:00:00",
+             "resolved_at": "2026-07-01T00:00:00", "pnl_usd": "5", "size_usd": "10"},
+            {"trade_id": "b", "signal_time": "2026-07-01T00:00:00",
+             "resolved_at": "2026-07-01T00:00:00", "pnl_usd": "-3", "size_usd": "10"},
+            {"trade_id": "c", "signal_time": "2026-07-01T00:00:00",
+             "size_usd": "8", "resolution_date": "2026-07-05"},                          # open
+            {"trade_id": "d", "signal_time": "2026-07-01T00:00:00",
+             "size_usd": "5", "error": "insufficient balance"},                          # excluded
         ])
         monkeypatch.setattr(tb, "_live_trades_csv_path", lambda uid: csv_path)
+        monkeypatch.setattr(tb, "_live_era_start", lambda uid: "2026-06-01T00:00:00")
         s = tb.read_live_stats(1)
         assert s["total"] == 3 and s["resolved"] == 2 and s["pending"] == 1
         assert s["wins"] == 1 and s["losses"] == 1 and s["win_rate"] == 50.0
@@ -45,13 +53,16 @@ class TestLiveWalletStats:
     def test_return_from_real_deposits(self, tmp_path, monkeypatch):
         csv_path = tmp_path / "live_trades.csv"
         _write_live_csv(csv_path, [
-            {"trade_id": "a", "resolved_at": "2026-07-01T00:00:00", "pnl_usd": "2", "size_usd": "10"},
-            {"trade_id": "c", "size_usd": "8", "resolution_date": "2026-07-05"},
+            {"trade_id": "a", "signal_time": "2026-07-01T00:00:00",
+             "resolved_at": "2026-07-01T00:00:00", "pnl_usd": "2", "size_usd": "10"},
+            {"trade_id": "c", "signal_time": "2026-07-01T00:00:00",
+             "size_usd": "8", "resolution_date": "2026-07-05"},
         ])
         ledger = tmp_path / "live_wallet.json"
         L.reconcile_deposit(ledger, 100.0)                       # $100 real deposit
         monkeypatch.setattr(tb, "_live_trades_csv_path", lambda uid: csv_path)
         monkeypatch.setattr(tb, "_live_wallet_file", lambda uid: ledger)
+        monkeypatch.setattr(tb, "_live_era_start", lambda uid: "2026-06-01T00:00:00")
         ws = tb.live_wallet_stats(1)
         assert ws["deposited"] == 100.0 and ws["realized_pnl"] == 2.0
         assert ws["deployed"] == 8.0
