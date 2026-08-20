@@ -63,12 +63,16 @@ class TestScanPermissionGate:
 
 class TestModeScopedViews:
     def test_trades_reads_live_and_badges_when_live(self, tmp_path, monkeypatch):
+        # signal_time must be within the current era — _relevant_trades() (Aug
+        # 20 2026 fix) scopes every listing view the same way wallet_stats() does.
         live_csv = tmp_path / "live_trades.csv"
         with open(live_csv, "w", newline="") as f:
-            w = _csv.DictWriter(f, fieldnames=["trade_id", "market_title", "resolved_at", "pnl_usd"])
+            w = _csv.DictWriter(f, fieldnames=["trade_id", "market_title", "signal_time",
+                                               "resolved_at", "pnl_usd"])
             w.writeheader()
             w.writerow({"trade_id": "L1", "market_title": "Live market",
-                        "resolved_at": "2026-07-03T00:00:00", "pnl_usd": "4"})
+                        "signal_time": "2026-08-10T00:00:00",
+                        "resolved_at": "2026-08-10T00:00:00", "pnl_usd": "4"})
         monkeypatch.setattr(tb, "get_user_mode", lambda uid: "live")
         monkeypatch.setattr(tb, "_active_trades_csv_path", lambda uid: live_csv)
         out = tb.fmt_trades(9)
@@ -77,12 +81,14 @@ class TestModeScopedViews:
     def test_positions_excludes_errored_live_rows(self, tmp_path, monkeypatch):
         live_csv = tmp_path / "live_trades.csv"
         with open(live_csv, "w", newline="") as f:
-            w = _csv.DictWriter(f, fieldnames=["market_title", "resolved_at", "size_usd",
-                                               "error", "resolution_date", "edge_pp"])
+            w = _csv.DictWriter(f, fieldnames=["market_title", "signal_time", "resolved_at",
+                                               "size_usd", "error", "resolution_date", "edge_pp"])
             w.writeheader()
-            w.writerow({"market_title": "Open ok", "size_usd": "10", "error": "",
+            w.writerow({"market_title": "Open ok", "signal_time": "2026-08-10T00:00:00",
+                        "size_usd": "10", "error": "",
                         "resolution_date": "2026-07-09", "edge_pp": "0.2"})
-            w.writerow({"market_title": "Errored", "size_usd": "5",
+            w.writerow({"market_title": "Errored", "signal_time": "2026-08-10T00:00:00",
+                        "size_usd": "5",
                         "error": "insufficient balance", "resolution_date": "2026-07-09", "edge_pp": "0.2"})
         monkeypatch.setattr(tb, "_active_trades_csv_path", lambda uid: live_csv)
         out = tb.fmt_positions(9)

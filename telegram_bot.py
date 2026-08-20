@@ -302,6 +302,23 @@ def _active_trades_csv_path(uid: int) -> Path:
     readers (read_stats, wallet_stats) keep using _trades_csv_path unconditionally."""
     return _live_trades_csv_path(uid) if get_user_mode(uid) == "live" else _trades_csv_path(uid)
 
+def _relevant_trades(uid: int) -> list[dict]:
+    """Rows from the user's current-mode trade log, scoped like wallet_stats()/
+    read_stats(): current era only, retired longshot rows excluded. This is the
+    population that should appear in listings/summaries (/positions, /trades,
+    /losses, the daily digest, the resolved-trade alert) — without it those
+    views silently mixed in the longshot backlog resolving out (Aug 20 2026:
+    94 "open positions" at $5 each against a ~$40 wallet). /why and its button
+    stay on the unfiltered log on purpose — a lookup by trade_id should still
+    find old/longshot trades, just not list them."""
+    csv_path = _active_trades_csv_path(uid)
+    if not csv_path.exists():
+        return []
+    with csv_path.open() as f:
+        rows = list(csv.DictReader(f))
+    return [r for r in rows if r.get("scan_source") != "longshot"
+            and r.get("signal_time", "") >= GATE_ERA_START]
+
 def _migrate_global_wallet() -> None:
     """One-time: move the legacy global ledger to the admin's per-user file."""
     admin_wallet = user_wallet_file(ADMIN_ID)
@@ -839,12 +856,9 @@ def _fmt_wallet_paper(uid: int) -> str:
 
 
 def fmt_positions(uid: int) -> str:
-    csv_path = _active_trades_csv_path(uid)
-    if not csv_path.exists():
+    rows = _relevant_trades(uid)
+    if not rows:
         return "No open positions."
-
-    with csv_path.open() as f:
-        rows = list(csv.DictReader(f))
 
     # Exclude errored live rows (order never placed → not a real position).
     pending = [r for r in rows if not r.get("resolved_at") and not r.get("error")]
@@ -926,11 +940,9 @@ def fmt_signals(signals: list[dict], uid: int) -> str:
 
 
 def fmt_trades(uid: int, n: int = 10) -> str:
-    trades_csv = _active_trades_csv_path(uid)
-    if not trades_csv.exists():
+    rows = _relevant_trades(uid)
+    if not rows:
         return "No trades yet."
-    with trades_csv.open() as f:
-        rows = list(csv.DictReader(f))
     resolved = sorted(
         [r for r in rows if r.get("resolved_at")],
         key=lambda x: x.get("resolved_at", ""), reverse=True
@@ -958,11 +970,9 @@ def fmt_trades(uid: int, n: int = 10) -> str:
 
 def why_kb(uid: int, n: int = 10) -> InlineKeyboardMarkup | None:
     """❓ buttons for the trades shown by fmt_trades (same order, max 8)."""
-    trades_csv = _active_trades_csv_path(uid)
-    if not trades_csv.exists():
+    rows = _relevant_trades(uid)
+    if not rows:
         return None
-    with trades_csv.open() as f:
-        rows = list(csv.DictReader(f))
     resolved = sorted(
         [r for r in rows if r.get("resolved_at")],
         key=lambda x: x.get("resolved_at", ""), reverse=True
@@ -1263,11 +1273,7 @@ async def cmd_losses(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             n = min(int(ctx.args[0]), 30)
         except ValueError:
             pass
-    trades_csv = _active_trades_csv_path(uid)
-    rows: list[dict] = []
-    if trades_csv.exists():
-        with trades_csv.open() as f:
-            rows = list(csv.DictReader(f))
+    rows = _relevant_trades(uid)
     await update.effective_message.reply_text(
         telegram_views.fmt_losses(rows, n), reply_markup=main_kb(uid), parse_mode="Markdown",
     )
@@ -2597,11 +2603,7 @@ def _build_digest(uid: int) -> str | None:
     if not ws:
         return None
 
-    rows: list[dict] = []
-    csv_path = _active_trades_csv_path(uid)
-    if csv_path.exists():
-        with csv_path.open() as f:
-            rows = list(csv.DictReader(f))
+    rows = _relevant_trades(uid)
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
     settled = [r for r in rows
                if r.get("resolved_at") and r["resolved_at"] >= cutoff and r.get("pnl_usd")]

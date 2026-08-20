@@ -404,6 +404,11 @@ def _write_resolved_file(paper: "PaperTrader", resolved_count: int, log_dir: Pat
         return
     with trades_path.open() as f:
         rows = list(_csv.DictReader(f))
+    # Retired longshot rows (see [[longshot_retired]]) shouldn't reach the
+    # "N trade(s) resolved" push alert — their backlog resolving out (mostly
+    # losses on old $5 stakes) reads as new trading activity when it's just
+    # cleanup, and was confusing enough to prompt this fix (Aug 20 2026).
+    rows = [r for r in rows if r.get("scan_source") != "longshot"]
     # Most recently resolved trades (by resolved_at timestamp)
     recently_resolved = sorted(
         [r for r in rows if r.get("resolved_at")],
