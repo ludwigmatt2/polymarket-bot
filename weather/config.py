@@ -175,13 +175,24 @@ MAX_CALIBRATION_SHIFT = 0.25
 
 # ── Re-live gate (Jul-8 redesign) ──────────────────────────────────────────────
 # Going live again requires evidence from the FIXED system only: trades resolved
-# on STATION truth (label_source == "station"), enough of them, spanning enough
-# calendar time that one weather regime can't flatter the record, profitable,
-# and — the honest skill test — the model's Brier must beat the MARKET PRICE's
-# Brier on the same trades (beating climatology is trivial; edge means beating
-# the crowd). The gate unlocks live order placement; flipping mode stays manual.
-GATE_MIN_STATION_RESOLVED = 150
-GATE_MIN_DAYS_ELAPSED = 21
+# on verified truth (label_source == "station" or "onchain"), enough of them,
+# spanning enough calendar time that one weather regime can't flatter the
+# record, profitable, and — the honest skill test — the model's Brier must beat
+# the MARKET PRICE's Brier on the same trades (beating climatology is trivial;
+# edge means beating the crowd). The gate unlocks live order placement;
+# flipping mode stays manual.
+#
+# LOWERED Aug 20 2026 — explicit user decision, not a re-derived design value.
+# Original design: 150 / 21. Actual record at the time: 91 verified trades /
+# 14 days, PF 2.04 (>>1.5), model Brier 0.218 < market 0.241, drawdown 7.7%
+# (<<20% cap) — every QUALITY check already cleared comfortably; only sample
+# size and calendar span were short. Lowered to match what's actually
+# accumulated (not to zero) so a real go-live test could run on ~$40 of test
+# capital in the reconnected July wallet, ahead of full statistical
+# confidence. RESTORE TO 150 / 21 before trusting this gate again for anything
+# beyond small deliberate tests — these are not the calibrated thresholds.
+GATE_MIN_STATION_RESOLVED = 90
+GATE_MIN_DAYS_ELAPSED = 14
 # Era boundary: only trades SIGNALED after this instant count for the gate.
 # A validation record must measure ONE system (the Jul-9 lesson). Set to the
 # actual Phase-1+2 deploy instant (service restarted 2026-08-06 ~12:27 UTC on
