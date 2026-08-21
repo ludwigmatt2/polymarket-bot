@@ -687,13 +687,17 @@ class LiveTrader:
             return None
         return [p for p in positions if p.get("redeemable")]
 
-    def claim_winnings(self, positions=None) -> dict:
+    def claim_winnings(self, positions=None, ledger_path: Path | None = None) -> dict:
         """Redeem resolved (redeemable) on-chain positions back to pUSD in the
         deposit wallet, gaslessly via the relayer. Routes CTF (binary) vs
         NegRiskAdapter (neg-risk) per position. Driven by the data-api redeemable
         flag (which lags weather resolution), so it self-heals across resolve
         loops until each market settles on-chain. Idempotent — redeemed positions
         vanish from the next snapshot.
+
+        `ledger_path`, when passed, points at this user's live_wallet.json. It's
+        used solely to advance the deposit-detection watermark past redemption
+        proceeds (see the note below) — never to record a transaction here.
 
         No-ops (returns {"claimed": 0}) without a funder/key, without redeemable
         positions, or if builder creds for the relayer are missing. Never raises —
@@ -737,15 +741,46 @@ class LiveTrader:
             usdce_before = _relayer.usdce_balance(self._funder_address)
             result = rc.redeem_positions(self._funder_address, list(groups.values()))
             wrapped = 0.0
+            wrap_error = None
+            usdce_after_redeem = usdce_before
             try:
-                delta = _relayer.usdce_balance(self._funder_address) - usdce_before
+                usdce_after_redeem = _relayer.usdce_balance(self._funder_address)
+                delta = usdce_after_redeem - usdce_before
                 if delta > 0.01:
-                    rc.wrap_usdce_to_pusd(self._funder_address, int(delta * 1_000_000))
-                    wrapped = round(delta, 6)
-            except Exception:  # noqa: BLE001 — wrap is best-effort; funds stay safe
-                pass
-            return {"claimed": len(groups), "conditions": list(groups.keys()),
-                    "result": result, "wrapped": wrapped}
+                    # Retry a couple of times — a single transient relayer hiccup
+                    # used to leave this delta permanently unwrapped, and it would
+                    # then get silently misfiled as a "deposit" by the next scan's
+                    # generic reconcile_deposit() (same dollar double-counted:
+                    # once via realized PnL, once via a phantom deposit).
+                    for attempt in range(3):
+                        try:
+                            rc.wrap_usdce_to_pusd(self._funder_address, int(delta * 1_000_000))
+                            wrapped = round(delta, 6)
+                            wrap_error = None
+                            break
+                        except Exception as e:  # noqa: BLE001
+                            wrap_error = str(e)
+                            if attempt < 2:
+                                time.sleep(2.0)
+            except Exception as e:  # noqa: BLE001 — balance read for the wrap step failed
+                wrap_error = str(e)
+            finally:
+                # Regardless of whether the wrap succeeded, tell the ledger this
+                # USDC.e is accounted for (it's already inside realized PnL from
+                # the resolved trade) — never let the generic deposit detector
+                # see it as new capital.
+                if ledger_path is not None:
+                    try:
+                        from . import live_ledger
+                        current = _relayer.usdce_balance(self._funder_address)
+                        live_ledger.advance_watermark(ledger_path, current)
+                    except Exception:  # noqa: BLE001 — ledger write is best-effort
+                        pass
+            out = {"claimed": len(groups), "conditions": list(groups.keys()),
+                   "result": result, "wrapped": wrapped}
+            if wrap_error:
+                out["wrap_error"] = wrap_error
+            return out
         except Exception as e:  # noqa: BLE001 — never break the resolve loop
             return {"claimed": 0, "error": str(e)}
 

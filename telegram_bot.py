@@ -604,8 +604,18 @@ def live_wallet_stats(uid: int, ls: dict | None = None) -> dict:
     "how has THIS attempt done" figure instead of inheriting a prior attempt's
     result — see read_live_stats. Balance itself still uses the all-time PnL
     internally (a paused attempt's real loss already lowered the real
-    balance; era-scoping that too would overstate it, not just re-frame it)."""
-    from weather import live_ledger
+    balance; era-scoping that too would overstate it, not just re-frame it).
+
+    `balance`/`available` are ALWAYS a live on-chain read (pUSD + unwrapped
+    USDC.e) when the network is reachable — the ledger figure (deposits −
+    withdrawals + PnL) is bookkeeping that can drift from reality (see the
+    Aug-2026 incident: redemption proceeds silently double-counted as a
+    fresh deposit, inflating the ledger figure by $31 while the real wallet
+    held $35 less than it claimed). Falls back to the ledger figure only if
+    the chain is unreachable, flagged via `onchain_verified: False` so a
+    stale number is never mistaken for a fresh one."""
+    from weather import live_ledger, relayer
+    from weather.secrets import get_user_creds
     t   = live_ledger.totals(_live_wallet_file(uid))
     ls  = ls if ls is not None else (read_live_stats(uid) or {})
     realized          = ls.get("total_pnl", 0.0)
@@ -613,15 +623,30 @@ def live_wallet_stats(uid: int, ls: dict | None = None) -> dict:
     deployed = ls.get("deployed", 0.0)
     deposited, withdrawn, net = t["deposited"], t["withdrawn"], t["net"]
 
-    # Accounting balance (deposits − withdrawals + ALL-TIME realized PnL). The
-    # on-chain pUSD is the source of truth shown by /deposit; this is the ROI
-    # ledger view.
-    balance    = net + all_time_realized
+    # Ledger accounting balance (deposits − withdrawals + ALL-TIME realized
+    # PnL) — kept as the fallback when the chain can't be reached.
+    ledger_balance = net + all_time_realized
+
+    onchain_balance = None
+    creds  = get_user_creds(uid) or {}
+    funder = creds.get("funder_address")
+    if funder:
+        try:
+            pusd  = relayer.pusd_balance(funder, strict=True)
+            usdce = relayer.usdce_balance(funder, strict=True)
+            if pusd is not None and usdce is not None:
+                onchain_balance = pusd + usdce
+        except Exception:  # noqa: BLE001 — network is best-effort, never blocks the view
+            pass
+
+    onchain_verified = onchain_balance is not None
+    balance    = onchain_balance if onchain_verified else ledger_balance
     available  = balance - deployed
     return_pct = (realized / deposited * 100) if deposited > 0 else None
     return {
         "deposited": deposited, "withdrawn": withdrawn,
         "deployed": deployed, "realized_pnl": realized,
+        "onchain_verified": onchain_verified, "ledger_balance": ledger_balance,
         "wallet_balance": balance, "available": available,
         "return_pct": return_pct,
         "pnl_today": ls.get("pnl_today", 0.0), "pnl_week": ls.get("pnl_week", 0.0),
@@ -825,7 +850,8 @@ def _fmt_wallet_live(uid: int) -> str:
     if ws["return_pct"] is not None:
         sign = "+" if ws["return_pct"] >= 0 else ""
         ret_str = f"  ({sign}{ws['return_pct']:.1f}%)"
-    lines.append(f"💰 Balance:   *${ws['wallet_balance']:,.2f}*{ret_str}")
+    balance_tag = "_(verified on-chain)_" if ws["onchain_verified"] else "⚠️ _(couldn't reach chain — ledger estimate)_"
+    lines.append(f"💰 Balance:   *${ws['wallet_balance']:,.2f}*{ret_str}  {balance_tag}")
     lines.append(f"├─ Deposited  ${ws['deposited']:,.2f}  _(real, on-chain)_")
     if ws["withdrawn"] > 0:
         lines.append(f"├─ Withdrawn  -${ws['withdrawn']:,.2f}")
@@ -1176,8 +1202,11 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 @require_auth()
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    # fmt_status reads the live wallet balance on-chain (a blocking RPC call) —
+    # offload it so one user's /status doesn't stall every other user's bot.
+    text = await asyncio.to_thread(fmt_status, uid)
     await update.effective_message.reply_text(
-        fmt_status(uid), reply_markup=main_kb(uid), parse_mode="Markdown",
+        text, reply_markup=main_kb(uid), parse_mode="Markdown",
     )
 
 @require_auth()
@@ -1226,8 +1255,11 @@ async def cmd_exportkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 @require_auth()
 async def cmd_wallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    # fmt_wallet reads the live balance on-chain (a blocking RPC call) — offload
+    # it so one user's /wallet doesn't stall every other user's bot.
+    text = await asyncio.to_thread(fmt_wallet, uid)
     await update.effective_message.reply_text(
-        fmt_wallet(uid), reply_markup=main_kb(uid), parse_mode="Markdown",
+        text, reply_markup=main_kb(uid), parse_mode="Markdown",
     )
 
 @require_auth()
@@ -2044,12 +2076,16 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = q.data
 
     if data == "status":
+        # blocking on-chain RPC read inside fmt_status — offload it.
+        text = await asyncio.to_thread(fmt_status, uid)
         await q.edit_message_text(
-            fmt_status(uid), reply_markup=main_kb(uid), parse_mode="Markdown"
+            text, reply_markup=main_kb(uid), parse_mode="Markdown"
         )
     elif data == "wallet":
+        # blocking on-chain RPC read inside fmt_wallet — offload it.
+        text = await asyncio.to_thread(fmt_wallet, uid)
         await q.edit_message_text(
-            fmt_wallet(uid), reply_markup=main_kb(uid), parse_mode="Markdown"
+            text, reply_markup=main_kb(uid), parse_mode="Markdown"
         )
     elif data == "positions":
         await q.edit_message_text(
@@ -2679,7 +2715,10 @@ async def _daily_digest(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             if get_user_mode(uid) != "live" and not _active_trades_csv_path(uid).exists():
                 continue
-            msg = _build_digest(uid)
+            # _build_digest reads the live balance on-chain for live users (a
+            # blocking RPC call) — offload so one user's digest doesn't stall
+            # every other job/command sharing this event loop.
+            msg = await asyncio.to_thread(_build_digest, uid)
             if msg:
                 await ctx.bot.send_message(uid, msg, parse_mode="Markdown")
         except Exception:

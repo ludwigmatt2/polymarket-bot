@@ -333,9 +333,13 @@ def fan_out_auto_resolve(client: WeatherClient) -> None:
                 live_resolved, live_skipped = user_live.auto_resolve(client, model=None, positions=_positions)
                 print(f"  User {uid} live: auto-resolved {live_resolved} trade(s).  "
                       f"{live_skipped} skipped.")
-                _claim = user_live.claim_winnings(positions=_positions)
+                _claim = user_live.claim_winnings(positions=_positions, ledger_path=user_dir / "live_wallet.json")
                 if _claim.get("claimed"):
                     print(f"  User {uid} live: claimed {_claim['claimed']} resolved position(s) → pUSD.")
+                if _claim.get("wrap_error"):
+                    print(f"  User {uid} live: redemption wrap failed after retries "
+                          f"({_claim['wrap_error']}) — funds safe as USDC.e, ledger watermark "
+                          f"advanced.", file=sys.stderr)
                 elif _claim.get("error"):
                     print(f"  User {uid} live: claim skipped ({_claim['error']})", file=sys.stderr)
             except Exception as e:
@@ -881,9 +885,13 @@ def main() -> None:
             _positions = live_trader.fetch_positions()  # one snapshot for resolve + claim
             live_resolved, live_skipped = live_trader.auto_resolve(client, model=model, positions=_positions)
             print(f"  Live:  auto-resolved {live_resolved} trade(s).  {live_skipped} skipped.")
-            _claim = live_trader.claim_winnings(positions=_positions)
+            _claim = live_trader.claim_winnings(positions=_positions, ledger_path=log_dir / "live_wallet.json")
             if _claim.get("claimed"):
                 print(f"  Live:  claimed {_claim['claimed']} resolved position(s) → pUSD.")
+            if _claim.get("wrap_error"):
+                print(f"  Live:  redemption wrap failed after retries ({_claim['wrap_error']}) — "
+                      f"funds are safe as USDC.e, ledger watermark advanced so it won't be "
+                      f"misfiled as a deposit.", file=sys.stderr)
             elif _claim.get("error"):
                 print(f"  Live:  claim skipped ({_claim['error']})", file=sys.stderr)
 

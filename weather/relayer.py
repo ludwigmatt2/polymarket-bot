@@ -51,19 +51,27 @@ def onchain_nonce(wallet: str) -> int:
     return int(r, 16) if r and r != "0x" else 0
 
 
-def _erc20_balance(token: str, wallet: str) -> float:
-    """balanceOf(wallet) on a 6-decimal ERC-20, in dollars (0.0 on failure)."""
+def _erc20_balance(token: str, wallet: str, *, strict: bool = False) -> float | None:
+    """balanceOf(wallet) on a 6-decimal ERC-20, in dollars.
+
+    Default (strict=False): 0.0 on failure — matches every existing caller,
+    which treats "can't read it" the same as "nothing there".
+    strict=True: None on failure instead, for callers that must not confuse
+    an unreachable RPC with a genuinely empty wallet (e.g. a balance display
+    that needs to say "couldn't verify" rather than silently show $0)."""
     r = _rpc("eth_call", [{"to": token,
              "data": pm.SEL_BALANCE_OF + wallet.lower().replace("0x", "").zfill(64)}, "latest"])
-    return int(r, 16) / 10 ** pm.PUSD_DECIMALS if r and r != "0x" else 0.0
+    if r and r != "0x":
+        return int(r, 16) / 10 ** pm.PUSD_DECIMALS
+    return None if strict else 0.0
 
 
-def pusd_balance(wallet: str) -> float:
-    return _erc20_balance(pm.PUSD, wallet)
+def pusd_balance(wallet: str, *, strict: bool = False) -> float | None:
+    return _erc20_balance(pm.PUSD, wallet, strict=strict)
 
 
-def usdce_balance(wallet: str) -> float:
-    return _erc20_balance(pm.USDCE, wallet)
+def usdce_balance(wallet: str, *, strict: bool = False) -> float | None:
+    return _erc20_balance(pm.USDCE, wallet, strict=strict)
 
 
 def is_deployed(wallet: str) -> bool:

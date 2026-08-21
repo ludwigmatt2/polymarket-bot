@@ -805,6 +805,64 @@ class TestClaimWinnings:
         # only the +5 proceeds wrapped; the pre-existing 2.0 deposit is left alone
         assert captured["wrapped_raw"] == 5_000_000
 
+    def test_wrap_retries_then_succeeds(self, tmp_path, monkeypatch):
+        """A transient wrap failure is retried, not left permanently unwrapped."""
+        t = self._trader(tmp_path)
+        t.redeemable_positions = lambda positions=None: [
+            {"conditionId": "0xa", "outcome": "Yes", "size": 5.0, "redeemable": True},
+        ]
+        attempts = {"n": 0}
+
+        class FlakyRC:
+            def __init__(self, pk=None): pass
+            def redeem_positions(self, *a): return {"ok": True}
+            def wrap_usdce_to_pusd(self, wallet, amount_raw):
+                attempts["n"] += 1
+                if attempts["n"] < 2:
+                    raise RuntimeError("relayer busy")
+
+        import weather.relayer as rl
+        monkeypatch.setattr(rl, "RelayerClient", FlakyRC)
+        balances = iter([2.0, 7.0, 7.0])  # before, after-redeem, post-wrap re-read
+        monkeypatch.setattr(rl, "usdce_balance", lambda w: next(balances))
+        monkeypatch.setattr("time.sleep", lambda s: None)
+
+        res = t.claim_winnings()
+        assert attempts["n"] == 2  # first attempt failed, second succeeded
+        assert res["wrapped"] == pytest.approx(5.0)
+        assert "wrap_error" not in res
+
+    def test_wrap_persistent_failure_advances_watermark(self, tmp_path, monkeypatch):
+        """If the wrap keeps failing, the leftover USDC.e must NOT be left for the
+        next scan's reconcile_deposit() to misfile as a fresh deposit — the
+        watermark advances past it regardless, and the failure is surfaced."""
+        from weather import live_ledger
+        t = self._trader(tmp_path)
+        t.redeemable_positions = lambda positions=None: [
+            {"conditionId": "0xa", "outcome": "Yes", "size": 5.0, "redeemable": True},
+        ]
+
+        class AlwaysBoomRC:
+            def __init__(self, pk=None): pass
+            def redeem_positions(self, *a): return {"ok": True}
+            def wrap_usdce_to_pusd(self, wallet, amount_raw):
+                raise RuntimeError("relayer down")
+
+        import weather.relayer as rl
+        monkeypatch.setattr(rl, "RelayerClient", AlwaysBoomRC)
+        balances = iter([2.0, 7.0, 7.0])  # before, after-redeem, watermark re-read
+        monkeypatch.setattr(rl, "usdce_balance", lambda w: next(balances))
+        monkeypatch.setattr("time.sleep", lambda s: None)
+
+        ledger_path = tmp_path / "live_wallet.json"
+        res = t.claim_winnings(ledger_path=ledger_path)
+        assert res["wrapped"] == 0.0
+        assert "relayer down" in res["wrap_error"]
+        # watermark must be at the post-redemption balance (7.0), not stuck at 0 —
+        # otherwise the next reconcile_deposit(path, 7.0) reads it as a $7 deposit.
+        assert live_ledger.read_ledger(ledger_path)["last_usdce"] == pytest.approx(7.0)
+        assert live_ledger.reconcile_deposit(ledger_path, 7.0) == 0.0
+
     def test_reconcile_flags_missing_on_chain(self, tmp_path):
         """An open local trade with no matching on-chain position is flagged."""
         trader = _make_trader(tmp_path)

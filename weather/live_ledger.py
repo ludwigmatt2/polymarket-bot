@@ -76,6 +76,20 @@ def reconcile_deposit(path: Path, usdce_now: float, *, min_delta: float = 0.01) 
     return detected
 
 
+def advance_watermark(path: Path, usdce_now: float) -> None:
+    """Move the deposit-detection watermark to `usdce_now` WITHOUT recording a
+    transaction. Call this the moment a redemption credits USDC.e — before or
+    regardless of whether the follow-up wrap succeeds — so reconcile_deposit()
+    never mistakes known trading proceeds (already counted via realized PnL)
+    for fresh external capital. Without this, a wrap that fails silently
+    leaves the elevated balance for the next scan's reconcile_deposit() to
+    misfile as a deposit, double-counting the same dollar."""
+    data = read_ledger(path)
+    if round(usdce_now, 6) != data.get("last_usdce"):
+        data["last_usdce"] = round(usdce_now, 6)
+        _write(path, data)
+
+
 def totals(path: Path) -> dict:
     """Gross deposited / withdrawn / net, for the wallet view."""
     txns = read_ledger(path).get("transactions", [])
