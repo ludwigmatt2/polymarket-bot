@@ -78,6 +78,13 @@ def _signals_path(uid: int) -> Path:
 def _resolved_path(uid: int) -> Path:
     return user_data_dir(uid) / "last_resolved.json"
 
+def _live_resolved_path(uid: int) -> Path:
+    """Live counterpart to _resolved_path — real settled trades only, written
+    by weather_bot's live auto_resolve. Separate file so a live user's push
+    alert never gets its content from the paper/calibration track running
+    alongside it in the background."""
+    return user_data_dir(uid) / "last_live_resolved.json"
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ["POLYMARKET_BOT_TOKEN"]
@@ -2297,6 +2304,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 _seen_signals_mtimes:  dict[int, float] = {}
 _seen_resolved_mtimes: dict[int, float] = {}
+_seen_live_resolved_mtimes: dict[int, float] = {}
 _seen_halt_mtimes:     dict[int, float] = {}
 _seen_alarm_mtime: float = 0.0
 # Halt files older than bot start are history, not news — don't replay on restart.
@@ -2388,12 +2396,17 @@ async def check_alerts(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 except Exception:
                     pass
 
-        # Resolved trades alert — enhanced with wallet context
+        # Paper/model resolved-trade alert + re-live gate flip. The paper track
+        # keeps running in the background for calibration even while a user is
+        # live, so the alert itself is gated to paper-mode users only — a live
+        # user would otherwise get "trade(s) resolved" pushes narrating
+        # simulated money as if it were their real activity (see the live
+        # alert below for that). The gate-flip announcement stays admin-only
+        # and always fires regardless of the admin's mode — it's about
+        # whether the paper/model record is good enough to go live, not about
+        # whichever mode the admin happens to be in right now.
         res_new = _read_json_if_new(resolved_file, _seen_resolved_mtimes, uid)
         if res_new is not None:
-            # Re-live gate flip: announce ONCE when the station-truth gate goes
-            # green (going live stays a manual /mymode decision). Re-arms if the
-            # gate later drops back below threshold.
             if uid == ADMIN_ID:
                 gate_ready = bool(res_new[0].get("gate_ready"))
                 if gate_ready and not ctx.bot_data.get("gate_was_ready"):
@@ -2412,11 +2425,50 @@ async def check_alerts(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                         pass
                 elif not gate_ready:
                     ctx.bot_data.pop("gate_was_ready", None)
-            resolved = res_new[0].get("resolved", [])
+
+            if get_user_mode(uid) != "live":
+                resolved = res_new[0].get("resolved", [])
+                if resolved:
+                    batch_pnl = sum(float(t.get("pnl_usd") or 0) for t in resolved)
+                    e         = "✅" if batch_pnl >= 0 else "❌"
+                    lines     = [f"{e} 🧪 *{len(resolved)} paper trade(s) resolved* — *${batch_pnl:+.2f}*\n"]
+
+                    for t in resolved[:5]:
+                        pnl   = float(t.get("pnl_usd") or 0)
+                        em    = "✅" if pnl > 0 else "❌"
+                        title = t.get("market_title", "?")
+                        if " - " in title:
+                            title = title.split(" - ", 1)[1]
+                        lines.append(f"{em} ${pnl:+.2f} — _{title[:44]}_")
+                    if len(resolved) > 5:
+                        lines.append(f"_...and {len(resolved) - 5} more_")
+
+                    ws = wallet_stats(uid)
+                    lines.append(f"\n📊 *All-time (paper): ${ws['realized_pnl']:+,.2f}*")
+                    if ws["return_pct"] is not None:
+                        sign = "+" if ws["return_pct"] >= 0 else ""
+                        lines.append(f"   Return:  {sign}{ws['return_pct']:.1f}%")
+                    if abs(ws["pnl_today"]) > 0:
+                        lines.append(f"   Today:   ${ws['pnl_today']:+.2f}")
+                    if ws["pending_count"] > 0:
+                        lines.append(f"   Open:    {ws['pending_count']} positions · ${ws['deployed']:,.0f} deployed")
+
+                    text = "\n".join(line for line in lines if line)
+                    try:
+                        await bot.send_message(uid, text, parse_mode="Markdown")
+                    except Exception:
+                        pass
+
+        # Live resolved-trade alert — real settlements, real money. Separate
+        # file from the paper one above so it only ever narrates what actually
+        # happened to this user's real wallet.
+        live_res_new = _read_json_if_new(_live_resolved_path(uid), _seen_live_resolved_mtimes, uid)
+        if live_res_new is not None and get_user_mode(uid) == "live":
+            resolved = live_res_new[0].get("resolved", [])
             if resolved:
                 batch_pnl = sum(float(t.get("pnl_usd") or 0) for t in resolved)
                 e         = "✅" if batch_pnl >= 0 else "❌"
-                lines     = [f"{e} *{len(resolved)} trade(s) resolved* — *${batch_pnl:+.2f}*\n"]
+                lines     = [f"{e} 🟢 *{len(resolved)} LIVE trade(s) resolved* — *${batch_pnl:+.2f}* _(real money)_\n"]
 
                 for t in resolved[:5]:
                     pnl   = float(t.get("pnl_usd") or 0)
@@ -2428,9 +2480,8 @@ async def check_alerts(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 if len(resolved) > 5:
                     lines.append(f"_...and {len(resolved) - 5} more_")
 
-                # Running wallet summary
-                ws = wallet_stats(uid)
-                lines.append(f"\n📊 *All-time: ${ws['realized_pnl']:+,.2f}*")
+                ws = live_wallet_stats(uid)
+                lines.append(f"\n📊 *All-time (live): ${ws['realized_pnl']:+,.2f}*")
                 if ws["return_pct"] is not None:
                     sign = "+" if ws["return_pct"] >= 0 else ""
                     lines.append(f"   Return:  {sign}{ws['return_pct']:.1f}%")

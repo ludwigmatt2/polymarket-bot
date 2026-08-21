@@ -265,3 +265,58 @@ class TestLiveFanOut:
             int(USER_A), {"mode": "live"}, user_dir, object(), [_make_signal()],
         )
         assert seen["bankroll"] == 200.0, "ledger net deposits must cap the bankroll"
+
+
+class TestWriteLiveResolvedFile:
+    """last_live_resolved.json is the live counterpart to last_resolved.json —
+    it must read live_trades.csv (real settlements), never paper_trades.csv,
+    so the Telegram alert built from it never narrates simulated money as a
+    live user's real activity."""
+
+    def _write_live_csv(self, path: Path, rows: list[dict]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fields = ["market_title", "direction", "pnl_usd", "resolved_at"]
+        with path.open("w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fields)
+            w.writeheader()
+            for r in rows:
+                w.writerow(r)
+
+    def test_writes_most_recently_resolved_from_live_csv(self, tmp_path):
+        live_csv = tmp_path / "live_trades.csv"
+        self._write_live_csv(live_csv, [
+            {"market_title": "NYC - old", "direction": "NO", "pnl_usd": "1.0",
+             "resolved_at": "2026-08-01T00:00:00+00:00"},
+            {"market_title": "Paris - new", "direction": "NO", "pnl_usd": "-2.5",
+             "resolved_at": "2026-08-21T00:00:00+00:00"},
+        ])
+        out_dir = tmp_path / "out"
+        weather_bot._write_live_resolved_file(live_csv, 1, out_dir)
+        data = json.loads((out_dir / "last_live_resolved.json").read_text())
+        assert data["count"] == 1
+        assert len(data["resolved"]) == 1
+        assert data["resolved"][0]["market_title"] == "Paris - new"
+        assert data["resolved"][0]["pnl_usd"] == -2.5
+
+    def test_noop_when_csv_missing(self, tmp_path):
+        out_dir = tmp_path / "out"
+        weather_bot._write_live_resolved_file(tmp_path / "nope.csv", 1, out_dir)
+        assert not (out_dir / "last_live_resolved.json").exists()
+
+    def test_never_reads_paper_trades_csv(self, tmp_path):
+        """Regression guard for the original bug: the live alert file must be
+        sourced from the live CSV path it's given, not a hardcoded paper path."""
+        (tmp_path / "paper_trades.csv").write_text(
+            "market_title,direction,pnl_usd,resolved_at\n"
+            "PAPER LEAK,NO,999.0,2026-08-21T00:00:00+00:00\n"
+        )
+        live_csv = tmp_path / "live_trades.csv"
+        self._write_live_csv(live_csv, [
+            {"market_title": "real live trade", "direction": "NO", "pnl_usd": "3.3",
+             "resolved_at": "2026-08-21T00:00:00+00:00"},
+        ])
+        weather_bot._write_live_resolved_file(live_csv, 1, tmp_path)
+        data = json.loads((tmp_path / "last_live_resolved.json").read_text())
+        titles = [r["market_title"] for r in data["resolved"]]
+        assert "PAPER LEAK" not in titles
+        assert titles == ["real live trade"]

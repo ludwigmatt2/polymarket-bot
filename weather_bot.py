@@ -333,6 +333,8 @@ def fan_out_auto_resolve(client: WeatherClient) -> None:
                 live_resolved, live_skipped = user_live.auto_resolve(client, model=None, positions=_positions)
                 print(f"  User {uid} live: auto-resolved {live_resolved} trade(s).  "
                       f"{live_skipped} skipped.")
+                if live_resolved:
+                    _write_live_resolved_file(live_csv, live_resolved, user_dir)
                 _claim = user_live.claim_winnings(positions=_positions, ledger_path=user_dir / "live_wallet.json")
                 if _claim.get("claimed"):
                     print(f"  User {uid} live: claimed {_claim['claimed']} resolved position(s) → pUSD.")
@@ -436,6 +438,37 @@ def _write_resolved_file(paper: "PaperTrader", resolved_count: int, log_dir: Pat
         "gate_ready": stats.ready_for_live,
         "gate_progress": stats.failure_reasons,
         "gate_station_resolved": stats.station_resolved,
+    }))
+
+
+def _write_live_resolved_file(trades_path: Path, resolved_count: int, out_dir: Path) -> None:
+    """Live counterpart to _write_resolved_file — reads real settlements off
+    live_trades.csv into last_live_resolved.json, so the Telegram alert job
+    can tell a live user what actually happened to their money, instead of
+    narrating the paper/calibration track that keeps running alongside it."""
+    import csv as _csv
+    import json
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if not trades_path.exists():
+        return
+    with trades_path.open() as f:
+        rows = list(_csv.DictReader(f))
+    recently_resolved = sorted(
+        [r for r in rows if r.get("resolved_at")],
+        key=lambda x: x.get("resolved_at", ""), reverse=True
+    )[:resolved_count]
+    (out_dir / "last_live_resolved.json").write_text(json.dumps({
+        "resolved_at": __import__("datetime").datetime.utcnow().isoformat(),
+        "count": resolved_count,
+        "resolved": [
+            {
+                "market_title": r.get("market_title", ""),
+                "direction": r.get("direction", ""),
+                "pnl_usd": float(r.get("pnl_usd", 0)),
+                "resolved_at": r.get("resolved_at", ""),
+            }
+            for r in recently_resolved
+        ],
     }))
 
 
@@ -885,6 +918,8 @@ def main() -> None:
             _positions = live_trader.fetch_positions()  # one snapshot for resolve + claim
             live_resolved, live_skipped = live_trader.auto_resolve(client, model=model, positions=_positions)
             print(f"  Live:  auto-resolved {live_resolved} trade(s).  {live_skipped} skipped.")
+            if live_resolved:
+                _write_live_resolved_file(live_log, live_resolved, log_dir)
             _claim = live_trader.claim_winnings(positions=_positions, ledger_path=log_dir / "live_wallet.json")
             if _claim.get("claimed"):
                 print(f"  Live:  claimed {_claim['claimed']} resolved position(s) → pUSD.")
