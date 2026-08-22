@@ -21,13 +21,23 @@ import requests
 _log = logging.getLogger(__name__)
 
 
+_RETRY_DELAYS_S = (2.0, 5.0, 10.0)
+
+
 def _get_with_retry(url: str, params: dict, timeout: float) -> requests.Response:
-    """GET with a single retry after a pause on 429 — Open-Meteo's free tier
+    """GET with growing-backoff retries on 429 — Open-Meteo's free tier
     rate-limits per minute; one scan evaluates hundreds of bucket markets and
-    can trip it mid-run."""
+    can trip it mid-run. A single flat 2s retry wasn't enough to clear a
+    sustained per-minute window, so a cache-cold scan (every DISK_CACHE_TTL_S)
+    could lose a big chunk of the universe to gate 2.5 wholesale (Aug 22 2026:
+    64/404 markets in one run). Backoff instead of a fixed pause so a longer
+    rate-limit window still has a chance to clear within the scan's kill-
+    timeout, rather than giving up after one quick retry."""
     r = requests.get(url, params=params, timeout=timeout)
-    if r.status_code == 429:
-        time.sleep(2.0)
+    for delay in _RETRY_DELAYS_S:
+        if r.status_code != 429:
+            break
+        time.sleep(delay)
         r = requests.get(url, params=params, timeout=timeout)
     r.raise_for_status()
     return r

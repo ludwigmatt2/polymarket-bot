@@ -99,6 +99,21 @@ class TestRateLimitRetry:
         with pytest.raises(req.HTTPError):
             _get_with_retry("http://x", {}, 5)
 
+    def test_recovers_after_sustained_429s_within_backoff_window(self, monkeypatch):
+        """A rate-limit window that outlasts a single 2s retry (Aug 22 2026:
+        scheduled scans were losing ~16% of markets to exactly this) must still
+        succeed once it clears, as long as it clears within the backoff budget."""
+        ok = MagicMock(status_code=200)
+        limited = MagicMock(status_code=429)
+        responses = [limited, limited, limited, ok]  # exhausts all 3 retries, then succeeds
+        monkeypatch.setattr(wc_module.requests, "get", lambda *a, **k: responses.pop(0))
+        sleeps = []
+        monkeypatch.setattr(wc_module.time, "sleep", lambda s: sleeps.append(s))
+        r = _get_with_retry("http://x", {}, 5)
+        assert r is ok
+        assert responses == []
+        assert sleeps == [2.0, 5.0, 10.0]  # growing backoff, not a flat retry
+
 
 class TestControlMemberExtraction:
     """Jul-8 fix: the control run arrives under the bare variable name and was
