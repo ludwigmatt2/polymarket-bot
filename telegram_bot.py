@@ -2569,8 +2569,9 @@ async def handle_admin_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
 
 
 def _count_trades(uid: int) -> int:
-    """Row count of a user's paper-trades CSV (excludes the header)."""
-    p = _trades_csv_path(uid)
+    """Row count of a user's active trades CSV (excludes the header) — live_trades.csv
+    when the user is in live mode, paper_trades.csv otherwise."""
+    p = _active_trades_csv_path(uid)
     if not p.exists():
         return 0
     try:
@@ -2699,7 +2700,8 @@ async def _auto_scan(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     header = [f"🔍 *Scan complete* · _{meta.get('scanned_at', '')}_"]
     if funnel.get("evaluated") is not None:
         header.append(f"Evaluated: {funnel['evaluated']} · Actionable: {funnel.get('actionable', 0)}")
-    header.append(f"New paper trades: *{new_trades}*")
+    trade_label = "New live trades" if get_user_mode(ADMIN_ID) == "live" else "New paper trades"
+    header.append(f"{trade_label}: *{new_trades}*")
     body = fmt_signals(read_last_signals(ADMIN_ID), ADMIN_ID)
     try:
         await ctx.bot.send_message(

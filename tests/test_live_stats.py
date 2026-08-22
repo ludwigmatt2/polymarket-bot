@@ -70,6 +70,31 @@ class TestLiveWalletStats:
         assert ws["return_pct"] == 2.0                            # 2 / 100
 
 
+class TestCountTrades:
+    """Aug 22 fix: the auto-scan heartbeat's 'New trades' count and label must
+    track the admin's actual mode — it was hardcoded to paper_trades.csv, so a
+    live admin's heartbeat kept reporting paper-track counts under a
+    'New paper trades' label."""
+
+    def test_paper_mode_counts_paper_csv(self, tmp_path, monkeypatch):
+        paper_csv = tmp_path / "paper_trades.csv"
+        paper_csv.write_text("h\nrow1\nrow2\n")
+        monkeypatch.setattr(tb, "get_user_mode", lambda uid: "paper")
+        monkeypatch.setattr(tb, "_trades_csv_path", lambda uid: paper_csv)
+        monkeypatch.setattr(tb, "_live_trades_csv_path", lambda uid: tmp_path / "nope.csv")
+        assert tb._count_trades(1) == 2
+
+    def test_live_mode_counts_live_csv_not_paper(self, tmp_path, monkeypatch):
+        paper_csv = tmp_path / "paper_trades.csv"
+        paper_csv.write_text("h\n" + "row\n" * 50)          # stale paper-track noise
+        live_csv = tmp_path / "live_trades.csv"
+        live_csv.write_text("h\nrow1\n")
+        monkeypatch.setattr(tb, "get_user_mode", lambda uid: "live")
+        monkeypatch.setattr(tb, "_trades_csv_path", lambda uid: paper_csv)
+        monkeypatch.setattr(tb, "_live_trades_csv_path", lambda uid: live_csv)
+        assert tb._count_trades(1) == 1
+
+
 class TestModeDispatch:
     def test_status_live_no_trades(self, monkeypatch):
         monkeypatch.setattr(tb, "get_user_mode", lambda uid: "live")
