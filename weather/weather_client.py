@@ -52,13 +52,19 @@ class WeatherClient:
     # Open-Meteo's per-minute limit mid-scan and whole city/date blocks silently
     # come back with 0 members (rejected by gate 2.5).
     FORECAST_CACHE_TTL_S = 900
-    # Cross-PROCESS disk cache TTL. Every scheduled run (hourly scan, 15-min
+    # Cross-PROCESS disk cache TTL. Every scheduled run (full scan, 15-min
     # intraday ticks) is a fresh subprocess with a cold in-memory cache — without
     # a shared cache the fleet re-fetched every ensemble every tick (~13-17k
     # calls/day vs Open-Meteo's ~10k free tier), and the resulting sustained
     # 429s + 2s retry sleeps dragged evaluation past the scan kill-timeout
-    # (Jul-9/10 outage, part 3). Ensembles update ~6-hourly; 45 min is fresh.
-    DISK_CACHE_TTL_S = 2700
+    # (Jul-9/10 outage, part 3).
+    # 45 min was sized for an hourly full scan; AUTO_SCAN_INTERVAL is now 4h
+    # (default, see telegram_bot.py) and the 45-min TTL was never bumped to
+    # match — every scheduled full scan started stone cold and re-triggered the
+    # same 429 burst (Aug 22 2026: 64/404 markets lost to gate2.5 in one scan).
+    # Ensembles only update ~6-hourly server-side regardless, so 6h loses no
+    # real freshness — Open-Meteo won't have new data before then anyway.
+    DISK_CACHE_TTL_S = 21600
     # A combo that failed entirely (usually a 429 burst) is not retried for this
     # long — one bad combo must not re-fail once per bucket market in its block.
     NEGATIVE_CACHE_TTL_S = 180
