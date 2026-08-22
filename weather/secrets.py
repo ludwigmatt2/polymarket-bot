@@ -318,15 +318,24 @@ def prepare_for_live(uid: int) -> dict:
         if not deployed:
             rc.deploy_deposit_wallet(wallet)
             deployed = True
-        usdce = relayer.usdce_balance(wallet)
-        if usdce > 0:
+        # strict=True: distinguish "RPC unreachable" (None) from "wallet genuinely
+        # has 0 USDC.e" (0.0) — the non-strict default silently no-ops the wrap on
+        # a flaky RPC read, which is why a stuck deposit could go unwrapped for a
+        # full day with zero error ever raised (Aug 22 2026 incident).
+        usdce = relayer.usdce_balance(wallet, strict=True)
+        if usdce is None:
+            error = "RPC unavailable — could not read USDC.e balance, wrap skipped this cycle"
+        elif usdce > 0:
             rc.wrap_usdce_to_pusd(wallet, int(usdce * 1_000_000))  # floor: never over-wrap
         if not creds.get("exchanges_approved"):
             rc.approve_exchanges(wallet)
             set_user_creds(uid, exchanges_approved=True)
     except Exception as e:  # noqa: BLE001
-        error = str(e)
-    pusd = relayer.pusd_balance(wallet)  # read once, shared by both outcomes
+        error = f"{type(e).__name__}: {e}"
+    pusd = relayer.pusd_balance(wallet, strict=True)  # read once, shared by both outcomes
+    if pusd is None:
+        error = error or "RPC unavailable — could not verify pUSD balance after wrap"
+        pusd = 0.0
     result = {"ready": error is None and pusd > 0, "pusd": pusd, "deployed": deployed}
     if error:
         result["error"] = error

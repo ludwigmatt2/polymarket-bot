@@ -21,6 +21,7 @@ import csv
 import json
 import math
 import os
+import sys
 import threading
 from contextlib import contextmanager
 from collections import defaultdict
@@ -2602,8 +2603,13 @@ def _record_and_prepare(uid: int, funder: str, usdce: float) -> dict:
     # (re-read, not assumed 0 — the wrap may have failed) so the NEXT deposit is
     # measured from there. Without this the watermark stays at this deposit's level
     # and the next deposit is under-counted (or, if smaller, missed entirely).
+    # strict=True: a False 0.0 on RPC failure would silently reset the watermark to
+    # 0 here, making the SAME still-unwrapped balance look like a brand-new deposit
+    # next cycle — skip the re-sync entirely rather than write a bad watermark.
     try:
-        live_ledger.reconcile_deposit(path, relayer.usdce_balance(funder))
+        post_wrap = relayer.usdce_balance(funder, strict=True)
+        if post_wrap is not None:
+            live_ledger.reconcile_deposit(path, post_wrap)
     except Exception:  # noqa: BLE001
         pass
     return {**prep, "detected": detected}
@@ -2628,7 +2634,14 @@ def _wrap_pending_live_deposits() -> list[dict]:
             c = get_user_creds(uid) or {}
             if c.get("signature_type") != 3 or not c.get("funder_address"):
                 continue
-            usdce = relayer.usdce_balance(c["funder_address"])
+            # strict=True: an unreachable RPC must not look like "nothing to wrap" —
+            # that silent conflation is what let a real deposit sit unwrapped for a
+            # full day with no error ever surfacing (Aug 22 2026 incident).
+            usdce = relayer.usdce_balance(c["funder_address"], strict=True)
+            if usdce is None:
+                out.append({"uid": uid, "wrapped": 0.0, "pusd": 0.0, "fresh": False,
+                            "error": "RPC unavailable — could not read on-chain USDC.e balance"})
+                continue
             if usdce <= 0:
                 continue
             prep = _record_and_prepare(uid, c["funder_address"], usdce)
@@ -2653,13 +2666,24 @@ async def _auto_scan(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             pass
     try:
         for w in await asyncio.to_thread(_wrap_pending_live_deposits):
-            if w.get("error") and w.get("fresh"):  # alert on a NEW deposit, not a stuck balance
+            if w.get("error"):
+                # Always land in the journal, even if the Telegram alert below is
+                # de-spammed — a stuck wrap must never go fully invisible again
+                # (Aug 22 2026: gated on "fresh" alone, so it alerted once on
+                # detection and then silently kept failing every scan for a day).
+                print(f"  [wrap] user {w['uid']}: ${w['wrapped']:.2f} USDC.e unwrapped — "
+                      f"{w['error']}", file=sys.stderr)
+                sig_key = f"last_wrap_fail_{w['uid']}"
+                sig = (w["error"], datetime.now(timezone.utc).date().isoformat())
+                if ctx.bot_data.get(sig_key) != sig:
+                    ctx.bot_data[sig_key] = sig
+                    await _dm(w["uid"],
+                              f"⚠️ ${w['wrapped']:.2f} USDC.e still unwrapped: "
+                              f"{str(w['error'])[:150]}\n(repeats muted today unless the error changes)")
+            elif w.get("pusd", 0) > 0:
+                ctx.bot_data.pop(f"last_wrap_fail_{w['uid']}", None)  # recovered → re-arm
                 await _dm(w["uid"],
-                          f"⚠️ Auto-wrap of a new ${w['wrapped']:.2f} USDC.e deposit "
-                          f"didn't finish: {str(w['error'])[:150]}\nIt'll retry next scan.")
-            elif not w.get("error") and w.get("pusd", 0) > 0:
-                await _dm(w["uid"],
-                          f"💰 ${w['wrapped']:.2f} new deposit wrapped — "
+                          f"💰 ${w['wrapped']:.2f} deposit wrapped — "
                           f"${w['pusd']:,.2f} pUSD now tradeable.")
     except Exception:
         pass

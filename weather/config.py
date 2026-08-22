@@ -143,11 +143,17 @@ PAPER_TRADE_SIZE_USD = 25.0
 PAPER_BANKROLL_USD = 1000.0
 
 # ── Live trading (Kelly sizing) ────────────────────────────────────────────────
-# Eighth Kelly (0.25 → 0.125, Aug 2026): Kelly sizing off a miscalibrated
+# Quarter Kelly (0.125 → 0.25, Aug 22 2026): restored after the eighth-Kelly cut
+# (Aug 2026, see below) — the variance-inflation fix (EMOS-lite, λ=2.0) forward-
+# validated on the mainline track (89 trades, WR 68.5%, PF 1.97, 0/89 on-chain
+# flips, per the Aug 19 gate pass). Also: on the current ~$80 live bankroll,
+# eighth-Kelly stakes on a typical actionable edge (8-15pp) landed at $1-4 —
+# frequently skipped outright by execute_signal's $1 CLOB minimum, so real
+# signals were going untraded regardless of edge quality.
+# Prior note (eighth Kelly, 0.25 → 0.125): Kelly sizing off a miscalibrated
 # probability compounds the damage — the forward calibration curve showed raw_p
-# in [0,0.10) resolving YES 34.9% of the time. Restore quarter Kelly only after
-# the variance-inflation calibration fix is validated forward.
-KELLY_FRACTION = 0.125
+# in [0,0.10) resolving YES 34.9% of the time.
+KELLY_FRACTION = 0.25
 MAX_LIVE_TRADE_USD = float(os.environ.get("MAX_LIVE_TRADE_USD", "25.0"))  # overrideable via env or /setmaxbet
 # Kill switch: halt for the day when resolved losses exceed
 # max(DAILY_LOSS_LIMIT_PCT × bankroll, 2 × max order) — the floor keeps a small

@@ -18,7 +18,7 @@ def _patch(monkeypatch, *, modes, creds, usdce, prep):
     import weather.live_ledger as ll
     monkeypatch.setattr(sec, "get_user_creds", lambda uid: creds.get(uid))
     monkeypatch.setattr(sec, "prepare_for_live", lambda uid: prep(uid))
-    monkeypatch.setattr(rl, "usdce_balance", lambda w: usdce.get(w, 0.0))
+    monkeypatch.setattr(rl, "usdce_balance", lambda w, strict=False: usdce.get(w, 0.0))
     monkeypatch.setattr(ll, "reconcile_deposit", lambda path, amt, **k: amt)  # amt>0 → fresh
 
 
@@ -71,6 +71,25 @@ def test_surfaces_prep_error_and_isolates_failures(monkeypatch):
     assert "boom" in res[30]["error"]   # per-user failure captured, not raised
 
 
+def test_rpc_failure_surfaces_as_error_not_silent_skip(monkeypatch):
+    """An unreachable RPC (usdce_balance → None under strict=True) must produce a
+    visible error entry — not be swallowed by the old non-strict default (0.0 on
+    failure), which made a real stuck deposit indistinguishable from 'nothing to
+    wrap' and let it sit unwrapped for a full day (Aug 22 2026 incident)."""
+    monkeypatch.setattr(tb, "all_user_ids", lambda: [10])
+    monkeypatch.setattr(tb, "get_user_mode", lambda uid: "live")
+    import weather.secrets as sec
+    import weather.relayer as rl
+    monkeypatch.setattr(sec, "get_user_creds",
+                         lambda uid: {"signature_type": 3, "funder_address": _W10})
+    monkeypatch.setattr(rl, "usdce_balance", lambda w, strict=False: None)  # RPC down
+
+    res = tb._wrap_pending_live_deposits()
+    assert len(res) == 1
+    assert res[0]["uid"] == 10
+    assert "RPC unavailable" in res[0]["error"]
+
+
 def test_record_and_prepare_resets_watermark_so_next_deposit_counts_full(monkeypatch, tmp_path):
     """After wrapping drops USDC.e→0, the ledger watermark must reset to the post-wrap
     balance — else the NEXT deposit is measured from this deposit's level and
@@ -81,7 +100,7 @@ def test_record_and_prepare_resets_watermark_so_next_deposit_counts_full(monkeyp
     ledger = tmp_path / "lw.json"
     monkeypatch.setattr(tb, "_live_wallet_file", lambda uid: ledger)
     monkeypatch.setattr(sec, "prepare_for_live", lambda uid: {"ready": True, "pusd": 50.0})
-    monkeypatch.setattr(rl, "usdce_balance", lambda w: 0.0)  # post-wrap balance ≈ 0
+    monkeypatch.setattr(rl, "usdce_balance", lambda w, strict=False: 0.0)  # post-wrap balance ≈ 0
 
     res = tb._record_and_prepare(99, "0xFUND", 50.0)          # $50 lands, then wraps
     assert res["detected"] == 50.0

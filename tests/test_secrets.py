@@ -175,16 +175,46 @@ class TestPrepareForLive:
             import weather.relayer as rl
             monkeypatch.setattr(rl, "RelayerClient", FakeRC)
             monkeypatch.setattr(rl, "is_deployed", lambda w: False)   # → deploy
-            monkeypatch.setattr(rl, "usdce_balance", lambda w: 5.0)   # → wrap
-            monkeypatch.setattr(rl, "pusd_balance", lambda w: 5.0)    # final balance
+            monkeypatch.setattr(rl, "usdce_balance", lambda w, strict=False: 5.0)   # → wrap
+            monkeypatch.setattr(rl, "pusd_balance", lambda w, strict=False: 5.0)    # final balance
 
             res = sec.prepare_for_live(2)
             assert res["ready"] is True and res["pusd"] == 5.0
             assert calls == {"deploy": 1, "wrap": 1, "approve": 1}
             # second call: already deployed + approved + no USDC.e → no relayer ops
             monkeypatch.setattr(rl, "is_deployed", lambda w: True)
-            monkeypatch.setattr(rl, "usdce_balance", lambda w: 0.0)
+            monkeypatch.setattr(rl, "usdce_balance", lambda w, strict=False: 0.0)
             calls.update(deploy=0, wrap=0, approve=0)
             res2 = sec.prepare_for_live(2)
             assert res2["ready"] is True
-            assert calls == {"deploy": 0, "wrap": 0, "approve": 0}  # idempotent
+
+    def test_rpc_failure_does_not_masquerade_as_zero_balance(self, tmp_path, monkeypatch):
+        """An unreachable RPC (usdce_balance → None under strict=True) must skip the
+        wrap and report an error — not silently look like 'nothing to wrap' the way
+        the old non-strict default (0.0 on failure) did. That silent conflation let a
+        real deposit sit unwrapped for a full day with zero error raised (Aug 22 2026)."""
+        self._setup(tmp_path, monkeypatch)
+        with patch.dict("sys.modules", {"keyring": None}):
+            from importlib import reload
+            import weather.secrets as sec
+            reload(sec)
+            sec.set_user_creds(3, pk=self._PK, funder_address="0xWALLET", signature_type=3)
+
+            calls = {"wrap": 0}
+
+            class FakeRC:
+                def __init__(self, pk=None): pass
+                def deploy_deposit_wallet(self, w): pass
+                def wrap_usdce_to_pusd(self, w, amt): calls["wrap"] += 1
+                def approve_exchanges(self, w): pass
+
+            import weather.relayer as rl
+            monkeypatch.setattr(rl, "RelayerClient", FakeRC)
+            monkeypatch.setattr(rl, "is_deployed", lambda w: True)
+            monkeypatch.setattr(rl, "usdce_balance", lambda w, strict=False: None)  # RPC down
+            monkeypatch.setattr(rl, "pusd_balance", lambda w, strict=False: 0.0)
+
+            res = sec.prepare_for_live(3)
+            assert calls["wrap"] == 0                       # never attempted a blind wrap
+            assert res["ready"] is False
+            assert "RPC unavailable" in res["error"]
