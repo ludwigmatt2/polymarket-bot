@@ -193,6 +193,13 @@ def _seed_admin_creds() -> None:
 def get_user_mode(uid: int) -> str:
     return _load_users().get(uid, {}).get("mode", "paper")
 
+def get_intraday_live(uid: int) -> bool:
+    """Independent of overall live/paper mode: intraday's own track record is
+    being watched separately (Aug 23 2026 — negative Brier skill despite
+    positive PF/WR), so it needs to be turnable off without killing hourly
+    live trading too. Requires overall live mode as a prerequisite regardless."""
+    return _load_users().get(uid, {}).get("intraday_live", False)
+
 def get_user_private_key(uid: int) -> Optional[str]:
     return _load_users().get(uid, {}).get("private_key")
 
@@ -1127,9 +1134,15 @@ def _scan_args(mode: str) -> list[str]:
     Both scan modes run one-shot; a *live* root scan is what actually places the
     admin's live orders — paper never does. Resolve modes are already loop-free.
     The intraday loop is root-only (no fan-out): it re-evaluates the watchlist
-    into the root paper log, which is what the gate and stats read."""
+    into the root paper log, which is what the gate and stats read. Live
+    execution for intraday (Aug 23 2026) is a standalone opt-in via --live —
+    it isn't implied by the admin's overall mode string the way hourly/paper
+    are, since intraday's own track record is still being watched separately."""
     if mode == "intraday":
-        return [PYTHON, "weather_bot.py", "--mode", "intraday"]
+        args = [PYTHON, "weather_bot.py", "--mode", "intraday"]
+        if get_user_mode(ADMIN_ID) == "live" and get_intraday_live(ADMIN_ID):
+            args.append("--live")
+        return args
     args = [PYTHON, "weather_bot.py", "--mode", mode, "--all-users"]
     if mode in ("paper", "live"):
         args += ["--interval", "0"]
@@ -1695,6 +1708,46 @@ async def cmd_setmaxbet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"✅ Max bet: *${old:.0f} → ${val:.0f}/trade*\nActive on next trade — no restart needed.",
         parse_mode="Markdown",
     )
+
+
+@require_perm(perms.SET_MAXBET)
+async def cmd_intraday_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Independent on/off switch for live execution on the intraday (event-day)
+    track — separate from overall /mymode so it can be turned off without
+    killing hourly live trading too. Requires overall live mode regardless;
+    this only decides whether the intraday loop is ALSO allowed to place real
+    orders once live mode is on."""
+    uid = update.effective_user.id
+    current = get_intraday_live(uid)
+    overall_live = get_user_mode(uid) == "live"
+
+    if not ctx.args:
+        status = "🟢 ON" if current else "🔴 OFF"
+        note = "" if overall_live else "\n⚠️ Overall mode is paper — intraday live is inert until /mymode live."
+        await update.effective_message.reply_text(
+            f"⚡ Intraday live execution: *{status}*{note}\n\nToggle: /intraday_live on|off",
+            parse_mode="Markdown",
+        )
+        return
+
+    arg = ctx.args[0].lower()
+    if arg not in ("on", "off"):
+        await update.effective_message.reply_text("❌ Usage: /intraday_live on|off")
+        return
+
+    new_val = arg == "on"
+    with _users_transaction() as users:
+        users.setdefault(uid, {})["intraday_live"] = new_val
+
+    if new_val and not overall_live:
+        await update.effective_message.reply_text(
+            "✅ Intraday live *armed* — but overall mode is still paper, so it "
+            "won't place real orders until /mymode live is also on.",
+            parse_mode="Markdown",
+        )
+    else:
+        state = "🟢 ON — the next 15-min tick can place real orders" if new_val else "🔴 OFF — back to paper-only"
+        await update.effective_message.reply_text(f"⚡ Intraday live execution: {state}")
 
 
 @require_perm(perms.TRIGGER_SCAN)
@@ -2559,6 +2612,7 @@ _ADMIN_COMMANDS = _USER_COMMANDS + [
     ("audit",       "🧾 Recent audit log (money/role/live events)"),
     ("setwithdrawcap", "🔐 Set a user's daily withdrawal cap"),
     ("setmaxbet",   "💰 Set max bet size per trade (e.g. /setmaxbet 50)"),
+    ("intraday_live", "⚡ Toggle live execution on the intraday track"),
 ]
 
 def _commands_for_role(role: str | None) -> list[tuple[str, str]]:
@@ -2873,13 +2927,47 @@ async def _intraday_scan(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 pass
         return
     ctx.bot_data.pop("last_intraday_fail", None)
-    trades = [ln.strip() for ln in (stdout or "").splitlines() if "NEW INTRADAY TRADE" in ln]
-    if trades:
-        body = "\n".join(f"`{t.replace('NEW INTRADAY TRADE: ', '')[:100]}`" for t in trades[:5])
+
+    # Same swallowed-order-failure gap the hourly path had (Aug 23 2026) — a
+    # live order can fail without failing the tick (rc stays 0). Now that
+    # intraday can place real orders, this must alert here too, not just on
+    # the hourly scan.
+    issues = [l for l in (stdout + stderr).splitlines() if l.startswith("ORDER_ISSUE:")]
+    if issues:
+        err_text = "\n".join(issues)[:600]
+        sig = (err_text, datetime.now(timezone.utc).date().isoformat())
+        if ctx.bot_data.get("last_intraday_order_fail") != sig:
+            ctx.bot_data["last_intraday_order_fail"] = sig
+            try:
+                await ctx.bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ Intraday live order didn't go through (repeats muted today unless the error changes)\n```\n{err_text}\n```",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+    else:
+        ctx.bot_data.pop("last_intraday_order_fail", None)
+
+    live_trades = [ln.strip() for ln in (stdout or "").splitlines() if "NEW INTRADAY LIVE TRADE" in ln]
+    paper_trades = [ln.strip() for ln in (stdout or "").splitlines()
+                     if "NEW INTRADAY TRADE" in ln and ln not in live_trades]
+    if live_trades:
+        body = "\n".join(f"`{t.replace('NEW INTRADAY LIVE TRADE: ', '')[:100]}`" for t in live_trades[:5])
         try:
             await ctx.bot.send_message(
                 ADMIN_ID,
-                f"⚡ *Intraday tape trade(s)* — {len(trades)}\n{body}",
+                f"⚡🟢 *Intraday LIVE trade(s)* — {len(live_trades)}\n{body}",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+    if paper_trades:
+        body = "\n".join(f"`{t.replace('NEW INTRADAY TRADE: ', '')[:100]}`" for t in paper_trades[:5])
+        try:
+            await ctx.bot.send_message(
+                ADMIN_ID,
+                f"⚡ *Intraday tape trade(s)* — {len(paper_trades)}\n{body}",
                 parse_mode="Markdown",
             )
         except Exception:
@@ -2966,6 +3054,7 @@ async def _run() -> None:
         ("unsuspend",   cmd_unsuspend),
         ("setwithdrawcap", cmd_setwithdrawcap),
         ("setmaxbet",   cmd_setmaxbet),
+        ("intraday_live", cmd_intraday_live),
     ]:
         app.add_handler(CommandHandler(cmd, handler))
 

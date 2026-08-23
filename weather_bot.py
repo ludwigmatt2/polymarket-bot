@@ -482,11 +482,16 @@ def _write_live_resolved_file(trades_path: Path, resolved_count: int, out_dir: P
     }))
 
 
-def mode_intraday(scanner, generator, log_dir: Path = DEFAULT_LOG_DIR) -> None:
+def mode_intraday(scanner, generator, log_dir: Path = DEFAULT_LOG_DIR,
+                   live_trader: "LiveTrader | None" = None) -> None:
     """I1: re-evaluate the watchlist (event-day station markets from the last
-    full scan) with fresh observations and fresh executable book quotes. Paper
-    only — the live path gets wired at the re-live decision. Trades logged with
-    scan_source='intraday' so the loop's PnL contribution is separable."""
+    full scan) with fresh observations and fresh executable book quotes.
+    Paper by default; live_trader activates the same execution path run_scan()
+    uses for the hourly track (Aug 23 2026 — see gates_passed split in
+    read_stats before turning this on: intraday's own Brier skill has run
+    negative even though PF/WR looked fine, so this is a live experiment, not
+    a proven track). Trades logged with scan_source='intraday' either way, so
+    the loop's PnL/calibration contribution stays separable from hourly's."""
     from weather import station_obs
     from weather.config import WATCHLIST_MAX_AGE_S
     from weather.watchlist import load_watchlist
@@ -503,6 +508,17 @@ def mode_intraday(scanner, generator, log_dir: Path = DEFAULT_LOG_DIR) -> None:
     from weather.watchlist import apply_book_mid
 
     paper = PaperTrader(log_path=log_dir / "paper_trades.csv")
+
+    geoblocked = False
+    if live_trader is not None:
+        live_trader.reset_scan_commitments()  # fresh in-tick spend budget
+        geo = check_geoblock()
+        if geo and geo.get("blocked"):
+            geoblocked = True
+            print(f"ORDER_ISSUE: intraday geoblocked from "
+                  f"{geo.get('country','?')}/{geo.get('region','?')} (IP {geo.get('ip','?')}) "
+                  f"— route order traffic through a permitted region (set HTTPS_PROXY).",
+                  file=sys.stderr)
     # X1: open positions indexed by (market_id, direction) — while a watchlist
     # market is being re-evaluated anyway, check whether the book bids MORE than
     # the freshly-computed model value of a position we hold. If so, simulate an
@@ -530,7 +546,24 @@ def mode_intraday(scanner, generator, log_dir: Path = DEFAULT_LOG_DIR) -> None:
             continue  # books unusable this tick — never price off stale quotes
         checked += 1
         sig = generator.evaluate(wm)
-        if sig.quality_gate_passed and paper.log_trade(sig, scan_source="intraday"):
+        if sig.quality_gate_passed and live_trader is not None and not geoblocked:
+            try:
+                result = live_trader.execute_signal(sig, scan_source="intraday")
+                if result and result.get("filled", 0) > 0:
+                    traded += 1
+                    print(f"  NEW INTRADAY LIVE TRADE: {sig.direction} {wm.title[:60]} "
+                          f"${result['size_usd']:.2f} @ {result['price']:.3f}  "
+                          f"order={result['order_id'][:10]}")
+                # unfilled/skipped: quiet, matches the hourly live path — retryable
+                # next tick, not worth a print every 15 minutes for a thin book.
+            except RuntimeError as e:
+                print(f"  LIVE HALT: {e}", file=sys.stderr)
+                raise
+            except Exception as e:
+                # Same swallowed-exception risk the hourly path had (Aug 23 2026)
+                # — tag it the same way so _intraday_scan's alerting catches it.
+                print(f"ORDER_ISSUE: {wm.title[:55]} | {type(e).__name__}: {e}", file=sys.stderr)
+        elif sig.quality_gate_passed and live_trader is None and paper.log_trade(sig, scan_source="intraday"):
             traded += 1
             obs = f"{sig.running_obs_c:.1f}C" if sig.running_obs_c is not None else "-"
             print(f"  NEW INTRADAY TRADE: {sig.direction} {wm.title[:60]} "
@@ -844,6 +877,91 @@ def mode_backtest_live(client: WeatherClient, model: ProbabilityModel, log_dir: 
     print("  ══════════════════════════════════════════════════")
 
 
+def _build_admin_live_trader(paper: PaperTrader, log_dir: Path, bankroll: float) -> LiveTrader:
+    """Construct + validate the admin/owner live trader: derive/migrate CLOB
+    creds if needed, check the go-live gate, fetch the real on-chain balance.
+    Shared by --mode live and --mode intraday --live so both execution paths
+    go through identical credential/gate handling. Exits the process on an
+    unrecoverable credential failure or a closed gate (matches the prior
+    --mode live behavior exactly)."""
+    from weather.secrets import get_user_creds, set_user_creds
+    admin_uid = int(os.environ.get("TELEGRAM_ADMIN_ID") or os.environ.get("ADMIN_ID") or "0")
+    _creds = get_user_creds(admin_uid) if admin_uid else None
+    # Auto-derive L2 creds if missing (first run after key was stored)
+    if _creds and _creds.get("pk") and not _creds.get("clob_api_key"):
+        try:
+            from weather.secrets import derive_and_store_clob_creds
+            l2 = derive_and_store_clob_creds(admin_uid)
+            _creds.update(l2)
+            print("  ✅ L2 CLOB credentials derived and stored.")
+        except Exception as exc:
+            print(f"  ⚠️  L2 credential derivation failed: {exc}", file=sys.stderr)
+    if not _creds or not _creds.get("pk"):
+        # One-time migration: seed from env vars if still present
+        pk_env = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
+        funder_env = os.environ.get("POLYMARKET_FUNDER_ADDRESS", "") or os.environ.get("POLYMARKET_PROXY_ADDRESS", "")
+        if pk_env and admin_uid:
+            sig = 1 if funder_env else 0  # POLY_PROXY vs EOA
+            set_user_creds(
+                admin_uid, pk=pk_env,
+                funder_address=funder_env or None, signature_type=sig,
+            )
+            _creds = {"pk": pk_env, "funder_address": funder_env or None, "signature_type": sig}
+            print(
+                "  ℹ️  Migrated admin credentials from env to encrypted store.\n"
+                "  You can now remove POLYMARKET_PRIVATE_KEY and POLYMARKET_PROXY_ADDRESS from .env."
+            )
+            # Derive L2 CLOB credentials so balance checks work
+            try:
+                from weather.secrets import derive_and_store_clob_creds
+                l2 = derive_and_store_clob_creds(admin_uid)
+                _creds.update(l2)
+                print("  ✅ L2 CLOB credentials derived and stored.")
+            except Exception as exc:
+                print(f"  ⚠️  L2 credential derivation failed: {exc}", file=sys.stderr)
+        else:
+            print(
+                "  ❌ No admin credentials in encrypted store.\n"
+                "  Run the Telegram bot onboarding (/wallet_setup) to store credentials.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    def _build(creds):
+        return LiveTrader.from_creds(
+            creds,
+            paper_trader=paper,
+            bankroll_usd=bankroll,
+            log_path=log_dir / "live_trades.csv",
+            idempotency_path=log_dir / "live_idempotency.json",
+        )
+
+    live_trader = _build(_creds)
+    if not live_trader.is_unlocked():
+        print("  Go-live gates not passed. Run: python weather_bot.py --mode stats", file=sys.stderr)
+        sys.exit(1)
+    try:
+        balance = live_trader.fetch_balance()
+    except Exception as e:  # noqa: BLE001
+        # Stale L2 CLOB creds (e.g. after a wallet-key rotation) 401 on the first
+        # CLOB call. Re-derive once and rebuild, then retry — so unattended live
+        # scans self-heal instead of silently placing nothing.
+        if "invalid api key" not in str(e).lower():
+            raise
+        from weather.secrets import derive_and_store_clob_creds
+        print("  ⚠️  CLOB creds rejected (401) — re-deriving and retrying...", file=sys.stderr)
+        derive_and_store_clob_creds(admin_uid)
+        live_trader = _build(get_user_creds(admin_uid))
+        balance = live_trader.fetch_balance()
+    # Kelly must size on REAL funds, never the CLI default (--bankroll defaults to
+    # 500). Cap to the actual wallet balance — mirrors the per-user fan-out path.
+    live_trader.bankroll_usd = min(live_trader.bankroll_usd, balance)
+    from weather.config import MAX_LIVE_TRADE_USD, KELLY_FRACTION
+    print(f"  Live mode — bankroll=${live_trader.bankroll_usd:.2f}  USDC balance=${balance:.2f}  Kelly={KELLY_FRACTION:.2f}x  max_order=${MAX_LIVE_TRADE_USD:.0f}")
+    print()
+    return live_trader
+
+
 def mode_stats(paper: PaperTrader) -> None:
     paper.print_dashboard()
 
@@ -886,6 +1004,9 @@ def main() -> None:
     parser.add_argument("--all-users", action="store_true",
                         help="After the root scan/resolve, mirror results to every "
                              "registered user's log dir (config/users.json)")
+    parser.add_argument("--live", action="store_true",
+                        help="With --mode intraday, also execute live orders for the "
+                             "admin account (same gates/credentials as --mode live)")
     args = parser.parse_args()
 
     log_dir: Path = args.log_dir
@@ -1024,85 +1145,19 @@ def main() -> None:
         return
 
     if args.mode == "intraday":
-        mode_intraday(scanner, generator, log_dir)
+        intraday_live_trader = None
+        if args.live:
+            # Own PaperTrader instance for the gate check — mode_intraday builds
+            # its own internally, but the gate/credential helper needs one before
+            # that point. Both point at the same CSV; no shared state to desync.
+            _paper_for_gate = PaperTrader(log_path=log_dir / "paper_trades.csv")
+            intraday_live_trader = _build_admin_live_trader(_paper_for_gate, log_dir, args.bankroll)
+        mode_intraday(scanner, generator, log_dir, live_trader=intraday_live_trader)
         return
 
     live_trader = None
     if args.mode == "live":
-        from weather.secrets import get_user_creds, set_user_creds
-        admin_uid = int(os.environ.get("TELEGRAM_ADMIN_ID") or os.environ.get("ADMIN_ID") or "0")
-        _creds = get_user_creds(admin_uid) if admin_uid else None
-        # Auto-derive L2 creds if missing (first run after key was stored)
-        if _creds and _creds.get("pk") and not _creds.get("clob_api_key"):
-            try:
-                from weather.secrets import derive_and_store_clob_creds
-                l2 = derive_and_store_clob_creds(admin_uid)
-                _creds.update(l2)
-                print("  ✅ L2 CLOB credentials derived and stored.")
-            except Exception as exc:
-                print(f"  ⚠️  L2 credential derivation failed: {exc}", file=sys.stderr)
-        if not _creds or not _creds.get("pk"):
-            # One-time migration: seed from env vars if still present
-            pk_env = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
-            funder_env = os.environ.get("POLYMARKET_FUNDER_ADDRESS", "") or os.environ.get("POLYMARKET_PROXY_ADDRESS", "")
-            if pk_env and admin_uid:
-                sig = 1 if funder_env else 0  # POLY_PROXY vs EOA
-                set_user_creds(
-                    admin_uid, pk=pk_env,
-                    funder_address=funder_env or None, signature_type=sig,
-                )
-                _creds = {"pk": pk_env, "funder_address": funder_env or None, "signature_type": sig}
-                print(
-                    "  ℹ️  Migrated admin credentials from env to encrypted store.\n"
-                    "  You can now remove POLYMARKET_PRIVATE_KEY and POLYMARKET_PROXY_ADDRESS from .env."
-                )
-                # Derive L2 CLOB credentials so balance checks work
-                try:
-                    from weather.secrets import derive_and_store_clob_creds
-                    l2 = derive_and_store_clob_creds(admin_uid)
-                    _creds.update(l2)
-                    print("  ✅ L2 CLOB credentials derived and stored.")
-                except Exception as exc:
-                    print(f"  ⚠️  L2 credential derivation failed: {exc}", file=sys.stderr)
-            else:
-                print(
-                    "  ❌ No admin credentials in encrypted store.\n"
-                    "  Run the Telegram bot onboarding (/wallet_setup) to store credentials.",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-        def _build_live_trader(creds):
-            return LiveTrader.from_creds(
-                creds,
-                paper_trader=paper,
-                bankroll_usd=args.bankroll,
-                log_path=log_dir / "live_trades.csv",
-                idempotency_path=log_dir / "live_idempotency.json",
-            )
-
-        live_trader = _build_live_trader(_creds)
-        if not live_trader.is_unlocked():
-            print("  Go-live gates not passed. Run: python weather_bot.py --mode stats", file=sys.stderr)
-            sys.exit(1)
-        try:
-            balance = live_trader.fetch_balance()
-        except Exception as e:  # noqa: BLE001
-            # Stale L2 CLOB creds (e.g. after a wallet-key rotation) 401 on the first
-            # CLOB call. Re-derive once and rebuild, then retry — so unattended live
-            # scans self-heal instead of silently placing nothing.
-            if "invalid api key" not in str(e).lower():
-                raise
-            from weather.secrets import derive_and_store_clob_creds
-            print("  ⚠️  CLOB creds rejected (401) — re-deriving and retrying...", file=sys.stderr)
-            derive_and_store_clob_creds(admin_uid)
-            live_trader = _build_live_trader(get_user_creds(admin_uid))
-            balance = live_trader.fetch_balance()
-        # Kelly must size on REAL funds, never the CLI default (--bankroll defaults to
-        # 500). Cap to the actual wallet balance — mirrors the per-user fan-out path.
-        live_trader.bankroll_usd = min(live_trader.bankroll_usd, balance)
-        from weather.config import MAX_LIVE_TRADE_USD, KELLY_FRACTION
-        print(f"  Live mode — bankroll=${live_trader.bankroll_usd:.2f}  USDC balance=${balance:.2f}  Kelly={KELLY_FRACTION:.2f}x  max_order=${MAX_LIVE_TRADE_USD:.0f}")
-        print()
+        live_trader = _build_admin_live_trader(paper, log_dir, args.bankroll)
 
     # paper / live mode — one-shot (interval=0) or continuous
     if args.interval == 0:

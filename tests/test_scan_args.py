@@ -26,3 +26,25 @@ def test_paper_scan_is_one_shot():
 def test_resolve_modes_are_not_forced_one_shot():
     # resolve/auto-resolve are already loop-free; they must not get --interval 0 bolted on
     assert "--interval" not in tb._scan_args("auto-resolve")
+
+
+class TestIntradayLiveWiring:
+    """Intraday live execution (Aug 23 2026) is a standalone opt-in, not implied
+    by overall /mymode live the way hourly is — both the toggle AND overall
+    live mode must be on, so it can be turned off independently if the track's
+    numbers turn bad without killing hourly live trading too."""
+
+    def test_no_live_flag_when_intraday_toggle_off(self, monkeypatch):
+        monkeypatch.setattr(tb, "get_user_mode", lambda uid: "live")
+        monkeypatch.setattr(tb, "get_intraday_live", lambda uid: False)
+        assert "--live" not in tb._scan_args("intraday")
+
+    def test_no_live_flag_when_overall_mode_paper(self, monkeypatch):
+        monkeypatch.setattr(tb, "get_user_mode", lambda uid: "paper")
+        monkeypatch.setattr(tb, "get_intraday_live", lambda uid: True)
+        assert "--live" not in tb._scan_args("intraday")
+
+    def test_live_flag_only_when_both_on(self, monkeypatch):
+        monkeypatch.setattr(tb, "get_user_mode", lambda uid: "live")
+        monkeypatch.setattr(tb, "get_intraday_live", lambda uid: True)
+        assert "--live" in tb._scan_args("intraday")
