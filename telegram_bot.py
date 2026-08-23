@@ -1705,7 +1705,17 @@ async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     else:
         summary = next((l for l in stdout.splitlines() if "evaluated" in l), "Scan complete.")
-        await msg.edit_text(f"✅ {summary.strip()}", reply_markup=main_kb(uid))
+        # A live order can fail without failing the scan (rc stays 0) — surface it
+        # here too, not just on the scheduled auto-scan (Aug 23 2026 gap).
+        issues = [l for l in (stdout + stderr).splitlines() if l.startswith("ORDER_ISSUE:")]
+        if issues:
+            err_text = "\n".join(issues)[:600]
+            await msg.edit_text(
+                f"✅ {summary.strip()}\n\n⚠️ *Live order issue:*\n```\n{err_text}\n```",
+                reply_markup=main_kb(uid), parse_mode="Markdown",
+            )
+        else:
+            await msg.edit_text(f"✅ {summary.strip()}", reply_markup=main_kb(uid))
 
 @require_perm(perms.TRIGGER_SCAN)
 async def cmd_resolve(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2713,6 +2723,28 @@ async def _auto_scan(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 pass
         return
     ctx.bot_data.pop("last_scan_fail", None)  # recovered → re-arm alerting
+
+    # A live order can fail (bad signature, allowance, CLOB rejection, geoblock...)
+    # without failing the SCAN — rc stays 0 so the "Auto-scan failed" alert above
+    # never fires, and the error used to just evaporate with the subprocess (Aug
+    # 23 2026: a correctly-sized $4.91 signal vanished with zero trace). Any
+    # ORDER_ISSUE line survives regardless of overall scan outcome.
+    issues = [l for l in (stdout + stderr).splitlines() if l.startswith("ORDER_ISSUE:")]
+    if issues:
+        err_text = "\n".join(issues)[:600]
+        sig = (err_text, datetime.now(timezone.utc).date().isoformat())
+        if ctx.bot_data.get("last_order_fail") != sig:
+            ctx.bot_data["last_order_fail"] = sig
+            try:
+                await ctx.bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ Live order didn't go through (repeats muted today unless the error changes)\n```\n{err_text}\n```",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+    else:
+        ctx.bot_data.pop("last_order_fail", None)  # recovered → re-arm
 
     # Success → heartbeat summary so every scheduled scan is visible, even quiet ones.
     new_trades = max(0, _count_trades(ADMIN_ID) - before)

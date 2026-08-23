@@ -61,6 +61,41 @@ class TestScanPermissionGate:
         tb.run_bot_async.assert_not_called()
 
 
+class TestScanOrderIssueSurfacing:
+    """A live order can fail without failing the scan itself (rc=0) — the
+    ORDER_ISSUE marker must reach the user even on a nominally successful
+    /scan, not just get folded into the quiet '✅ Scan complete' text
+    (Aug 23 2026: a correctly-sized live order vanished with zero trace)."""
+
+    def _setup(self, monkeypatch, stdout):
+        monkeypatch.setattr(tb, "_ensure_authorized", AsyncMock(return_value=True))
+        monkeypatch.setattr(tb, "has_permission", lambda uid, cap: True)
+        monkeypatch.setattr(tb, "run_bot_async", AsyncMock(return_value=(stdout, "", 0)))
+        monkeypatch.setattr(tb, "get_user_mode", lambda uid: "live")
+        update = MagicMock()
+        update.effective_user.id = 5
+        msg = MagicMock()
+        msg.edit_text = AsyncMock()
+        update.effective_message.reply_text = AsyncMock(return_value=msg)
+        return update, msg
+
+    def test_order_issue_surfaced_on_successful_scan(self, monkeypatch):
+        stdout = ("5 evaluated | 1 actionable | 4 rejected\n"
+                  "ORDER_ISSUE: Lowest temperature in Seoul | ValueError: bad signature")
+        update, msg = self._setup(monkeypatch, stdout)
+        _run(lambda: tb.cmd_scan(update, MagicMock()))
+        text = msg.edit_text.call_args.args[0]
+        assert "Live order issue" in text
+        assert "bad signature" in text
+
+    def test_no_issue_block_when_scan_clean(self, monkeypatch):
+        stdout = "5 evaluated | 0 actionable | 5 rejected"
+        update, msg = self._setup(monkeypatch, stdout)
+        _run(lambda: tb.cmd_scan(update, MagicMock()))
+        text = msg.edit_text.call_args.args[0]
+        assert "Live order issue" not in text
+
+
 class TestModeScopedViews:
     def test_trades_reads_live_and_badges_when_live(self, tmp_path, monkeypatch):
         # signal_time must be within the current era — _relevant_trades() (Aug

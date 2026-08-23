@@ -104,7 +104,10 @@ def run_scan(
 
     geo = check_geoblock() if (live_trader and actionable) else None
     if live_trader and actionable and geo and geo.get("blocked"):
-        print(f"  LIVE HALT: geoblocked from {geo.get('country','?')}/{geo.get('region','?')} "
+        # ORDER_ISSUE: greppable by _auto_scan, which alerts on it even though
+        # the scan otherwise completes normally (rc=0) — this used to be a
+        # totally silent skip: no orders attempted, no error surfaced anywhere.
+        print(f"ORDER_ISSUE: geoblocked from {geo.get('country','?')}/{geo.get('region','?')} "
               f"(IP {geo.get('ip','?')}) — route order traffic through a permitted region "
               f"(set HTTPS_PROXY).", file=sys.stderr)
     elif live_trader and actionable:
@@ -123,7 +126,14 @@ def run_scan(
                 print(f"  LIVE HALT: {e}", file=sys.stderr)
                 raise
             except Exception as e:
-                print(f"    ✗ {s.market.title[:55]} | order failed: {e}", file=sys.stderr)
+                # ORDER_ISSUE: a real order-submission exception (bad signature,
+                # allowance, network, CLOB rejection...) — caught here so one bad
+                # signal doesn't kill the rest of the scan, but that also meant it
+                # was completely invisible: rc stayed 0, so _auto_scan's failure
+                # alert never fired and the error just evaporated with the
+                # subprocess (Aug 23 2026: a $4.91 Kelly-sized signal vanished
+                # with no trace — this exact gap was the leading suspect).
+                print(f"ORDER_ISSUE: {s.market.title[:55]} | {type(e).__name__}: {e}", file=sys.stderr)
     elif paper and actionable:
         print(f"  [3/3] Logging {len(actionable)} paper trades...", end=" ", flush=True)
         logged = [paper.log_trade(s) for s in actionable]
