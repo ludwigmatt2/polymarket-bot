@@ -96,6 +96,55 @@ class TestScanOrderIssueSurfacing:
         assert "Live order issue" not in text
 
 
+class TestMainlineHourlyIntradaySplit:
+    """Mainline blends hourly + intraday into one number for the go-live gate —
+    by design, that number can't tell you whether intraday is pulling its
+    weight or riding on hourly's performance. read_stats() must expose both
+    standalone, without changing what the gate itself reads (Aug 23 2026)."""
+
+    def _write_trades(self, tmp_path, rows):
+        path = tmp_path / "paper_trades.csv"
+        fieldnames = ["scan_source", "signal_time", "resolved_at", "pnl_usd", "brier_score"]
+        with open(path, "w", newline="") as f:
+            w = _csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            for r in rows:
+                w.writerow(r)
+        return path
+
+    def _row(self, scan_source, pnl):
+        return {
+            "scan_source": scan_source,
+            "signal_time": "2026-08-10T00:00:00+00:00",  # after GATE_ERA_START
+            "resolved_at": "2026-08-11T00:00:00+00:00",
+            "pnl_usd": str(pnl),
+            "brier_score": "",
+        }
+
+    def test_hourly_and_intraday_split_independently_from_blended_mainline(self, tmp_path, monkeypatch):
+        rows = [
+            self._row("hourly", 10),      # hourly: 1W
+            self._row("hourly", -5),      # hourly: 1L
+            self._row("intraday", -8),    # intraday: 1L
+            self._row("intraday", -3),    # intraday: 1L
+            self._row("longshot", 999),   # must not leak into either bucket
+        ]
+        self._write_trades(tmp_path, rows)
+        monkeypatch.setattr(tb, "user_data_dir", lambda uid: tmp_path)
+
+        s = tb.read_stats(1)
+        mh = s["tracks"]["mainline_hourly"]
+        mi = s["tracks"]["mainline_intraday"]
+        m = s["tracks"]["mainline"]
+
+        assert mh["resolved"] == 2 and mh["wins"] == 1 and mh["losses"] == 1
+        assert mi["resolved"] == 2 and mi["wins"] == 0 and mi["losses"] == 2
+        assert mi["total_pnl"] == -11
+        # blended mainline still combines both, unchanged — the gate reads this
+        assert m["resolved"] == 4
+        assert m["total_pnl"] == mh["total_pnl"] + mi["total_pnl"]
+
+
 class TestModeScopedViews:
     def test_trades_reads_live_and_badges_when_live(self, tmp_path, monkeypatch):
         # signal_time must be within the current era — _relevant_trades() (Aug

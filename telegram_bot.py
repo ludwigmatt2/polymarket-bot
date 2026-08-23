@@ -516,6 +516,15 @@ def read_stats(uid: int) -> dict:
         "mainline": _track_stats(mainline_res),      # hourly + intraday: live-tradeable
         "longshot": _track_stats(longshot_res),      # microprice tails: experimental
     }
+    # Mainline blends hourly + intraday into one number for the go-live gate (by
+    # design — see below), but that means intraday's own performance is invisible
+    # unless you break it out separately. Purely informational: gates_passed below
+    # still reads the blended "mainline" bucket, unchanged.
+    is_intraday = lambda r: (r.get("scan_source") or "") == "intraday"  # noqa: E731
+    s["tracks"]["mainline_hourly"] = _track_stats(
+        [r for r in mainline_res if not is_intraday(r)])
+    s["tracks"]["mainline_intraday"] = _track_stats(
+        [r for r in mainline_res if is_intraday(r)])
 
     pending_by_date: dict[str, int] = {}
     for r in rows:
@@ -813,6 +822,13 @@ def _fmt_status_paper(uid: int) -> str:
     m = s["tracks"]["mainline"]
     l = s["tracks"]["longshot"]
     lines += _track_block("🎯 Mainline (live-tradeable)", m, "hourly + intraday")
+    # Mainline is blended for the gate — break it out here so intraday's own
+    # profitability is visible before deciding whether to live-enable it
+    # separately (it currently only ever paper-trades, gate or no gate).
+    mh = s["tracks"]["mainline_hourly"]
+    mi = s["tracks"]["mainline_intraday"]
+    lines += _track_block("　├ hourly", mh, "live-executing")
+    lines += _track_block("　└ intraday", mi, "paper-only — no live path yet")
     lines += _track_block("🎰 Longshot (experimental)", l, "microprice tails — not live-fillable")
 
     if scan:
