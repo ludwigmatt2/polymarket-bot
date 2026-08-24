@@ -1,9 +1,10 @@
-"""Live execution on the intraday track (Aug 23 2026) — mirrors run_scan()'s
-live path exactly, but the one thing that's easy to get wrong porting it over
-is the paper-mirror tag: execute_signal() defaults scan_source to "hourly",
-so a live intraday fill that doesn't pass scan_source="intraday" explicitly
-would silently corrupt the mainline_hourly/mainline_intraday split the
-moment intraday goes live — right when watching it separately matters most."""
+"""Live execution on the intraday track (Aug 23 2026), decoupled from the paper
+track (Aug 2026): mode_intraday ALWAYS logs every actionable signal to the paper
+track with scan_source='intraday' — that's the model record and the go-live gate
+basis — and executes live SEPARATELY (real USDC → live_trades.csv). The two must
+not be entangled: a blocked/thin-book live order must never stop the paper track
+from recording the signal (that entanglement once let a geoblock silently freeze
+the whole mainline paper track for days)."""
 import csv
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
@@ -43,14 +44,14 @@ def _signal(market: WeatherMarket, *, quality_gate_passed: bool = True) -> Signa
 class FakeLiveTrader:
     def __init__(self, fill: bool = True):
         self.fill = fill
-        self.calls: list[dict] = []
+        self.calls = 0
         self.reset_calls = 0
 
     def reset_scan_commitments(self):
         self.reset_calls += 1
 
-    def execute_signal(self, signal, scan_source="hourly"):
-        self.calls.append({"scan_source": scan_source})
+    def execute_signal(self, signal):
+        self.calls += 1
         if not self.fill:
             return {"filled": 0.0, "size_usd": 0.0, "price": 0.0, "order_id": ""}
         return {"filled": 5.0, "size_usd": 2.5, "price": 0.5, "order_id": "0xabc123def"}
@@ -71,8 +72,12 @@ def _setup(monkeypatch, tmp_path, market, *, geoblocked: bool = False):
     return scanner
 
 
+def _paper_rows(tmp_path):
+    return list(csv.DictReader(open(tmp_path / "paper_trades.csv")))
+
+
 class TestIntradayLiveExecution:
-    def test_live_fill_tags_paper_mirror_as_intraday_not_hourly(self, tmp_path, monkeypatch):
+    def test_paper_logged_as_intraday_and_live_executed(self, tmp_path, monkeypatch):
         market = _market()
         scanner = _setup(monkeypatch, tmp_path, market)
         generator = MagicMock()
@@ -81,10 +86,14 @@ class TestIntradayLiveExecution:
 
         weather_bot.mode_intraday(scanner, generator, tmp_path, live_trader=trader)
 
-        assert trader.calls == [{"scan_source": "intraday"}]
+        rows = _paper_rows(tmp_path)
+        assert len(rows) == 1 and rows[0]["scan_source"] == "intraday"  # model track
+        assert trader.calls == 1  # live executed separately
         assert trader.reset_calls == 1  # fresh in-tick spend budget
 
-    def test_geoblocked_skips_execution_entirely(self, tmp_path, monkeypatch, capsys):
+    def test_geoblock_skips_live_but_paper_track_still_records(self, tmp_path, monkeypatch, capsys):
+        """The whole point of the decoupling: a geoblocked live order must NOT
+        stop the paper/model track from logging the signal."""
         market = _market()
         scanner = _setup(monkeypatch, tmp_path, market, geoblocked=True)
         generator = MagicMock()
@@ -93,8 +102,10 @@ class TestIntradayLiveExecution:
 
         weather_bot.mode_intraday(scanner, generator, tmp_path, live_trader=trader)
 
-        assert trader.calls == []  # never even attempted
+        assert trader.calls == 0  # live never attempted
         assert "ORDER_ISSUE" in capsys.readouterr().err
+        rows = _paper_rows(tmp_path)
+        assert len(rows) == 1 and rows[0]["scan_source"] == "intraday"  # still recorded
 
     def test_order_exception_tagged_order_issue_not_silently_swallowed(self, tmp_path, monkeypatch, capsys):
         market = _market()
@@ -103,17 +114,19 @@ class TestIntradayLiveExecution:
         generator.evaluate.return_value = _signal(market)
 
         class BlowsUpTrader(FakeLiveTrader):
-            def execute_signal(self, signal, scan_source="hourly"):
+            def execute_signal(self, signal):
                 raise ValueError("bad signature")
 
         weather_bot.mode_intraday(scanner, generator, tmp_path, live_trader=BlowsUpTrader())
 
         err = capsys.readouterr().err
         assert "ORDER_ISSUE" in err and "bad signature" in err
+        # paper track still recorded the signal before the live order blew up
+        assert len(_paper_rows(tmp_path)) == 1
 
     def test_paper_mode_unaffected_when_no_live_trader(self, tmp_path, monkeypatch):
-        """Regression guard: live_trader=None must behave exactly as before —
-        paper-log the signal, no execute_signal call anywhere."""
+        """live_trader=None must behave as before — paper-log the signal, no
+        execute_signal call anywhere."""
         market = _market()
         scanner = _setup(monkeypatch, tmp_path, market)
         generator = MagicMock()
@@ -121,7 +134,7 @@ class TestIntradayLiveExecution:
 
         weather_bot.mode_intraday(scanner, generator, tmp_path, live_trader=None)
 
-        rows = list(csv.DictReader(open(tmp_path / "paper_trades.csv")))
+        rows = _paper_rows(tmp_path)
         assert len(rows) == 1
         assert rows[0]["scan_source"] == "intraday"
 
@@ -134,4 +147,5 @@ class TestIntradayLiveExecution:
 
         weather_bot.mode_intraday(scanner, generator, tmp_path, live_trader=trader)
 
-        assert trader.calls == []
+        assert trader.calls == 0
+        assert not (tmp_path / "paper_trades.csv").exists() or _paper_rows(tmp_path) == []

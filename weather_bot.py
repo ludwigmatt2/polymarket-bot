@@ -102,42 +102,47 @@ def run_scan(
     actionable.sort(key=lambda s: s.edge_pp, reverse=True)
     print(f"{len(actionable)} signals pass quality gates")
 
-    geo = check_geoblock() if (live_trader and actionable) else None
-    if live_trader and actionable and geo and geo.get("blocked"):
-        # ORDER_ISSUE: greppable by _auto_scan, which alerts on it even though
-        # the scan otherwise completes normally (rc=0) — this used to be a
-        # totally silent skip: no orders attempted, no error surfaced anywhere.
-        print(f"ORDER_ISSUE: geoblocked from {geo.get('country','?')}/{geo.get('region','?')} "
-              f"(IP {geo.get('ip','?')}) — route order traffic through a permitted region "
-              f"(set HTTPS_PROXY).", file=sys.stderr)
-    elif live_trader and actionable:
-        print(f"  [3/3] Executing {len(actionable)} live order(s)...")
-        live_trader.reset_scan_commitments()  # fresh in-scan spend budget
-        for s in actionable:
-            try:
-                result = live_trader.execute_signal(s)
-                if result and result.get("filled", 0) > 0:
-                    print(f"    ✓ {s.market.title[:55]} | {s.direction} ${result['size_usd']:.2f} @ {result['price']:.3f}  order={result['order_id'][:10]}")
-                elif result:
-                    print(f"    – {s.market.title[:55]} | unfilled (no depth within slippage cap)")
-                else:
-                    print(f"    – {s.market.title[:55]} | skipped (size too small)")
-            except RuntimeError as e:
-                print(f"  LIVE HALT: {e}", file=sys.stderr)
-                raise
-            except Exception as e:
-                # ORDER_ISSUE: a real order-submission exception (bad signature,
-                # allowance, network, CLOB rejection...) — caught here so one bad
-                # signal doesn't kill the rest of the scan, but that also meant it
-                # was completely invisible: rc stayed 0, so _auto_scan's failure
-                # alert never fired and the error just evaporated with the
-                # subprocess (Aug 23 2026: a $4.91 Kelly-sized signal vanished
-                # with no trace — this exact gap was the leading suspect).
-                print(f"ORDER_ISSUE: {s.market.title[:55]} | {type(e).__name__}: {e}", file=sys.stderr)
-    elif paper and actionable:
-        print(f"  [3/3] Logging {len(actionable)} paper trades...", end=" ", flush=True)
-        logged = [paper.log_trade(s) for s in actionable]
-        print(f"{sum(1 for t in logged if t)} logged")
+    # Model track record — ALWAYS log every actionable signal to the paper track,
+    # independent of live execution. This is the go-live gate AND the dataset we
+    # optimize the model/params against, so it must never hinge on whether a live
+    # order filled. (Tying paper logging to live fills once let a geoblock
+    # silently freeze the entire mainline track for days — Aug 2026.) Real money
+    # is recorded separately in live_trades.csv by the live trader below.
+    if paper and actionable:
+        logged = sum(1 for s in actionable if paper.log_trade(s))
+        print(f"  [3/3] Logged {logged}/{len(actionable)} actionable to paper track")
+
+    # Live execution — separate path, real USDC → live_trades.csv. Skipped whole
+    # when geoblocked; the ORDER_ISSUE line is greppable by _auto_scan's alerting
+    # even though the scan itself completes normally (rc=0).
+    if live_trader and actionable:
+        geo = check_geoblock()
+        if geo and geo.get("blocked"):
+            print(f"ORDER_ISSUE: geoblocked from {geo.get('country','?')}/{geo.get('region','?')} "
+                  f"(IP {geo.get('ip','?')}) — route order traffic through a permitted region "
+                  f"(set HTTPS_PROXY).", file=sys.stderr)
+        else:
+            print(f"  [live] Placing {len(actionable)} live order(s)...")
+            live_trader.reset_scan_commitments()  # fresh in-scan spend budget
+            for s in actionable:
+                try:
+                    result = live_trader.execute_signal(s)
+                    if result and result.get("filled", 0) > 0:
+                        print(f"    ✓ {s.market.title[:55]} | {s.direction} ${result['size_usd']:.2f} @ {result['price']:.3f}  order={result['order_id'][:10]}")
+                    elif result:
+                        print(f"    – {s.market.title[:55]} | unfilled (no depth within slippage cap)")
+                    else:
+                        print(f"    – {s.market.title[:55]} | skipped (size too small)")
+                except RuntimeError as e:
+                    print(f"  LIVE HALT: {e}", file=sys.stderr)
+                    raise
+                except Exception as e:
+                    # A real order-submission exception (bad signature, allowance,
+                    # network, CLOB rejection...) — caught so one bad signal doesn't
+                    # kill the rest of the scan, but tagged ORDER_ISSUE so _auto_scan
+                    # surfaces it instead of it evaporating with the subprocess (rc
+                    # stays 0). Aug 23 2026: a $4.91 signal vanished with no trace.
+                    print(f"ORDER_ISSUE: {s.market.title[:55]} | {type(e).__name__}: {e}", file=sys.stderr)
 
     # Long-shot harvest REMOVED Aug 2026. It logged the sub-3¢ deep-disagreement
     # YES shape among gate-rejected signals as an isolated track
@@ -546,28 +551,33 @@ def mode_intraday(scanner, generator, log_dir: Path = DEFAULT_LOG_DIR,
             continue  # books unusable this tick — never price off stale quotes
         checked += 1
         sig = generator.evaluate(wm)
-        if sig.quality_gate_passed and live_trader is not None and not geoblocked:
-            try:
-                result = live_trader.execute_signal(sig, scan_source="intraday")
-                if result and result.get("filled", 0) > 0:
-                    traded += 1
-                    print(f"  NEW INTRADAY LIVE TRADE: {sig.direction} {wm.title[:60]} "
-                          f"${result['size_usd']:.2f} @ {result['price']:.3f}  "
-                          f"order={result['order_id'][:10]}")
-                # unfilled/skipped: quiet, matches the hourly live path — retryable
-                # next tick, not worth a print every 15 minutes for a thin book.
-            except RuntimeError as e:
-                print(f"  LIVE HALT: {e}", file=sys.stderr)
-                raise
-            except Exception as e:
-                # Same swallowed-exception risk the hourly path had (Aug 23 2026)
-                # — tag it the same way so _intraday_scan's alerting catches it.
-                print(f"ORDER_ISSUE: {wm.title[:55]} | {type(e).__name__}: {e}", file=sys.stderr)
-        elif sig.quality_gate_passed and live_trader is None and paper.log_trade(sig, scan_source="intraday"):
-            traded += 1
-            obs = f"{sig.running_obs_c:.1f}C" if sig.running_obs_c is not None else "-"
-            print(f"  NEW INTRADAY TRADE: {sig.direction} {wm.title[:60]} "
-                  f"@ {sig.entry_price:.3f} edge={sig.edge_pp:.3f} obs={obs}")
+        if sig.quality_gate_passed:
+            # Model track — always record the signal (scan_source='intraday'),
+            # independent of live execution, so the gate/optimization data keeps
+            # accruing even when a fill is blocked or the book is thin. dedups by
+            # (market_id, direction), so re-evaluating the same watchlist every
+            # tick logs each market once.
+            if paper.log_trade(sig, scan_source="intraday"):
+                traded += 1
+                obs = f"{sig.running_obs_c:.1f}C" if sig.running_obs_c is not None else "-"
+                print(f"  NEW INTRADAY TRADE: {sig.direction} {wm.title[:60]} "
+                      f"@ {sig.entry_price:.3f} edge={sig.edge_pp:.3f} obs={obs}")
+            # Live execution — separate, real USDC → live_trades.csv.
+            if live_trader is not None and not geoblocked:
+                try:
+                    result = live_trader.execute_signal(sig)
+                    if result and result.get("filled", 0) > 0:
+                        print(f"  NEW INTRADAY LIVE TRADE: {sig.direction} {wm.title[:60]} "
+                              f"${result['size_usd']:.2f} @ {result['price']:.3f}  "
+                              f"order={result['order_id'][:10]}")
+                    # unfilled/skipped: quiet — retryable next tick.
+                except RuntimeError as e:
+                    print(f"  LIVE HALT: {e}", file=sys.stderr)
+                    raise
+                except Exception as e:
+                    # Same swallowed-exception risk the hourly path had (Aug 23
+                    # 2026) — tag it so _intraday_scan's alerting catches it.
+                    print(f"ORDER_ISSUE: {wm.title[:55]} | {type(e).__name__}: {e}", file=sys.stderr)
         # X1 exit check — both directions, using the side's own live bid
         for direction, bid in (("YES", wm.yes_best_bid), ("NO", wm.no_best_bid)):
             if (wm.market_id, direction) not in open_keys or bid <= 0.0:

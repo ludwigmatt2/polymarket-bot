@@ -332,15 +332,16 @@ class LiveTrader:
             return 0.0
         return min(self.bankroll_usd * KELLY_FRACTION * full_kelly, _get_max_trade_usd())
 
-    def execute_signal(self, signal: Signal, scan_source: str = "hourly") -> dict | None:
+    def execute_signal(self, signal: Signal) -> dict | None:
         """
-        Place a limit order for signal. Returns order info dict or None if skipped.
+        Place a live order for signal. Returns order info dict or None if skipped.
         Raises RuntimeError on hard blocks (gates not passed, kill switch, bad creds).
 
-        scan_source tags the paper mirror (below) so a live-executing track's own
-        stats keep accumulating post-go-live, same as the paper-only period —
-        get this wrong and the track's PF/BSS silently freezes the moment it goes
-        live, right when watching it matters most.
+        Writes real fills to live_trades.csv ONLY. The paper/model track is owned
+        by the scan loop (run_scan / mode_intraday), which logs every actionable
+        signal independent of whether it fills — so the go-live gate and the data
+        we optimize against never hinge on execution (a geoblock once silently
+        froze the whole mainline paper track for days, Aug 2026).
         """
         if not self.is_unlocked():
             raise RuntimeError("Go-live gates not passed — run: python weather_bot.py dashboard")
@@ -535,7 +536,6 @@ class LiveTrader:
         self._events_this_scan.add(event)
         self._day_committed_this_scan[day] = self._day_committed_this_scan.get(day, 0.0) + usd_spent
         self._log_trade(signal, order_id, usd_spent, ep, filled, filled_price, order_status)
-        self.paper_trader.log_trade(signal, scan_source=scan_source)
 
         return {
             "order_id": order_id,

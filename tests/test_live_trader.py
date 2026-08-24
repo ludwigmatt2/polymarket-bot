@@ -261,12 +261,16 @@ class TestFillReconciliation:
         assert float(rows[0]["filled_price"]) == pytest.approx(0.36)
         assert rows[0]["order_status"] == "partial"
 
-    def test_full_fill_mirrors_to_paper(self, tmp_path):
-        """A fully-filled order should call paper_trader.log_trade exactly once."""
+    def test_full_fill_does_not_touch_paper_track(self, tmp_path):
+        """execute_signal writes ONLY live_trades.csv — the paper/model track is
+        owned by the scan loop, which logs every actionable signal regardless of
+        fill. A live fill must never write to the paper track (that entanglement
+        once let a geoblock silently freeze the mainline paper track, Aug 2026)."""
         trader = _make_trader(tmp_path)
         trader._client = _make_mock_client(filled=20.0)
         trader.execute_signal(_make_signal())
-        trader.paper_trader.log_trade.assert_called_once()
+        assert trader._log_path.exists()  # live_trades.csv written
+        trader.paper_trader.log_trade.assert_not_called()
 
     def test_fill_read_from_response_no_scaling(self, tmp_path):
         """Shares come straight from takingAmount; price from makingAmount/shares."""
