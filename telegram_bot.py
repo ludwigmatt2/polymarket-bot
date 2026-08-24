@@ -2828,6 +2828,17 @@ async def _auto_scan(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         header.append(f"Evaluated: {funnel['evaluated']} · Actionable: {funnel.get('actionable', 0)}")
     trade_label = "New live trades" if get_user_mode(ADMIN_ID) == "live" else "New paper trades"
     header.append(f"{trade_label}: *{new_trades}*")
+    # Surface an unresolved order block in the heartbeat itself. The push alert
+    # above is de-spammed to once/day, which once let a persistent geoblock hide
+    # behind quiet "0 trades" heartbeats for days (Aug 2026: the VPS silently
+    # egressed over an IPv6 address geolocated to a blocked region, so every live
+    # order was skipped at the geoblock gate with no visible reason). The
+    # heartbeat fires every scan, so a live block can never be muted into
+    # invisibility here.
+    if issues:
+        summary = issues[0].replace("ORDER_ISSUE:", "").strip()[:160]
+        extra = f" _(+{len(issues) - 1} more)_" if len(issues) > 1 else ""
+        header.append(f"🚫 *Orders blocked this scan:* {_md_escape(summary)}{extra}")
     body = fmt_signals(read_last_signals(ADMIN_ID), ADMIN_ID)
     try:
         await ctx.bot.send_message(

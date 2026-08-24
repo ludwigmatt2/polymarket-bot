@@ -96,6 +96,47 @@ class TestScanOrderIssueSurfacing:
         assert "Live order issue" not in text
 
 
+class TestAutoScanHeartbeatSurfacesBlock:
+    """The scheduled _auto_scan push alert for a live-order block is de-spammed
+    to once/day — which once let a persistent geoblock hide behind quiet
+    '0 trades' heartbeats for days (Aug 2026: VPS egressed over an IPv6 address
+    geolocated to a blocked region). The heartbeat fires every scan, so an
+    unresolved block must be surfaced there too, un-mutably."""
+
+    def _setup(self, monkeypatch, stdout):
+        monkeypatch.setattr(tb, "_wrap_pending_live_deposits", lambda: [])
+        monkeypatch.setattr(tb, "run_bot_async", AsyncMock(return_value=(stdout, "", 0)))
+        monkeypatch.setattr(tb, "_count_trades", lambda uid: 0)
+        monkeypatch.setattr(tb, "read_last_scan_meta", lambda uid: {"scanned_at": "2026-08-25T13:33"})
+        monkeypatch.setattr(tb, "read_last_signals", lambda uid: [])
+        monkeypatch.setattr(tb, "fmt_signals", lambda sigs, uid: "(no signals)")
+        monkeypatch.setattr(tb, "get_user_mode", lambda uid: "live")
+        bad_path = MagicMock()
+        bad_path.read_text.side_effect = OSError  # funnel read → {} (try/except)
+        monkeypatch.setattr(tb, "_signals_path", lambda uid: bad_path)
+        ctx = MagicMock()
+        ctx.bot.send_message = AsyncMock()
+        ctx.bot_data = {}
+        return ctx
+
+    def test_geoblock_shown_in_heartbeat(self, monkeypatch):
+        stdout = ("406 evaluated | 2 actionable | 404 rejected\n"
+                  "ORDER_ISSUE: geoblocked from DE/BY (IP 2a01:4f9::1) — route order "
+                  "traffic through a permitted region (set HTTPS_PROXY).")
+        ctx = self._setup(monkeypatch, stdout)
+        _run(lambda: tb._auto_scan(ctx))
+        # Last send is the heartbeat (the first is the de-spammed push alert).
+        heartbeat = ctx.bot.send_message.call_args_list[-1].args[1]
+        assert "Orders blocked this scan" in heartbeat
+        assert "geoblocked" in heartbeat
+
+    def test_clean_scan_has_no_block_line(self, monkeypatch):
+        ctx = self._setup(monkeypatch, "406 evaluated | 0 actionable | 406 rejected")
+        _run(lambda: tb._auto_scan(ctx))
+        heartbeat = ctx.bot.send_message.call_args_list[-1].args[1]
+        assert "Orders blocked this scan" not in heartbeat
+
+
 class TestMainlineHourlyIntradaySplit:
     """Mainline blends hourly + intraday into one number for the go-live gate —
     by design, that number can't tell you whether intraday is pulling its
