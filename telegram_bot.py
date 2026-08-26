@@ -1209,6 +1209,38 @@ def _scan_args(mode: str) -> list[str]:
 _MODE_TIMEOUTS = {"live": 900, "paper": 900, "scan": 900, "intraday": 300}
 
 
+# Scan stdout/stderr are PIPE'd straight to Telegram and never reach journald —
+# `journalctl -u polymarket-bot` only ever shows the bot process itself. A scan
+# that fails while nobody is reading chat therefore leaves no trace on disk at
+# all, which is what made the Aug 26 "Could not derive api key!" triage
+# guesswork (zero journal hits across the whole retention window, despite the
+# error having fired). Tee stderr here so failures stay greppable after the fact.
+_SCAN_ERROR_LOG = DATA_DIR / "logs" / "scan_errors.log"
+_SCAN_ERROR_LOG_MAX_BYTES = 2_000_000
+
+
+def _record_scan_stderr(mode: str, stderr: str, rc: int | str) -> None:
+    """Append a scan's stderr to scan_errors.log for post-hoc forensics.
+
+    Best-effort by design: this is diagnostics, so a failure to write must never
+    propagate into the scan path — that would trade a logging gap for an outage.
+    """
+    if rc == 0 and not stderr.strip():
+        return
+    try:
+        _SCAN_ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
+        # Single-backup rotation — keeps the file greppable without unbounded growth.
+        if (_SCAN_ERROR_LOG.exists()
+                and _SCAN_ERROR_LOG.stat().st_size > _SCAN_ERROR_LOG_MAX_BYTES):
+            _SCAN_ERROR_LOG.replace(_SCAN_ERROR_LOG.parent / (_SCAN_ERROR_LOG.name + ".1"))
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with _SCAN_ERROR_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n===== {ts} mode={mode} rc={rc} =====\n")
+            fh.write(stderr.rstrip() + "\n")
+    except Exception as exc:  # noqa: BLE001 — diagnostics must not break scans
+        print(f"[scanlog] could not write {_SCAN_ERROR_LOG}: {exc}", flush=True)
+
+
 async def run_bot_async(mode: str, uid: int, wait: bool = False) -> tuple[str, str, int]:
     """Run weather_bot.py globally: root scan/resolve + fan-out to all users.
 
@@ -1237,8 +1269,19 @@ async def run_bot_async(mode: str, uid: int, wait: bool = False) -> tuple[str, s
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
             proc.kill()
+            # Record THAT a timeout happened. The partial stderr the scan had
+            # already written is NOT recoverable here: wait_for cancelled
+            # communicate(), which discards the output it had buffered — verified
+            # empirically, and a second communicate() or a direct
+            # proc.stderr.read() both return b"". Capturing it would mean reading
+            # the streams incrementally into a buffer as the scan runs, which is a
+            # larger change than this log is worth. The header alone is still more
+            # than journald has, since scan output never reaches it.
+            _record_scan_stderr(mode, "", f"timeout after {timeout}s")
             return "", f"Timed out after {timeout}s.", -1
-        return stdout.decode(), stderr.decode(), proc.returncode or 0
+        rc = proc.returncode or 0
+        _record_scan_stderr(mode, stderr.decode(errors="replace"), rc)
+        return stdout.decode(), stderr.decode(), rc
     finally:
         _bot_run_lock.release()
 
