@@ -2735,6 +2735,46 @@ def _wrap_pending_live_deposits() -> list[dict]:
     return out
 
 
+# Every muted-alert here mutes at most once/day — exactly the pattern that let
+# the Aug 25 2026 IPv6 geoblock hide "zero live trades" for days behind quiet,
+# de-spammed alerts. "live trader unavailable this cycle" (weather_bot.py's
+# _build_live_trader_or_none) is the one failure class that means live trading
+# is fully sidelined, not just one blocked order — so it gets its own
+# time-based escalation on top of the regular per-day mute, re-alerting louder
+# the longer it stays broken instead of settling into the same quiet 1/day drip.
+LIVE_DEGRADED_ESCALATE_AFTER = timedelta(hours=12)
+LIVE_DEGRADED_RE_ESCALATE_EVERY = timedelta(hours=6)
+
+
+def _track_live_degradation(ctx: ContextTypes.DEFAULT_TYPE, track: str, issues: list[str]) -> str | None:
+    """Update the consecutive-failure streak for `track` ("hourly"/"intraday")
+    and return an escalation message once the streak has been continuous for
+    LIVE_DEGRADED_ESCALATE_AFTER, re-returning every LIVE_DEGRADED_RE_ESCALATE_EVERY
+    thereafter until it clears. Returns None on every other call."""
+    since_key, escalated_key = f"{track}_live_degraded_since", f"{track}_live_escalated_at"
+    degraded = any("live trader unavailable this cycle" in ln for ln in issues)
+    now = datetime.now(timezone.utc)
+    if not degraded:
+        ctx.bot_data.pop(since_key, None)
+        ctx.bot_data.pop(escalated_key, None)
+        return None
+    since = ctx.bot_data.get(since_key)
+    if since is None:
+        ctx.bot_data[since_key] = now
+        return None
+    elapsed = now - since
+    if elapsed < LIVE_DEGRADED_ESCALATE_AFTER:
+        return None
+    last_escalated = ctx.bot_data.get(escalated_key)
+    if last_escalated is not None and now - last_escalated < LIVE_DEGRADED_RE_ESCALATE_EVERY:
+        return None
+    ctx.bot_data[escalated_key] = now
+    hours = elapsed.total_seconds() / 3600
+    return (f"🔴 *Live trading has been down {hours:.0f}h straight* ({track}) — "
+            f"every scan since {since.strftime('%b %d %H:%M UTC')} failed to build a live trader. "
+            f"Paper logging is unaffected, but no live orders are going out.")
+
+
 async def _auto_scan(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Scheduled job: paper scan + fan-out to all users. Runs every AUTO_SCAN_INTERVAL seconds."""
     # Auto-wrap any new USDC.e deposits → pUSD BEFORE the scan reads balances, so a
@@ -2815,6 +2855,13 @@ async def _auto_scan(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 pass
     else:
         ctx.bot_data.pop("last_order_fail", None)  # recovered → re-arm
+
+    escalation = _track_live_degradation(ctx, "hourly", issues)
+    if escalation:
+        try:
+            await ctx.bot.send_message(ADMIN_ID, escalation, parse_mode="Markdown")
+        except Exception:
+            pass
 
     # Success → heartbeat summary so every scheduled scan is visible, even quiet ones.
     new_trades = max(0, _count_trades(ADMIN_ID) - before)
@@ -2959,6 +3006,13 @@ async def _intraday_scan(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 pass
     else:
         ctx.bot_data.pop("last_intraday_order_fail", None)
+
+    escalation = _track_live_degradation(ctx, "intraday", issues)
+    if escalation:
+        try:
+            await ctx.bot.send_message(ADMIN_ID, escalation, parse_mode="Markdown")
+        except Exception:
+            pass
 
     live_trades = [ln.strip() for ln in (stdout or "").splitlines() if "NEW INTRADAY LIVE TRADE" in ln]
     paper_trades = [ln.strip() for ln in (stdout or "").splitlines()

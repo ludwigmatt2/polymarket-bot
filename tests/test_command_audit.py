@@ -137,6 +137,69 @@ class TestAutoScanHeartbeatSurfacesBlock:
         assert "Orders blocked this scan" not in heartbeat
 
 
+class TestLiveDegradationEscalation:
+    """Regular ORDER_ISSUE alerts mute at 1/day — the same pattern that hid the
+    Aug 25 2026 IPv6 geoblock for days. "live trader unavailable this cycle"
+    (weather_bot.py's _build_live_trader_or_none) means live trading is fully
+    sidelined, not just one blocked order, so it gets a time-based escalation
+    on top of the regular per-day mute."""
+
+    def _ctx(self):
+        ctx = MagicMock()
+        ctx.bot_data = {}
+        return ctx
+
+    def test_no_issues_clears_state_and_never_escalates(self):
+        ctx = self._ctx()
+        ctx.bot_data["hourly_live_degraded_since"] = tb.datetime.now(tb.timezone.utc) - tb.timedelta(hours=48)
+        assert tb._track_live_degradation(ctx, "hourly", []) is None
+        assert "hourly_live_degraded_since" not in ctx.bot_data
+
+    def test_unrelated_order_issue_does_not_count_toward_escalation(self):
+        ctx = self._ctx()
+        issues = ["ORDER_ISSUE: Seoul market | ValueError: bad signature"]
+        assert tb._track_live_degradation(ctx, "hourly", issues) is None
+        assert "hourly_live_degraded_since" not in ctx.bot_data
+
+    def test_first_occurrence_records_timestamp_but_does_not_escalate(self):
+        ctx = self._ctx()
+        issues = ["ORDER_ISSUE: live trader unavailable this cycle | RuntimeError: boom"]
+        assert tb._track_live_degradation(ctx, "hourly", issues) is None
+        assert "hourly_live_degraded_since" in ctx.bot_data
+
+    def test_escalates_once_threshold_elapsed(self):
+        ctx = self._ctx()
+        issues = ["ORDER_ISSUE: live trader unavailable this cycle | RuntimeError: boom"]
+        ctx.bot_data["hourly_live_degraded_since"] = tb.datetime.now(tb.timezone.utc) - tb.timedelta(hours=13)
+        msg = tb._track_live_degradation(ctx, "hourly", issues)
+        assert msg is not None and "13h" in msg
+
+    def test_does_not_re_escalate_before_re_escalate_window(self):
+        ctx = self._ctx()
+        issues = ["ORDER_ISSUE: live trader unavailable this cycle | RuntimeError: boom"]
+        ctx.bot_data["hourly_live_degraded_since"] = tb.datetime.now(tb.timezone.utc) - tb.timedelta(hours=13)
+        assert tb._track_live_degradation(ctx, "hourly", issues) is not None
+        # Same cycle, immediately after — still within the 6h re-escalate window.
+        assert tb._track_live_degradation(ctx, "hourly", issues) is None
+
+    def test_re_escalates_after_re_escalate_window(self):
+        ctx = self._ctx()
+        issues = ["ORDER_ISSUE: live trader unavailable this cycle | RuntimeError: boom"]
+        ctx.bot_data["hourly_live_degraded_since"] = tb.datetime.now(tb.timezone.utc) - tb.timedelta(hours=20)
+        ctx.bot_data["hourly_live_escalated_at"] = tb.datetime.now(tb.timezone.utc) - tb.timedelta(hours=7)
+        msg = tb._track_live_degradation(ctx, "hourly", issues)
+        assert msg is not None
+
+    def test_hourly_and_intraday_tracks_are_independent(self):
+        ctx = self._ctx()
+        issues = ["ORDER_ISSUE: live trader unavailable this cycle | RuntimeError: boom"]
+        ctx.bot_data["hourly_live_degraded_since"] = tb.datetime.now(tb.timezone.utc) - tb.timedelta(hours=13)
+        hourly_msg = tb._track_live_degradation(ctx, "hourly", issues)
+        intraday_msg = tb._track_live_degradation(ctx, "intraday", issues)
+        assert hourly_msg is not None
+        assert intraday_msg is None  # intraday's own streak just started
+
+
 class TestMainlineHourlyIntradaySplit:
     """Mainline blends hourly + intraday into one number for the go-live gate —
     by design, that number can't tell you whether intraday is pulling its
