@@ -141,10 +141,6 @@ def _ctf_redeem(condition_id: str) -> str:
          bytes.fromhex(condition_id.replace("0x", "")), [1, 2]]).hex()
 
 
-def _negrisk_redeem(condition_id: str, amounts: list[int]) -> str:
-    return pm.SEL_NEGRISK_REDEEM + encode(
-        ["bytes32", "uint256[]"],
-        [bytes.fromhex(condition_id.replace("0x", "")), amounts]).hex()
 
 
 class RelayerClient:
@@ -230,6 +226,9 @@ class RelayerClient:
     def approve_exchanges(self, wallet: str):
         datas = [(pm.PUSD, _approve(s, pm.MAX_UINT)) for s in pm.EXCHANGES]
         datas += [(pm.CTF, _set_approval_for_all(s, True)) for s in pm.EXCHANGES]
+        # Redemption adapters only ever pull CTF (ERC-1155) positions out of the
+        # wallet, never spend pUSD — no PUSD approve needed for them.
+        datas += [(pm.CTF, _set_approval_for_all(s, True)) for s in pm.REDEMPTION_ADAPTERS]
         return self._batch(wallet, datas)
 
     def unwrap_pusd_to_usdce(self, wallet: str, amount_raw: int, to: str):
@@ -241,11 +240,15 @@ class RelayerClient:
 
     def redeem_positions(self, wallet: str, grouped: list[dict]):
         """`grouped`: [{'condition_id','neg_risk','amounts':[yes,no]}]. Routes
-        CTF (binary) vs NegRiskAdapter (neg-risk). Caller pre-groups by condition."""
+        CTF (binary) vs NegRiskCtfCollateralAdapter (neg-risk) — the deposit-wallet
+        relayer deny-lists direct CTF/NegRiskAdapter calls, so both must go through
+        their dedicated collateral-adapter wrapper. Both adapters expose the same
+        redeemPositions(address,bytes32,bytes32,uint256[]) selector and redeem the
+        caller's full on-chain balance regardless of the args passed, so `amounts`
+        is unused here — kept in `grouped` only because callers already compute it
+        for logging. Caller pre-groups by condition."""
         datas = []
         for g in grouped:
-            if g["neg_risk"]:
-                datas.append((pm.NEG_RISK_ADAPTER, _negrisk_redeem(g["condition_id"], g["amounts"])))
-            else:
-                datas.append((pm.CTF, _ctf_redeem(g["condition_id"])))
+            target = pm.NEG_RISK_CTF_COLLATERAL_ADAPTER if g["neg_risk"] else pm.CTF_COLLATERAL_ADAPTER
+            datas.append((target, _ctf_redeem(g["condition_id"])))
         return self._batch(wallet, datas) if datas else None

@@ -21,6 +21,16 @@ NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
 CTF = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"             # ConditionalTokens (ERC-1155)
 EXCHANGES = [EXCHANGE_V2, NEG_RISK_EXCHANGE_V2, NEG_RISK_ADAPTER]
 
+# Redemption for deposit-wallet accounts must route through these dedicated
+# adapters — relayer-v2 deny-lists direct WALLET-batch calls to CTF/NEG_RISK_ADAPTER
+# ("calls to 0x... are not permitted"). Both expose the same
+# redeemPositions(address,bytes32,bytes32,uint256[]) selector as raw CTF (the
+# adapter ignores those args and redeems the caller's actual on-chain balance),
+# verified against the deployed+verified source on Polygonscan Aug 26 2026.
+CTF_COLLATERAL_ADAPTER = "0xAdA100Db00Ca00073811820692005400218FcE1f"
+NEG_RISK_CTF_COLLATERAL_ADAPTER = "0xadA2005600Dec949baf300f4C6120000bDB6eAab"
+REDEMPTION_ADAPTERS = [CTF_COLLATERAL_ADAPTER, NEG_RISK_CTF_COLLATERAL_ADAPTER]
+
 # ── Wrap / unwrap (USDC.e <-> pUSD) ──────────────────────────────────────────
 ONRAMP = "0x93070a847efEf7F70739046A929D47a521F5B8ee"          # CollateralOnramp (wrap)
 OFFRAMP = "0x2957922Eb93258b93368531d39fAcCA3B4dC5854"         # CollateralOfframp (unwrap)
@@ -34,8 +44,7 @@ SEL_APPROVE = "0x095ea7b3"             # approve(address,uint256)
 SEL_SET_APPROVAL_FOR_ALL = "0xa22cb465"  # setApprovalForAll(address,bool)
 SEL_WRAP = "0x62355638"                # CollateralOnramp.wrap(address,address,uint256)
 SEL_UNWRAP = "0x8cc7104f"              # CollateralOfframp.unwrap(address,address,uint256)
-SEL_CTF_REDEEM = "0x01b7037c"          # CTF.redeemPositions(address,bytes32,bytes32,uint256[])
-SEL_NEGRISK_REDEEM = "0xdbeccb23"      # NegRiskAdapter.redeemPositions(bytes32,uint256[])
+SEL_CTF_REDEEM = "0x01b7037c"          # redeemPositions(address,bytes32,bytes32,uint256[]) — CTF + both collateral adapters
 SEL_NONCE = "0xaffed0e0"               # DepositWallet.nonce()
 SEL_PREDICT_WALLET = "0x04f1d3c7"      # factory.predictWalletAddress(bytes32)
 SEL_PAYOUT_NUMERATORS = "0x0504c814"   # CTF.payoutNumerators(bytes32,uint256)
