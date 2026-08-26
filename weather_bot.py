@@ -972,6 +972,22 @@ def _build_admin_live_trader(paper: PaperTrader, log_dir: Path, bankroll: float)
     return live_trader
 
 
+def _build_live_trader_or_none(paper: PaperTrader, log_dir: Path, bankroll: float) -> "LiveTrader | None":
+    """Wrap _build_admin_live_trader so a broken credential/gate/CLOB-auth path
+    degrades to paper-only instead of killing the whole scan. Polymarket's CLOB
+    auth backend intermittently 400s on deposit-wallet re-derivation (see
+    "Could not derive api key!", an upstream bug — not fixable here); without
+    this wrapper that exception propagated out of main() uncaught, which took
+    paper-track logging down with it for the whole cycle, violating the
+    invariant that paper always logs regardless of live-side state."""
+    try:
+        return _build_admin_live_trader(paper, log_dir, bankroll)
+    except (Exception, SystemExit) as e:  # noqa: BLE001 — any failure here must not sink the scan
+        print(f"ORDER_ISSUE: live trader unavailable this cycle | {type(e).__name__}: {e}",
+              file=sys.stderr)
+        return None
+
+
 def mode_stats(paper: PaperTrader) -> None:
     paper.print_dashboard()
 
@@ -1161,13 +1177,13 @@ def main() -> None:
             # its own internally, but the gate/credential helper needs one before
             # that point. Both point at the same CSV; no shared state to desync.
             _paper_for_gate = PaperTrader(log_path=log_dir / "paper_trades.csv")
-            intraday_live_trader = _build_admin_live_trader(_paper_for_gate, log_dir, args.bankroll)
+            intraday_live_trader = _build_live_trader_or_none(_paper_for_gate, log_dir, args.bankroll)
         mode_intraday(scanner, generator, log_dir, live_trader=intraday_live_trader)
         return
 
     live_trader = None
     if args.mode == "live":
-        live_trader = _build_admin_live_trader(paper, log_dir, args.bankroll)
+        live_trader = _build_live_trader_or_none(paper, log_dir, args.bankroll)
 
     # paper / live mode — one-shot (interval=0) or continuous
     if args.interval == 0:

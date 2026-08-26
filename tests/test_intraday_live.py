@@ -149,3 +149,46 @@ class TestIntradayLiveExecution:
 
         assert trader.calls == 0
         assert not (tmp_path / "paper_trades.csv").exists() or _paper_rows(tmp_path) == []
+
+
+class TestLiveTraderConstructionNeverKillsScan:
+    """Polymarket's CLOB auth backend intermittently 400s re-deriving API keys
+    for deposit-wallet accounts ("Could not derive api key!", an upstream bug).
+    Before this wrapper, that exception propagated out of _build_admin_live_trader
+    uncaught, crashing the whole weather_bot.py subprocess — taking paper-track
+    logging down with it for the entire cycle, not just live execution."""
+
+    def test_credential_failure_degrades_to_none_not_crash(self, tmp_path, monkeypatch, capsys):
+        def _boom(paper, log_dir, bankroll):
+            raise RuntimeError("CLOB auth failed: PolyApiException[status_code=400, "
+                                "error_message={'error': 'Could not derive api key!'}]")
+        monkeypatch.setattr(weather_bot, "_build_admin_live_trader", _boom)
+
+        result = weather_bot._build_live_trader_or_none(MagicMock(), tmp_path, 500.0)
+
+        assert result is None
+        err = capsys.readouterr().err
+        assert "ORDER_ISSUE" in err and "Could not derive api key" in err
+
+    def test_sys_exit_from_gate_or_missing_creds_also_degrades_to_none(self, tmp_path, monkeypatch, capsys):
+        """_build_admin_live_trader intentionally sys.exit(1)s on a closed gate
+        or missing admin creds — that must not kill an unattended scheduled scan
+        either."""
+        def _exits(paper, log_dir, bankroll):
+            import sys as _sys
+            _sys.exit(1)
+        monkeypatch.setattr(weather_bot, "_build_admin_live_trader", _exits)
+
+        result = weather_bot._build_live_trader_or_none(MagicMock(), tmp_path, 500.0)
+
+        assert result is None
+        assert "ORDER_ISSUE" in capsys.readouterr().err
+
+    def test_success_path_passes_through_unchanged(self, tmp_path, monkeypatch):
+        sentinel = FakeLiveTrader()
+        monkeypatch.setattr(weather_bot, "_build_admin_live_trader",
+                             lambda paper, log_dir, bankroll: sentinel)
+
+        result = weather_bot._build_live_trader_or_none(MagicMock(), tmp_path, 500.0)
+
+        assert result is sentinel
