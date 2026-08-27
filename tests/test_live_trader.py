@@ -1040,3 +1040,73 @@ class TestKellyMarginHaircut:
         # model_p barely above price: margin-adjusted Kelly must be 0, not tiny-positive
         sig = _make_signal(market_p=0.35, model_p=0.37, direction="YES")
         assert trader.kelly_size_usd(sig) == 0.0
+
+
+class TestFakNoMatchIsBenign:
+    """The CLOB reports "your cap crossed nothing" as a 400, not a zero-fill 200.
+    That must read as an unfilled order, not as an order FAILURE that pages the
+    owner — the price cap refusing a bad fill is the system working."""
+
+    ERR = ("PolyApiException[status_code=400, error_message={'error': 'no orders "
+           "found to match with FAK order. FAK orders are partially filled or "
+           "killed if no match is found.', 'orderID': '0xa80d4d0bf94cc2ab'}]")
+
+    def _killing_client(self):
+        mock = MagicMock()
+        mock.create_and_post_market_order.side_effect = Exception(self.ERR)
+        return mock
+
+    def test_killed_fak_returns_unfilled_instead_of_raising(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        trader._client = self._killing_client()
+        result = trader.execute_signal(_make_signal())
+        assert result is not None
+        assert result["filled"] == 0.0
+        assert result["size_usd"] == 0.0
+        assert result["status"] == "killed"
+
+    def test_killed_fak_leaves_market_retryable(self, tmp_path):
+        """A FAK is atomic — nothing rests on the book, so the day's
+        idempotency key must be released or one thin book forfeits the edge."""
+        trader = _make_trader(tmp_path)
+        trader._client = self._killing_client()
+        sig = _make_signal()
+        trader.execute_signal(sig)
+        assert trader._is_duplicate(sig) is False
+
+    def test_killed_fak_writes_no_trade_row(self, tmp_path):
+        """Nothing filled → live_trades.csv must stay untouched, or auto_resolve
+        would chase an outcome-less row for on-chain settlement forever."""
+        trader = _make_trader(tmp_path)
+        trader._client = self._killing_client()
+        trader.execute_signal(_make_signal())
+        assert not (tmp_path / "live_trades.csv").exists()
+
+    def test_killed_fak_is_recorded_for_fill_rate(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        trader._client = self._killing_client()
+        trader.execute_signal(_make_signal(market_p=0.35, model_p=0.46))
+        rows = list(csv.DictReader(open(tmp_path / "live_order_kills.csv")))
+        assert len(rows) == 1
+        assert rows[0]["direction"] == "YES"
+        assert float(rows[0]["edge_pp"]) == pytest.approx(0.11, abs=1e-6)
+
+    def test_zero_fill_response_also_recorded(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        trader._client = _make_mock_client(filled=0.0)
+        trader.execute_signal(_make_signal())
+        rows = list(csv.DictReader(open(tmp_path / "live_order_kills.csv")))
+        assert len(rows) == 1
+
+    def test_real_order_failure_still_raises(self, tmp_path):
+        """Only the no-match 400 is benign. A signature/allowance error must
+        still surface as ORDER_ISSUE."""
+        trader = _make_trader(tmp_path)
+        mock = MagicMock()
+        mock.create_and_post_market_order.side_effect = Exception(
+            "PolyApiException[status_code=400, error_message='invalid signature']")
+        trader._client = mock
+        sig = _make_signal()
+        with pytest.raises(Exception, match="invalid signature"):
+            trader.execute_signal(sig)
+        assert trader._is_duplicate(sig) is False

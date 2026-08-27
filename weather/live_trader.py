@@ -33,6 +33,27 @@ from .paths import DATA_DIR as _DATA_DIR
 LIVE_TRADES_LOG = _DATA_DIR / "logs" / "live_trades.csv"
 _IDEMPOTENCY_FILE = _DATA_DIR / "logs" / "live_idempotency.json"
 _RUNTIME_CONFIG = _DATA_DIR / "logs" / "runtime_config.json"
+# Killed FAKs live in their OWN log, never live_trades.csv: every reader of that
+# file treats an outcome-less row as an open position (_load_open_live_trades,
+# the day-exposure sum, auto_resolve), so a zero-fill row there would be chased
+# for on-chain settlement forever and pollute live stats.
+LIVE_KILLS_LOG = _DATA_DIR / "logs" / "live_order_kills.csv"
+
+_KILL_HEADERS = [
+    "submitted_at", "market_id", "market_title", "direction",
+    "entry_price", "model_p", "edge_pp", "price_cap", "amount_usd", "reason",
+]
+
+# The CLOB reports "your cap crossed nothing on the book" as a 400, not as a
+# 200-with-zero-fill, so the graceful no-fill path in execute_signal never sees
+# it and the exception escapes as a scary ORDER_ISSUE page. A killed FAK moved
+# no money and rests nothing on the book — it is the price cap doing its job.
+_FAK_NO_MATCH = "no orders found to match with fak order"
+
+
+def _is_fak_no_match(exc: Exception) -> bool:
+    """True for the CLOB 400 raised when a FAK found no crossing depth."""
+    return _FAK_NO_MATCH in str(exc).lower()
 
 _CSV_HEADERS = [
     "trade_id", "market_id", "market_title", "order_id",
@@ -219,6 +240,10 @@ class LiveTrader:
         self.bankroll_usd = bankroll_usd
         self._fill_poll_delay = fill_poll_delay  # override to 0 in tests
         self._log_path = log_path
+        # Derived from log_path, not a separate arg, so any caller that isolates
+        # the trade log to a temp dir (tests, validate_live_order.py) isolates
+        # the kill log with it automatically.
+        self._kill_log_path = log_path.parent / LIVE_KILLS_LOG.name
         self._idempotency_path = idempotency_path
         self._private_key = private_key
         self._funder_address = funder_address or proxy_address  # accept legacy name
@@ -490,9 +515,19 @@ class LiveTrader:
                 ),
                 order_type=OrderType.FAK,
             )
-        except Exception:
+        except Exception as e:
+            # Roll the key back either way: a FAK is atomic, so a submit that
+            # raised left nothing resting on the book and the market must stay
+            # retryable next scan.
             self._remove_idempotency_key(signal)
-            raise
+            if not _is_fak_no_match(e):
+                raise
+            # Benign: the book had no depth at/under our cap. Same outcome as the
+            # filled<=0 branch below, just delivered as a 400 instead of an empty
+            # fill — so return the identical shape rather than paging the owner.
+            self._log_kill(signal, price_cap, amount_usd, str(e))
+            return {"order_id": "", "status": "killed", "filled": 0.0,
+                    "size_usd": 0.0, "filled_price": 0.0, "price": 0.0}
         order_id = result.get("orderID") or result.get("id") or str(result)
 
         self._write_idempotency_key(signal, order_id)
@@ -523,6 +558,7 @@ class LiveTrader:
             # this, one thin-book miss forfeited the market's edge for the whole
             # day (the key is date-scoped; Jul-7 audit).
             self._remove_idempotency_key(signal)
+            self._log_kill(signal, price_cap, amount_usd, "zero fill on FAK response")
             # Shape-complete so display callers (which read size_usd/price) never
             # KeyError on a no-fill — now a common outcome with FAK + slippage cap.
             return {"order_id": order_id, "status": "unfilled", "filled": 0.0,
@@ -908,6 +944,38 @@ class LiveTrader:
             clob_passphrase=self._clob_passphrase,
         )
         return self._client
+
+    def _log_kill(
+        self, signal: Signal, price_cap: float, amount_usd: float, reason: str
+    ) -> None:
+        """Record an order that was submitted but filled nothing.
+
+        Kept out of live_trades.csv on purpose (see LIVE_KILLS_LOG). Without this
+        a killed order left no trace anywhere except a transient stderr line, so
+        the live fill rate — the thing that tells you whether the price cap is
+        set sanely — was unmeasurable from the data.
+        """
+        try:
+            is_new = not self._kill_log_path.exists()
+            self._kill_log_path.parent.mkdir(exist_ok=True)
+            with open(self._kill_log_path, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=_KILL_HEADERS, extrasaction="ignore")
+                if is_new:
+                    writer.writeheader()
+                writer.writerow({
+                    "submitted_at": datetime.now(timezone.utc).isoformat(),
+                    "market_id":    signal.market.market_id,
+                    "market_title": signal.market.title[:80],
+                    "direction":    signal.direction,
+                    "entry_price":  round(signal.entry_price, 4),
+                    "model_p":      round(signal.model_p, 4),
+                    "edge_pp":      round(signal.edge_pp, 4),
+                    "price_cap":    round(price_cap, 4),
+                    "amount_usd":   round(amount_usd, 2),
+                    "reason":       reason[:200],
+                })
+        except Exception:  # noqa: BLE001 — observability must never break execution
+            pass
 
     def _log_trade(
         self,

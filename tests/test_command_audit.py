@@ -282,3 +282,34 @@ class TestModeScopedViews:
         out = tb.fmt_positions(9)
         assert "1 trades" in out          # only the non-errored position counts
         assert "$10 deployed" in out
+
+
+class TestMuteSignature:
+    """The daily ORDER_ISSUE mute promises "repeats muted today unless the error
+    changes". Order IDs are nonce-derived hashes, unique on every submission, so
+    keying on the raw text made every repeat look like a NEW error and the alert
+    fired on every scan (Aug 27 2026: FAK-kill 400s paged continuously)."""
+
+    def _err(self, order_id: str) -> str:
+        return ("ORDER_ISSUE: Highest temperature in Atlanta on August 28? | "
+                "PolyApiException[status_code=400, error_message={'error': 'no "
+                "orders found to match with FAK order.', 'orderID': '%s'}]" % order_id)
+
+    def test_same_failure_different_order_id_dedupes(self):
+        a = tb._mute_signature(self._err("0xa80d4d0bf94cc2abc80d83b37ccf3496"))
+        b = tb._mute_signature(self._err("0x21167f07c360e366948de7531c696afc"))
+        assert a == b
+
+    def test_different_failure_still_alerts(self):
+        a = tb._mute_signature(self._err("0xa80d4d0bf94cc2abc80d83b37ccf3496"))
+        b = tb._mute_signature("ORDER_ISSUE: Atlanta | ValueError: bad signature")
+        assert a != b
+
+    def test_different_market_still_alerts(self):
+        a = tb._mute_signature("ORDER_ISSUE: Atlanta | boom 0xdeadbeefcafe1234")
+        b = tb._mute_signature("ORDER_ISSUE: Seoul | boom 0xdeadbeefcafe1234")
+        assert a != b
+
+    def test_short_hex_is_not_collapsed(self):
+        """Only long identifiers are volatile; don't blur real content."""
+        assert tb._mute_signature("code 0x1f") == "code 0x1f"

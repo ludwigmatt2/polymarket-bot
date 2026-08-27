@@ -21,6 +21,7 @@ import csv
 import json
 import math
 import os
+import re
 import sys
 import threading
 from contextlib import contextmanager
@@ -2745,6 +2746,18 @@ def _wrap_pending_live_deposits() -> list[dict]:
 LIVE_DEGRADED_ESCALATE_AFTER = timedelta(hours=12)
 LIVE_DEGRADED_RE_ESCALATE_EVERY = timedelta(hours=6)
 
+# Order IDs are nonce-derived hashes — unique on EVERY submission — so keying the
+# daily mute on the raw error text meant the signature never repeated and the
+# alert fired on every single scan: the exact opposite of the "muted today unless
+# the error changes" it promises. Collapse volatile identifiers before comparing
+# so the mute keys on the error's SHAPE (which market, which failure) instead.
+_VOLATILE_ID_RE = re.compile(r"0x[0-9a-fA-F]{8,}")
+
+
+def _mute_signature(err_text: str) -> str:
+    """Stable dedupe key for an ORDER_ISSUE block."""
+    return _VOLATILE_ID_RE.sub("0x*", err_text)
+
 
 def _track_live_degradation(ctx: ContextTypes.DEFAULT_TYPE, track: str, issues: list[str]) -> str | None:
     """Update the consecutive-failure streak for `track` ("hourly"/"intraday")
@@ -2842,7 +2855,7 @@ async def _auto_scan(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     issues = [l for l in (stdout + stderr).splitlines() if l.startswith("ORDER_ISSUE:")]
     if issues:
         err_text = "\n".join(issues)[:600]
-        sig = (err_text, datetime.now(timezone.utc).date().isoformat())
+        sig = (_mute_signature(err_text), datetime.now(timezone.utc).date().isoformat())
         if ctx.bot_data.get("last_order_fail") != sig:
             ctx.bot_data["last_order_fail"] = sig
             try:
@@ -2993,7 +3006,7 @@ async def _intraday_scan(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     issues = [l for l in (stdout + stderr).splitlines() if l.startswith("ORDER_ISSUE:")]
     if issues:
         err_text = "\n".join(issues)[:600]
-        sig = (err_text, datetime.now(timezone.utc).date().isoformat())
+        sig = (_mute_signature(err_text), datetime.now(timezone.utc).date().isoformat())
         if ctx.bot_data.get("last_intraday_order_fail") != sig:
             ctx.bot_data["last_intraday_order_fail"] = sig
             try:
