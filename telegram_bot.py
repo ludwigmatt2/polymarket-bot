@@ -2738,13 +2738,35 @@ def _wrap_pending_live_deposits() -> list[dict]:
 
 # Every muted-alert here mutes at most once/day — exactly the pattern that let
 # the Aug 25 2026 IPv6 geoblock hide "zero live trades" for days behind quiet,
-# de-spammed alerts. "live trader unavailable this cycle" (weather_bot.py's
-# _build_live_trader_or_none) is the one failure class that means live trading
-# is fully sidelined, not just one blocked order — so it gets its own
+# de-spammed alerts. A handful of failure classes mean live trading is FULLY
+# sidelined rather than one order being rejected, and those get their own
 # time-based escalation on top of the regular per-day mute, re-alerting louder
-# the longer it stays broken instead of settling into the same quiet 1/day drip.
+# the longer they stay broken instead of settling into the same quiet 1/day drip.
 LIVE_DEGRADED_ESCALATE_AFTER = timedelta(hours=12)
 LIVE_DEGRADED_RE_ESCALATE_EVERY = timedelta(hours=6)
+
+# (marker in the ORDER_ISSUE line, how to phrase it in the escalation).
+# A geoblock belongs here for the same reason the trader-build failure does:
+# weather_bot skips the entire execution block before attempting any order, so
+# every scan places nothing for as long as it lasts. Leaving it out is what let
+# the original incident run for days on a once-a-day alert — the very outage
+# this escalation was written to catch would not have tripped it.
+_LIVE_SIDELINED_MARKERS = (
+    ("live trader unavailable this cycle", "failed to build a live trader"),
+    ("geoblocked", "was geoblocked before a single order was attempted"),
+)
+
+
+def _sidelined_cause(issues: list[str]) -> str | None:
+    """Why live trading is fully sidelined this cycle, or None if it isn't.
+
+    A one-off rejection (bad signature, no depth) is NOT sidelining — those
+    stay on the plain per-day mute so the escalation keeps meaning "nothing is
+    getting out at all"."""
+    for marker, cause in _LIVE_SIDELINED_MARKERS:
+        if any(marker in ln for ln in issues):
+            return cause
+    return None
 
 # Order IDs are nonce-derived hashes — unique on EVERY submission — so keying the
 # daily mute on the raw error text meant the signature never repeated and the
@@ -2765,9 +2787,12 @@ def _track_live_degradation(ctx: ContextTypes.DEFAULT_TYPE, track: str, issues: 
     LIVE_DEGRADED_ESCALATE_AFTER, re-returning every LIVE_DEGRADED_RE_ESCALATE_EVERY
     thereafter until it clears. Returns None on every other call."""
     since_key, escalated_key = f"{track}_live_degraded_since", f"{track}_live_escalated_at"
-    degraded = any("live trader unavailable this cycle" in ln for ln in issues)
+    # The streak tracks "live is down", not "down for THIS reason" — a geoblock
+    # that turns into a trader-build failure is still one continuous outage, so
+    # the cause is re-read each cycle for the wording but never resets the clock.
+    cause = _sidelined_cause(issues)
     now = datetime.now(timezone.utc)
-    if not degraded:
+    if cause is None:
         ctx.bot_data.pop(since_key, None)
         ctx.bot_data.pop(escalated_key, None)
         return None
@@ -2784,7 +2809,7 @@ def _track_live_degradation(ctx: ContextTypes.DEFAULT_TYPE, track: str, issues: 
     ctx.bot_data[escalated_key] = now
     hours = elapsed.total_seconds() / 3600
     return (f"🔴 *Live trading has been down {hours:.0f}h straight* ({track}) — "
-            f"every scan since {since.strftime('%b %d %H:%M UTC')} failed to build a live trader. "
+            f"every scan since {since.strftime('%b %d %H:%M UTC')} {cause}. "
             f"Paper logging is unaffected, but no live orders are going out.")
 
 

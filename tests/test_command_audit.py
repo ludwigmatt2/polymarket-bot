@@ -139,10 +139,9 @@ class TestAutoScanHeartbeatSurfacesBlock:
 
 class TestLiveDegradationEscalation:
     """Regular ORDER_ISSUE alerts mute at 1/day — the same pattern that hid the
-    Aug 25 2026 IPv6 geoblock for days. "live trader unavailable this cycle"
-    (weather_bot.py's _build_live_trader_or_none) means live trading is fully
-    sidelined, not just one blocked order, so it gets a time-based escalation
-    on top of the regular per-day mute."""
+    Aug 25 2026 IPv6 geoblock for days. A failure class that leaves live trading
+    fully sidelined (rather than blocking one order) gets a time-based
+    escalation on top of the regular per-day mute."""
 
     def _ctx(self):
         ctx = MagicMock()
@@ -198,6 +197,51 @@ class TestLiveDegradationEscalation:
         intraday_msg = tb._track_live_degradation(ctx, "intraday", issues)
         assert hourly_msg is not None
         assert intraday_msg is None  # intraday's own streak just started
+
+    # --- geoblock (Aug 25 2026) -------------------------------------------
+    # The outage this escalation was written for. weather_bot skips the whole
+    # execution block when check_geoblock() reports blocked, so nothing is even
+    # attempted — but it prints a DIFFERENT ORDER_ISSUE line, and the original
+    # predicate only matched the trader-build failure. These lines are copied
+    # from weather_bot.py so a reworded print breaks the test, not production.
+
+    GEO_HOURLY = ("ORDER_ISSUE: geoblocked from DE/Bavaria (IP 2a01:4f9:c012::1) "
+                  "— route order traffic through a permitted region (set HTTPS_PROXY).")
+    GEO_INTRADAY = ("ORDER_ISSUE: intraday geoblocked from DE/Bavaria "
+                    "(IP 2a01:4f9:c012::1) — route order traffic through a "
+                    "permitted region (set HTTPS_PROXY).")
+
+    def test_persistent_geoblock_escalates(self):
+        ctx = self._ctx()
+        ctx.bot_data["hourly_live_degraded_since"] = tb.datetime.now(tb.timezone.utc) - tb.timedelta(hours=13)
+        msg = tb._track_live_degradation(ctx, "hourly", [self.GEO_HOURLY])
+        assert msg is not None and "13h" in msg
+        assert "geoblocked" in msg  # names the actual cause, not "build a live trader"
+
+    def test_intraday_geoblock_escalates(self):
+        ctx = self._ctx()
+        ctx.bot_data["intraday_live_degraded_since"] = tb.datetime.now(tb.timezone.utc) - tb.timedelta(hours=13)
+        assert tb._track_live_degradation(ctx, "intraday", [self.GEO_INTRADAY]) is not None
+
+    def test_geoblock_clearing_resets_the_streak(self):
+        ctx = self._ctx()
+        tb._track_live_degradation(ctx, "hourly", [self.GEO_HOURLY])
+        assert "hourly_live_degraded_since" in ctx.bot_data
+        assert tb._track_live_degradation(ctx, "hourly", []) is None
+        assert "hourly_live_degraded_since" not in ctx.bot_data
+
+    def test_cause_switching_does_not_restart_the_clock(self):
+        """Geoblock → trader-build failure is still one continuous outage."""
+        ctx = self._ctx()
+        since = tb.datetime.now(tb.timezone.utc) - tb.timedelta(hours=13)
+        ctx.bot_data["hourly_live_degraded_since"] = since
+        assert tb._track_live_degradation(ctx, "hourly", [self.GEO_HOURLY]) is not None
+        assert ctx.bot_data["hourly_live_degraded_since"] == since
+        ctx.bot_data.pop("hourly_live_escalated_at")  # past the re-escalate window
+        msg = tb._track_live_degradation(
+            ctx, "hourly", ["ORDER_ISSUE: live trader unavailable this cycle | RuntimeError: boom"])
+        assert msg is not None and "13h" in msg
+        assert "build a live trader" in msg  # wording follows the CURRENT cause
 
 
 class TestMainlineHourlyIntradaySplit:

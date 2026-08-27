@@ -192,3 +192,48 @@ class TestLiveTraderConstructionNeverKillsScan:
         result = weather_bot._build_live_trader_or_none(MagicMock(), tmp_path, 500.0)
 
         assert result is sentinel
+
+
+class TestHourlyGeoblockIsReportedEveryScan:
+    """The hourly counterpart of the intraday geoblock check (Aug 27 2026).
+
+    telegram_bot's 12h live-degradation escalation keys off the geoblocked
+    ORDER_ISSUE line appearing on EVERY scan while the block lasts. run_scan
+    used to emit it only inside `if live_trader and actionable:`, so a quiet
+    scan — the common case, since signals land a couple of times a day —
+    printed nothing, which the escalation read as "recovered" and used to reset
+    the streak. The result was that the very outage the escalation was written
+    for (the Aug 25 IPv6 geoblock) could never accumulate 12h of continuity."""
+
+    def _run(self, tmp_path, monkeypatch, *, actionable: bool, geoblocked: bool):
+        market = _market()
+        monkeypatch.setattr(weather_bot, "check_geoblock",
+                            lambda *a, **k: {"blocked": True, "country": "DE",
+                                             "region": "BY", "ip": "2a01:4f9::1"}
+                            if geoblocked else {"blocked": False})
+        scanner = MagicMock()
+        scanner.scan.return_value = [market]
+        generator = MagicMock()
+        generator.evaluate.return_value = _signal(market, quality_gate_passed=actionable)
+        trader = FakeLiveTrader(fill=True)
+        weather_bot.run_scan(scanner, generator, None, log_dir=tmp_path, live_trader=trader)
+        return trader
+
+    def test_geoblock_reported_even_when_no_signal_was_actionable(self, tmp_path, monkeypatch, capsys):
+        trader = self._run(tmp_path, monkeypatch, actionable=False, geoblocked=True)
+        assert "ORDER_ISSUE: geoblocked" in capsys.readouterr().err
+        assert trader.calls == 0
+
+    def test_geoblock_still_reported_with_actionable_signals(self, tmp_path, monkeypatch, capsys):
+        trader = self._run(tmp_path, monkeypatch, actionable=True, geoblocked=True)
+        assert "ORDER_ISSUE: geoblocked" in capsys.readouterr().err
+        assert trader.calls == 0  # execution skipped whole
+
+    def test_no_geoblock_line_when_not_blocked(self, tmp_path, monkeypatch, capsys):
+        self._run(tmp_path, monkeypatch, actionable=False, geoblocked=False)
+        assert "geoblocked" not in capsys.readouterr().err
+
+    def test_unblocked_scan_with_actionable_signals_still_executes(self, tmp_path, monkeypatch):
+        trader = self._run(tmp_path, monkeypatch, actionable=True, geoblocked=False)
+        assert trader.calls == 1
+        assert trader.reset_calls == 1  # fresh in-scan spend budget

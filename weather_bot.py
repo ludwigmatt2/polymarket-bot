@@ -115,13 +115,20 @@ def run_scan(
     # Live execution — separate path, real USDC → live_trades.csv. Skipped whole
     # when geoblocked; the ORDER_ISSUE line is greppable by _auto_scan's alerting
     # even though the scan itself completes normally (rc=0).
-    if live_trader and actionable:
+    # The geoblock check is deliberately NOT gated on `actionable`: being blocked
+    # is a standing infrastructure condition, not a per-signal event, and the
+    # 12h escalation in telegram_bot keys off this line appearing on EVERY scan.
+    # Gated on `actionable`, a quiet scan (the common case — signals land only a
+    # couple of times a day) emitted nothing, which read as "recovered" and reset
+    # the streak, so the escalation could never reach 12h continuous.
+    if live_trader:
         geo = check_geoblock()
-        if geo and geo.get("blocked"):
+        blocked = bool(geo and geo.get("blocked"))
+        if blocked:
             print(f"ORDER_ISSUE: geoblocked from {geo.get('country','?')}/{geo.get('region','?')} "
                   f"(IP {geo.get('ip','?')}) — route order traffic through a permitted region "
                   f"(set HTTPS_PROXY).", file=sys.stderr)
-        else:
+        elif actionable:
             print(f"  [live] Placing {len(actionable)} live order(s)...")
             live_trader.reset_scan_commitments()  # fresh in-scan spend budget
             for s in actionable:
