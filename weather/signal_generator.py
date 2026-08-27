@@ -49,6 +49,7 @@ from .config import (
     REQUIRE_STATION_TRUTH,
     RUNNING_OBS_ENABLED,
     EDGE_SAFETY_MARGIN_PP,
+    GATE_ON_EXECUTABLE_ASK,
     VELOCITY_WINDOW_HOURS,
 )
 from . import station_obs
@@ -194,16 +195,23 @@ class SignalGenerator:
         spread_factor = max(0.0, 1.0 - prob_result.ensemble_spread / MAX_ENSEMBLE_SPREAD)
         model_p = market.yes_price + (model_p - market.yes_price) * skill * spread_factor
 
+        # Direction and the shrinkage anchor both stay on the MID: the mid is the
+        # crowd's fair-value estimate, which is the right no-information anchor,
+        # and the half-spread is a transaction cost, not a probability. Only the
+        # EDGE moves to the ask — that's the number that has to clear a cost.
+        market_p = market.yes_price
+        direction = "YES" if model_p > market_p else "NO"
+        exec_price = market.ask_for(direction) if GATE_ON_EXECUTABLE_ASK else 0.0
+        cost = exec_price or (market_p if direction == "YES" else 1.0 - market_p)
+        p_win = model_p if direction == "YES" else 1.0 - model_p
+        edge_pp = p_win - cost
+
         # Re-check gate 4 after both shrinkages
         if gate_passed:
-            net_ev_shrunk = abs(model_p - market.yes_price) - EDGE_SAFETY_MARGIN_PP
+            net_ev_shrunk = edge_pp - EDGE_SAFETY_MARGIN_PP
             if net_ev_shrunk < MIN_NET_EV_PP:
                 gate_passed = False
                 rejection_reason = f"gate4_after_shrinkage:{net_ev_shrunk:.3f}"
-
-        market_p = market.yes_price
-        edge_pp = abs(model_p - market_p)
-        direction = "YES" if model_p > market_p else "NO"
 
         # Size factor (0.0–1.0): product of spread and lead-time confidence.
         # Used by live trader for Kelly position sizing; paper trader logs it for analysis.
@@ -225,6 +233,7 @@ class SignalGenerator:
             prob_result=prob_result,
             running_obs_c=observed_c,
             restofday=restofday,
+            exec_price=exec_price,
         )
 
     def _quality_gates(
@@ -350,8 +359,17 @@ class SignalGenerator:
             matched = next(c for c in BLOCKED_YES_CITIES if c in market.title)
             return False, f"gate9.8_city_yes_blocked:{matched}", 0.0
 
-        # Gate 4: Margin-adjusted edge (blocks the majority of candidate trades)
-        gross_ev = abs(prob.calibrated_p - market.yes_price)
+        # Gate 4: Margin-adjusted edge (blocks the majority of candidate trades).
+        # Edge is profit over what the contract COSTS, so it is measured against
+        # the traded side's ask, not the book mid — see GATE_ON_EXECUTABLE_ASK.
+        # With the mid, this gate's real floor was MIN_NET_EV_PP + half a spread
+        # and the surplus signals were killed by the exchange instead (Aug 2026).
+        # When the book is absent, ask_for() returns the mid-implied price and
+        # p_win - cost reduces to abs(calibrated_p - yes_price) exactly.
+        p_win = prob.calibrated_p if side_is_yes else 1.0 - prob.calibrated_p
+        cost = (market.ask_for(side_tag.upper()) if GATE_ON_EXECUTABLE_ASK
+                else (market.yes_price if side_is_yes else 1.0 - market.yes_price))
+        gross_ev = p_win - cost
         net_ev = gross_ev - EDGE_SAFETY_MARGIN_PP
         if net_ev < MIN_NET_EV_PP:
             return False, f"gate4_margin_adjusted_edge:{net_ev:.3f}_required:{MIN_NET_EV_PP}", 0.0

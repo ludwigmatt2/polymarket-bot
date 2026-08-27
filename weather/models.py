@@ -61,6 +61,21 @@ class WeatherMarket:
     station_country: str = ""
     resolve_unit: str = ""
 
+    def ask_for(self, direction: str) -> float:
+        """Cost per contract to BUY `direction` right now.
+
+        This is what a marketable order actually pays. `yes_price` is the book
+        MID, which is half a spread cheaper than anything buyable — pricing edge
+        off it is what let Gate 4 admit signals the exchange then refused.
+
+        Falls back to the mid-implied price when the book side wasn't fetched
+        (0.0 sentinel — paper-only runs, sidecar down). That fallback is exactly
+        the old arithmetic, so behaviour is unchanged wherever books are absent.
+        """
+        if direction == "YES":
+            return self.yes_best_ask or self.yes_price
+        return self.no_best_ask or (1.0 - self.yes_price)
+
 
 @dataclass
 class EnsembleForecast:
@@ -124,7 +139,12 @@ class Signal:
     market: WeatherMarket
     model_p: float          # Calibrated model probability (after all shrinkages)
     market_p: float         # Current market price
-    edge_pp: float          # abs(model_p - market_p) — always positive
+    # Executable edge: P(win) minus what the contract COSTS (the traded side's
+    # ask, or the mid-implied price when no book was fetched). Can be negative
+    # on a rejected signal whose spread swallowed the model's disagreement —
+    # that is real information, not a bug. Gate-passed signals are always
+    # >= MIN_NET_EV_PP + EDGE_SAFETY_MARGIN_PP.
+    edge_pp: float
     direction: str          # "YES" or "NO" (which contract to buy)
     ensemble_spread: float
     confidence_score: float # Gate 8 composite score
@@ -139,10 +159,21 @@ class Signal:
     running_obs_c: float | None = None
     # M1: True when members were rest-of-day extremes (hourly), not full-day.
     restofday: bool = False
+    # Executable cost per contract at signal time — the traded side's best ask.
+    # 0.0 when the book wasn't fetched; entry_price then falls back to the mid.
+    exec_price: float = 0.0
 
     @property
     def entry_price(self) -> float:
-        """Market-implied cost per contract for the signalled direction."""
+        """Cost per contract for the signalled direction.
+
+        Prefers the executable ask captured at signal time; falls back to the
+        mid-implied price for Signals built without one (backtests, tests, and
+        any path where the book wasn't fetched), which is the pre-Aug-27
+        behaviour verbatim.
+        """
+        if self.exec_price > 0.0:
+            return self.exec_price
         return self.market_p if self.direction == "YES" else (1.0 - self.market_p)
 
 

@@ -134,6 +134,28 @@ BLOCKED_YES_CITIES: list[str] = ["Tokyo"]
 # edge-preserving FAK price cap), NOT by this margin.
 EDGE_SAFETY_MARGIN_PP = 0.03
 
+# Measure edge against the price a BUY actually PAYS — the traded side's best ask
+# — instead of the book mid (`yes_price` = (best_ask+best_bid)/2).
+#
+# Aug 27 2026: Gate 4 advertised an 0.11 edge floor but enforced ~0.116, because
+# it priced off the mid while a marketable order fills at the ask. Measured over
+# all 45 live fills, `filled_price - entry_price` averaged +0.0095 and was
+# NEVER negative. Two consequences: ~33% of actionable signals sat below the
+# real floor and were killed by the exchange rather than the gate (the FAK cap
+# refused them, correctly — at edge 0.114 with a 0.0095 spread, net EV after the
+# safety margin is 0.0745, under the 0.08 floor), and the paper track booked
+# every entry half a spread better than reachable, inflating PF.
+#
+# With this on, the gate rejects those trades itself, `entry_price` records what
+# was actually payable, and the live price cap is guaranteed to sit at or above
+# the ask so a passing signal can genuinely fill. Expect FEWER signals and a
+# LOWER paper PF — that is the inflation coming out, not a regression.
+#
+# Falls back to the mid-implied price whenever the book wasn't fetched (paper-only
+# runs, sidecar down), which reproduces the old arithmetic exactly.
+# Set GATE_ON_EXECUTABLE_ASK=0 to revert without a code change.
+GATE_ON_EXECUTABLE_ASK = os.environ.get("GATE_ON_EXECUTABLE_ASK", "1") != "0"
+
 # ── Paper trading ──────────────────────────────────────────────────────────────
 PAPER_TRADE_SIZE_USD = 25.0
 # Virtual bankroll the paper record is measured against (display/ROI only — flat

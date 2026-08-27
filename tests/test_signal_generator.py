@@ -425,8 +425,12 @@ class TestSideAwareLiquidity:
 
     def test_no_signal_passes_on_deep_no_book(self):
         gen = _make_generator(model_p=0.10)
+        # NO quotes must be arbitrage-consistent with yes_price=0.28 (NO ask
+        # ~= 1 - yes_bid). Gate 4 now prices edge off the traded side's ask, so
+        # an inconsistent book manufactures a phantom ~0.49 edge and trips Gate
+        # 4.5's ceiling instead of exercising the depth check this test is for.
         m = self._no_side_market(book_depth_usd=10.0, no_book_depth_usd=5000.0,
-                                 no_best_ask=0.41, no_best_bid=0.39)
+                                 no_best_ask=0.73, no_best_bid=0.71)
         s = gen.evaluate(m)
         assert s.quality_gate_passed is True
 
@@ -547,3 +551,76 @@ class TestPrecipBlocked:
         sig = gen.evaluate(m)
         assert sig.quality_gate_passed is False
         assert "gate0.5_no_station_truth" in sig.rejection_reason
+
+
+class TestGateOnExecutableAsk:
+    """Gate 4 measures edge against what a BUY actually PAYS (the traded side's
+    ask), not the book mid. Pricing off the mid made the advertised 0.11 floor
+    really 0.11 + half a spread, and the exchange — not the gate — refused the
+    difference (Aug 27 2026: killed FAKs at edge 0.1138/0.1145 while the lowest
+    edge ever filled was 0.1164)."""
+
+    def _mkt(self, yes_price, **kw):
+        m = _make_market(yes_price=yes_price)
+        for k, v in kw.items():
+            setattr(m, k, v)
+        return m
+
+    def test_edge_is_reduced_by_the_half_spread(self):
+        """Same model, same mid — a wider book must yield a smaller edge."""
+        gen = _make_generator(model_p=0.10)
+        tight = gen.evaluate(self._mkt(0.28, no_book_depth_usd=5000.0,
+                                       no_best_ask=0.725, no_best_bid=0.715))
+        wide = gen.evaluate(self._mkt(0.28, no_book_depth_usd=5000.0,
+                                      no_best_ask=0.74, no_best_bid=0.70))
+        assert wide.edge_pp < tight.edge_pp
+        assert tight.edge_pp - wide.edge_pp == pytest.approx(0.015, abs=1e-6)
+
+    def test_entry_price_records_the_ask_not_the_mid(self):
+        gen = _make_generator(model_p=0.10)
+        s = gen.evaluate(self._mkt(0.28, no_book_depth_usd=5000.0,
+                                   no_best_ask=0.73, no_best_bid=0.71))
+        assert s.exec_price == pytest.approx(0.73)
+        assert s.entry_price == pytest.approx(0.73)   # NOT 1 - 0.28 = 0.72
+
+    def test_marginal_signal_the_book_could_not_fill_is_now_rejected(self):
+        """The Aug 27 failure mode, as a counterfactual pair.
+
+        Identical market and model. Priced off the mid the signal clears the
+        0.11 floor at 0.1148 and gets submitted — then the exchange kills the
+        FAK, because the cap lands under the ask. Priced off the ask it is
+        0.1048 and the GATE rejects it, which is where the decision belongs.
+        """
+        from weather.config import MIN_NET_EV_PP, EDGE_SAFETY_MARGIN_PP
+        floor = MIN_NET_EV_PP + EDGE_SAFETY_MARGIN_PP          # 0.11
+        gen = _make_generator(model_p=0.10)
+
+        # No book fetched → mid-implied cost 0.73, the pre-Aug-27 arithmetic.
+        on_mid = gen.evaluate(self._mkt(0.27, no_book_depth_usd=5000.0))
+        assert on_mid.quality_gate_passed is True
+        assert on_mid.edge_pp > floor
+
+        # Real book: NO ask a cent worse than the mid.
+        on_ask = gen.evaluate(self._mkt(0.27, no_book_depth_usd=5000.0,
+                                        no_best_ask=0.74, no_best_bid=0.72))
+        assert on_ask.quality_gate_passed is False
+        assert "gate4" in on_ask.rejection_reason
+        assert on_ask.edge_pp < floor
+        # The whole difference is the half-spread, nothing else.
+        assert on_mid.edge_pp - on_ask.edge_pp == pytest.approx(0.01, abs=1e-4)
+
+    def test_falls_back_to_mid_when_book_absent(self):
+        """Paper-only runs / sidecar down: no quotes → old arithmetic verbatim."""
+        gen = _make_generator(model_p=0.10)
+        s = gen.evaluate(self._mkt(0.28, no_book_depth_usd=5000.0))
+        assert s.exec_price == pytest.approx(1 - 0.28)   # mid-implied, not a quote
+        assert s.entry_price == pytest.approx(1 - 0.28)
+        assert s.edge_pp == pytest.approx((1 - s.model_p) - (1 - 0.28), abs=1e-4)
+
+    def test_yes_side_uses_the_yes_ask(self):
+        gen = _make_generator(model_p=0.55)
+        s = gen.evaluate(self._mkt(0.30, book_depth_usd=5000.0,
+                                   yes_best_ask=0.31, yes_best_bid=0.29))
+        assert s.direction == "YES"
+        assert s.entry_price == pytest.approx(0.31)
+        assert s.edge_pp == pytest.approx(s.model_p - 0.31, abs=1e-4)
