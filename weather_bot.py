@@ -47,6 +47,21 @@ from weather.price_tracker import PriceTracker
 from weather.probability_model import ProbabilityModel
 from weather.signal_generator import SignalGenerator
 from weather.weather_client import WeatherClient
+from weather.config import SHADOW_TRACKS_ENABLED
+
+# Shadow A/B tracker — built once per process (models load calibrators once), then
+# reused across scans. None until the first scan with SHADOW_TRACKS_ENABLED.
+_SHADOW_TRACKER = None
+
+
+def _get_shadow_tracker(client, log_dir: "Path"):
+    """Lazily build (and cache) the shadow tracker from the default challenger
+    roster. Isolated here so run_scan stays readable and tests can reset it."""
+    global _SHADOW_TRACKER
+    if _SHADOW_TRACKER is None:
+        from weather.shadow import DEFAULT_SPECS, ShadowTracker
+        _SHADOW_TRACKER = ShadowTracker(DEFAULT_SPECS, client, log_dir)
+    return _SHADOW_TRACKER
 
 # All logs live under the persistent data dir (RAILWAY_VOLUME_MOUNT_PATH on the VPS,
 # repo root locally). Keep every writer here in sync with telegram_bot.py's readers,
@@ -111,6 +126,19 @@ def run_scan(
     if paper and actionable:
         logged = sum(1 for s in actionable if paper.log_trade(s))
         print(f"  [3/3] Logged {logged}/{len(actionable)} actionable to paper track")
+
+    # Shadow A/B tracks — re-score the SAME forecasts under challenger model
+    # configs, logging each to data/logs/shadow/<name>/. Read-only; wrapped so a
+    # challenger can never perturb the scan that funds real trades. Opt-in.
+    if SHADOW_TRACKS_ENABLED and signals:
+        try:
+            tracker = _get_shadow_tracker(generator.client, log_dir)
+            counts = tracker.evaluate_and_log(signals)
+            if any(counts.values()):
+                summary = " ".join(f"{k}={v}" for k, v in counts.items() if v)
+                print(f"  [shadow] logged {summary}")
+        except Exception as e:  # noqa: BLE001 — shadows must never break the scan
+            print(f"  [shadow] harness error (scan unaffected): {e}", file=sys.stderr)
 
     # Live execution — separate path, real USDC → live_trades.csv. Skipped whole
     # when geoblocked; the ORDER_ISSUE line is greppable by _auto_scan's alerting
@@ -1103,6 +1131,18 @@ def main() -> None:
 
         if args.all_users:
             fan_out_auto_resolve(client)
+
+        # Shadow tracks resolve on the same on-chain truth, each feeding its own
+        # isolated calibrator. Wrapped so a shadow resolve can never abort the
+        # production resolve/claim above.
+        if SHADOW_TRACKS_ENABLED:
+            try:
+                sh = _get_shadow_tracker(client, log_dir)
+                shres = sh.resolve_all(client)
+                if any(shres.values()):
+                    print(f"  [shadow] resolved " + " ".join(f"{k}={v}" for k, v in shres.items() if v))
+            except Exception as e:  # noqa: BLE001
+                print(f"  [shadow] resolve harness error (production unaffected): {e}", file=sys.stderr)
 
         return
 

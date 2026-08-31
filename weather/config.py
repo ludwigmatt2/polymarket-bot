@@ -276,6 +276,14 @@ MODEL_WEIGHTING_ENABLED = True
 VARIANCE_INFLATION = 2.0
 VARIANCE_INFLATION_ENABLED = True
 
+# ── Shadow model tracks (forward A/B, Aug 2026) ────────────────────────────────
+# Run challenger model configs (weather.shadow.DEFAULT_SPECS) alongside the live
+# model each scan, logging their paper trades to data/logs/shadow/<name>/ for an
+# out-of-sample forward comparison. Read-only re-scoring of the production
+# forecast; never touches the live signal path or real orders. Off by default so
+# it's an explicit opt-in on the box that has the forecast budget to spare.
+SHADOW_TRACKS_ENABLED = os.environ.get("SHADOW_TRACKS_ENABLED", "0") == "1"
+
 # Deterministic models used for cross-model spread (uncertainty proxy)
 FORECAST_MODELS = ["gfs_seamless", "ecmwf_ifs025", "icon_seamless"]
 

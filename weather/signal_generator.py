@@ -71,27 +71,34 @@ class SignalGenerator:
         self.price_tracker = price_tracker
         self.bias_corrector = bias_corrector or CityBiasCorrector()
 
-    def evaluate(self, market: WeatherMarket) -> Signal:
+    def evaluate(self, market: WeatherMarket, forecast=None) -> Signal:
         """
         Full pipeline for one market:
-        1. Fetch ensemble forecast
+        1. Fetch ensemble forecast (or reuse `forecast` when supplied)
         2. Compute calibrated P(outcome)
         3. Apply quality gates (0 → 8)
         4. Record current price in history (for next cycle's Gate 6)
         5. Return Signal
+
+        `forecast`: reuse an already-fetched EnsembleForecast instead of hitting the
+        API. The shadow harness (weather.shadow) passes the PRODUCTION model's
+        forecast so each challenger scores the identical ensemble — the only thing
+        that varies across tracks is the model, never the input data — and no scan
+        pays a second forecast fetch. None → fetch as normal (the live path).
         """
-        if market.forecast_start_date is not None:
-            forecast = self.client.get_monthly_aggregate_forecast(
-                location=market.location,
-                month_start=market.forecast_start_date,
-                metric=market.metric,
-            )
-        else:
-            forecast = self.client.get_ensemble_forecast(
-                location=market.location,
-                target_date=market.resolution_date.date(),
-                metric=market.metric,
-            )
+        if forecast is None:
+            if market.forecast_start_date is not None:
+                forecast = self.client.get_monthly_aggregate_forecast(
+                    location=market.location,
+                    month_start=market.forecast_start_date,
+                    metric=market.metric,
+                )
+            else:
+                forecast = self.client.get_ensemble_forecast(
+                    location=market.location,
+                    target_date=market.resolution_date.date(),
+                    metric=market.metric,
+                )
 
         now = datetime.now(timezone.utc)
         days_to_res = (market.resolution_date - now).total_seconds() / 86400
