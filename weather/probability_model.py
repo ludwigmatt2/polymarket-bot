@@ -95,10 +95,11 @@ class HistoricalSkillCorrector:
                 best_d, best = d, c
         return best if best and best_d < self.max_distance_km else None
 
-    def lookup_shift(self, lat: float, lon: float, metric: str, lead_day: int, month: int) -> float | None:
-        """Return the °C member shift (mean_error) for this cell, or None if untrusted."""
-        if not MOS_ENABLED or metric not in self.enabled_metrics:
-            return None
+    def lookup_cell(self, lat: float, lon: float, metric: str, lead_day: int, month: int) -> dict | None:
+        """Return the trusted skill cell {mean_error, std_error, n} for this
+        (nearest-city, metric, lead, month), or None. Shared by the MOS mean-shift
+        (lookup_shift) and the per-cell EMOS dispersion (DispersionCorrector) so
+        both traverse the table identically."""
         city = self._nearest_city(lat, lon)
         if not city:
             return None
@@ -112,8 +113,15 @@ class HistoricalSkillCorrector:
         for L in sorted(ms.keys(), key=lambda k: abs(int(k) - lead)):
             for cell in (ms[L].get(str(month)), ms[L].get("0")):
                 if cell and cell.get("n", 0) >= MIN_SKILL_OBS:
-                    return cell["mean_error"]
+                    return cell
         return None
+
+    def lookup_shift(self, lat: float, lon: float, metric: str, lead_day: int, month: int) -> float | None:
+        """Return the °C member shift (mean_error) for this cell, or None if untrusted."""
+        if not MOS_ENABLED or metric not in self.enabled_metrics:
+            return None
+        cell = self.lookup_cell(lat, lon, metric, lead_day, month)
+        return cell["mean_error"] if cell else None
 
     def adjust_members(
         self, members: list[float], lat: float, lon: float, metric: str, lead_day: int, month: int
@@ -123,6 +131,66 @@ class HistoricalSkillCorrector:
         if shift is None:
             return members
         return [m - shift for m in members]
+
+
+class DispersionCorrector:
+    """Per-cell EMOS variance inflation (Aug 2026).
+
+    The global λ (VARIANCE_INFLATION) says "double every ensemble's spread" —
+    one number for every city, lead and season. But underdispersion isn't
+    uniform: a hard cell (long lead, volatile season) needs more widening than a
+    calm one. This scales λ by each (city, lead, month) cell's historical
+    forecast-error std relative to the average trusted cell, so
+        λ_cell = base_λ · std_error_cell / mean(std_error)
+    anchored so the mean cell reproduces the validated global λ, and clamped to a
+    sane band. Reuses the SAME historical-skill table MOS already loads (its cells
+    carry std_error) — no new data source or fit step.
+
+    Deployed only as a shadow challenger ("emos_percell"); the forward A/B decides
+    whether the per-cell refinement actually beats the flat global λ before it
+    could ever reach the production model. Returns None per cell when the table is
+    absent or the cell is untrusted, so the caller falls back to the scalar λ.
+    """
+
+    def __init__(
+        self,
+        skill: "HistoricalSkillCorrector | None" = None,
+        base_lambda: float = VARIANCE_INFLATION,
+        lam_min: float = 1.25,
+        lam_max: float = 3.5,
+    ):
+        self.skill = skill if skill is not None else HistoricalSkillCorrector()
+        self.base_lambda = base_lambda
+        self.lam_min = lam_min
+        self.lam_max = lam_max
+        self.ref_std = self._mean_trusted_std()
+
+    def _mean_trusted_std(self) -> float | None:
+        vals: list[float] = []
+        for city in self.skill._cities:
+            for _metric, leads in city.get("metrics", {}).items():
+                for _lead, months in leads.items():
+                    for _mo, cell in months.items():
+                        s = cell.get("std_error")
+                        if s and cell.get("n", 0) >= MIN_SKILL_OBS:
+                            vals.append(s)
+        return (sum(vals) / len(vals)) if vals else None
+
+    @property
+    def is_loaded(self) -> bool:
+        return bool(self.skill.is_loaded and self.ref_std)
+
+    def lookup_lambda(
+        self, lat: float, lon: float, metric: str, lead_day: int, month: int
+    ) -> float | None:
+        """Per-cell inflation λ, or None to defer to the scalar λ."""
+        if not self.ref_std:
+            return None
+        cell = self.skill.lookup_cell(lat, lon, metric, lead_day, month)
+        if not cell or cell.get("std_error") is None:
+            return None
+        lam = self.base_lambda * cell["std_error"] / self.ref_std
+        return float(min(max(lam, self.lam_min), self.lam_max))
 
 
 class ProbabilityModel:
@@ -137,6 +205,7 @@ class ProbabilityModel:
         model_weights: dict[str, float] | None = None,
         variance_inflation: float | None = None,
         variance_inflation_enabled: bool | None = None,
+        dispersion_corrector: "DispersionCorrector | None" = None,
         name: str = "production",
     ):
         self.calibration_log_path = calibration_log_path
@@ -156,6 +225,10 @@ class ProbabilityModel:
             if variance_inflation_enabled is None
             else variance_inflation_enabled
         )
+        # Per-cell EMOS dispersion (optional challenger). When set, its per-(cell)
+        # λ overrides the scalar variance_inflation wherever the skill table has a
+        # trusted cell; elsewhere the scalar stands in. None → flat scalar λ (prod).
+        self.dispersion_corrector = dispersion_corrector
         # Phase 4: per-model member weights. None → the labeled literature prior.
         self.model_weights = MODEL_WEIGHTS if model_weights is None else model_weights
         # Phase 1 MOS. Auto-load by default: a no-op when historical_skill.json is
@@ -212,8 +285,20 @@ class ProbabilityModel:
         # ensemble underdispersion at the source — tail buckets regain the
         # probability mass reality showed they deserve (raw_p<0.10 resolved YES
         # 34.9% forward). λ=1 is an exact no-op; fit offline (see config).
-        if self.variance_inflation_enabled and self.variance_inflation != 1.0:
-            lam = self.variance_inflation
+        # Per-cell EMOS λ overrides the scalar where the skill table has a trusted
+        # cell for this (city, lead, month); otherwise the scalar λ stands.
+        lam = self.variance_inflation
+        if (
+            self.dispersion_corrector is not None
+            and lead_day is not None
+            and month is not None
+        ):
+            cell_lam = self.dispersion_corrector.lookup_lambda(
+                forecast.lat, forecast.lon, forecast.metric, lead_day, month
+            )
+            if cell_lam is not None:
+                lam = cell_lam
+        if self.variance_inflation_enabled and lam != 1.0:
             inflated = {}
             for m, vals in member_arrays.items():
                 if not vals:

@@ -27,7 +27,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .paper_trader import PaperTrader
-from .probability_model import HistoricalSkillCorrector, ProbabilityModel
+from .probability_model import (
+    DispersionCorrector,
+    HistoricalSkillCorrector,
+    ProbabilityModel,
+)
 from .signal_generator import SignalGenerator
 
 
@@ -40,13 +44,17 @@ class ModelSpec:
     variance_inflation: float = 2.0
     variance_inflation_enabled: bool = True
     mos_enabled: bool = True
+    emos_percell: bool = False
     model_weights: dict[str, float] | None = None
 
     def build_model(self, log_dir: Path) -> ProbabilityModel:
         """Construct an isolated ProbabilityModel for this spec. MOS off ⇒ no
         skill corrector, so signal_generator falls back to flat city bias exactly
-        as it would if MOS had no data (the honest 'MOS contributes nothing' arm)."""
+        as it would if MOS had no data (the honest 'MOS contributes nothing' arm).
+        emos_percell ⇒ attach the per-cell dispersion corrector, which overrides
+        the scalar λ where the skill table has a trusted cell."""
         corrector = HistoricalSkillCorrector() if self.mos_enabled else None
+        dispersion = DispersionCorrector(base_lambda=self.variance_inflation) if self.emos_percell else None
         cal_path = log_dir / "shadow" / self.name / "calibration_log.csv"
         return ProbabilityModel(
             calibration_log_path=cal_path,
@@ -54,6 +62,7 @@ class ModelSpec:
             model_weights=self.model_weights,
             variance_inflation=self.variance_inflation,
             variance_inflation_enabled=self.variance_inflation_enabled,
+            dispersion_corrector=dispersion,
             name=self.name,
         )
 
@@ -68,6 +77,8 @@ DEFAULT_SPECS: list[ModelSpec] = [
     ModelSpec("lambda_1_0", variance_inflation=1.0, variance_inflation_enabled=False),
     ModelSpec("lambda_2_5", variance_inflation=2.5),
     ModelSpec("mos_off", variance_inflation=2.0, mos_enabled=False),
+    # The proper per-cell EMOS — the real candidate this harness exists to judge.
+    ModelSpec("emos_percell", variance_inflation=2.0, emos_percell=True),
 ]
 
 
