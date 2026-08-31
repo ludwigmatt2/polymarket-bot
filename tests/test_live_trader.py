@@ -1110,3 +1110,61 @@ class TestFakNoMatchIsBenign:
         with pytest.raises(Exception, match="invalid signature"):
             trader.execute_signal(sig)
         assert trader._is_duplicate(sig) is False
+
+
+# ---------------------------------------------------------------------------
+# Equity-based bankroll + skip-reason logging (Aug 31 2026)
+# ---------------------------------------------------------------------------
+class TestEquityBankroll:
+    def test_open_position_cost_sums_open_only(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        _write_live_trades(trader._log_path, [
+            {"market_id": "a", "size_usd": "10.0", "actual_outcome": "",
+             "resolution_date": "2026-09-01"},                       # open
+            {"market_id": "b", "size_usd": "7.5", "actual_outcome": "",
+             "resolution_date": "2026-09-02"},                       # open
+            {"market_id": "c", "size_usd": "5.0", "actual_outcome": "1",
+             "resolution_date": "2026-08-30", "pnl_usd": "2.0"},     # resolved
+        ])
+        assert trader.open_position_cost() == pytest.approx(17.5)
+
+    def test_equity_bankroll_adds_open_cost_to_free_cash(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        _write_live_trades(trader._log_path, [
+            {"market_id": "a", "size_usd": "40.0", "actual_outcome": "",
+             "resolution_date": "2026-09-01"},
+        ])
+        # $66 free + $40 deployed = $106 equity — the whole point of the fix:
+        # deployed capital keeps counting toward Kelly and the day-exposure cap.
+        assert trader.equity_bankroll(66.0) == pytest.approx(106.0)
+
+    def test_equity_bankroll_equals_free_when_no_open_positions(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        assert trader.equity_bankroll(66.0) == pytest.approx(66.0)
+
+
+class TestSkipLogging:
+    def test_day_cap_full_is_logged(self, tmp_path):
+        # Tiny bankroll so day_cap (bankroll × 0.40) is already exceeded by an
+        # existing open position resolving the SAME day but a DIFFERENT event.
+        trader = _make_trader(tmp_path, bankroll=10.0)  # day_cap = $4
+        sig = _make_signal()
+        res_day = sig.market.resolution_date.date().isoformat()
+        _write_live_trades(trader._log_path, [
+            {"market_id": "other", "size_usd": "9.0", "actual_outcome": "",
+             "resolution_date": res_day, "lat": "1.0", "lon": "1.0",
+             "metric": "temperature_2m_min"},  # different event, same day
+        ])
+        assert trader.execute_signal(sig) is None
+        rows = list(csv.DictReader(open(tmp_path / "live_order_skips.csv")))
+        assert len(rows) == 1
+        assert rows[0]["reason"].startswith("day_cap_full")
+
+    def test_duplicate_is_logged(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        trader._client = _make_mock_client(filled=20.0)
+        sig = _make_signal()
+        trader.execute_signal(sig)          # first fills
+        trader.execute_signal(sig)          # second is a duplicate → skip
+        rows = list(csv.DictReader(open(tmp_path / "live_order_skips.csv")))
+        assert any(r["reason"] == "duplicate" for r in rows)

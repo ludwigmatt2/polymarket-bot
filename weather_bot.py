@@ -302,7 +302,10 @@ def _execute_live_for_user(
         print(f"    – user {uid}: balance ${balance:.2f} too small, live skipped")
         return
     ledger_cap = _user_ledger_cap(user_dir)
-    trader.bankroll_usd = min(balance, ledger_cap) if ledger_cap else balance
+    # Size off total equity (free USDC + open-position cost), not free cash alone,
+    # so deployed capital keeps counting toward Kelly and the day cap (Aug 31 2026).
+    equity = trader.equity_bankroll(balance)
+    trader.bankroll_usd = min(equity, ledger_cap) if ledger_cap else equity
 
     print(f"    user {uid}: LIVE, bankroll=${trader.bankroll_usd:.2f}, "
           f"{len(actionable)} signal(s)")
@@ -970,9 +973,13 @@ def _build_admin_live_trader(paper: PaperTrader, log_dir: Path, bankroll: float)
         derive_and_store_clob_creds(admin_uid)
         live_trader = _build(get_user_creds(admin_uid))
         balance = live_trader.fetch_balance()
-    # Kelly must size on REAL funds, never the CLI default (--bankroll defaults to
-    # 500). Cap to the actual wallet balance — mirrors the per-user fan-out path.
-    live_trader.bankroll_usd = min(live_trader.bankroll_usd, balance)
+    # Kelly must size on REAL equity, never the CLI default (--bankroll defaults
+    # to 500). Total equity = free USDC + cost basis of open positions; sizing off
+    # free cash alone made the bot starve itself of the capital already deployed
+    # (Aug 31 2026). The pre-trade spend guard still reads free USDC, so this can
+    # never overdraw. Cap to equity — mirrors the per-user fan-out path.
+    live_trader.bankroll_usd = min(live_trader.bankroll_usd,
+                                   live_trader.equity_bankroll(balance))
     from weather.config import MAX_LIVE_TRADE_USD, KELLY_FRACTION
     print(f"  Live mode — bankroll=${live_trader.bankroll_usd:.2f}  USDC balance=${balance:.2f}  Kelly={KELLY_FRACTION:.2f}x  max_order=${MAX_LIVE_TRADE_USD:.0f}")
     print()
@@ -1210,7 +1217,9 @@ def main() -> None:
         # fetch (the per-order spendable-balance guard still prevents overdraw).
         if live_trader is not None:
             try:
-                live_trader.bankroll_usd = min(args.bankroll, live_trader.fetch_balance())
+                live_trader.bankroll_usd = min(
+                    args.bankroll,
+                    live_trader.equity_bankroll(live_trader.fetch_balance()))
             except Exception as e:  # noqa: BLE001
                 print(f"  ⚠ bankroll refresh failed ({e}) — keeping "
                       f"${live_trader.bankroll_usd:.2f}", file=sys.stderr)

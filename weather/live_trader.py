@@ -44,6 +44,19 @@ _KILL_HEADERS = [
     "entry_price", "model_p", "edge_pp", "price_cap", "amount_usd", "reason",
 ]
 
+# Signals that pass every gate but never reach the book: execute_signal returns
+# None before submitting (duplicate, one-bin-per-event, day-cap full, sub-$1
+# stake…). None of these wrote a trace anywhere, so the fill rate — and WHY a
+# qualifying signal went untraded — was unmeasurable from the data (Aug 31 2026).
+# Distinct from live_order_kills.csv, which is orders that WERE submitted and
+# filled nothing. Neither file is ever read as a position (no outcome chasing).
+LIVE_SKIPS_LOG = _DATA_DIR / "logs" / "live_order_skips.csv"
+
+_SKIP_HEADERS = [
+    "ts", "market_id", "market_title", "direction",
+    "entry_price", "model_p", "edge_pp", "scan_source", "reason",
+]
+
 # The CLOB reports "your cap crossed nothing on the book" as a 400, not as a
 # 200-with-zero-fill, so the graceful no-fill path in execute_signal never sees
 # it and the exception escapes as a scary ORDER_ISSUE page. A killed FAK moved
@@ -244,6 +257,7 @@ class LiveTrader:
         # the trade log to a temp dir (tests, validate_live_order.py) isolates
         # the kill log with it automatically.
         self._kill_log_path = log_path.parent / LIVE_KILLS_LOG.name
+        self._skip_log_path = log_path.parent / LIVE_SKIPS_LOG.name
         self._idempotency_path = idempotency_path
         self._private_key = private_key
         self._funder_address = funder_address or proxy_address  # accept legacy name
@@ -300,6 +314,31 @@ class LiveTrader:
                 except ValueError:
                     pass
         return total
+
+    def open_position_cost(self) -> float:
+        """USD cost basis of all still-open live positions (sum of size_usd, the
+        actual USD spent). This capital is deployed, not free — fetch_balance()
+        no longer sees it — so a bankroll measured off free USDC alone shrinks as
+        the book fills, throttling Kelly stakes and the day-exposure cap on the
+        very capital that's working. Adding this back gives total equity at cost
+        basis, the correct denominator for sizing (Aug 31 2026)."""
+        total = 0.0
+        for row in self._load_open_live_trades():
+            try:
+                total += float(row.get("size_usd") or 0.0)
+            except ValueError:
+                pass
+        return total
+
+    def equity_bankroll(self, free_balance: float) -> float:
+        """Sizing bankroll = free USDC + open-position cost (total equity at cost
+        basis). Kelly and the day-exposure cap size off THIS, so the bot deploys
+        toward its intended fraction as capital rotates instead of asymptotically
+        starving itself of the cash sitting in open positions. The pre-trade spend
+        guard (execute_signal) still fetches real free USDC, so this never lets an
+        order overdraw — it only changes what fraction we AIM to deploy, not what
+        we can actually spend this instant."""
+        return free_balance + self.open_position_cost()
 
     @classmethod
     def from_creds(cls, creds: dict | None, *, paper_trader, bankroll_usd: float = 0.0,
@@ -383,6 +422,7 @@ class LiveTrader:
             )
 
         if self._is_duplicate(signal):
+            self._log_skip(signal, "duplicate")
             return None
 
         # One bin per event: adjacent buckets of the same temperature ladder are
@@ -392,6 +432,7 @@ class LiveTrader:
         event = self._event_key_of(signal.market.location.lat, signal.market.location.lon,
                                    signal.market.metric, signal.market.resolution_date.isoformat())
         if event in self._events_this_scan or self._has_open_event(event):
+            self._log_skip(signal, "one_bin_per_event")
             return None
 
         # Per-resolution-day exposure cap: the whole book marks in one overnight
@@ -400,6 +441,7 @@ class LiveTrader:
         day_cap = self.bankroll_usd * MAX_DAY_EXPOSURE_PCT
         day_open = self._open_day_exposure(day) + self._day_committed_this_scan.get(day, 0.0)
         if day_open >= day_cap:
+            self._log_skip(signal, f"day_cap_full:{day_open:.2f}/{day_cap:.2f}")
             return None
 
         size_usd = self.kelly_size_usd(signal)
@@ -419,6 +461,7 @@ class LiveTrader:
 
         assert size_usd <= _get_max_trade_usd(), f"kelly_size_usd exceeded cap: {size_usd}"
         if size_usd < 1.0:
+            self._log_skip(signal, f"sub_1_stake:{size_usd:.2f}")
             return None
 
         import math
@@ -442,6 +485,7 @@ class LiveTrader:
                 n_contracts = round(min_size, 2)
                 size_usd = bumped_usd
             else:
+                self._log_skip(signal, f"min_size_over_cap:{bumped_usd:.2f}")
                 return None
 
         # Resolve the CLOB token ID for the direction we're trading
@@ -495,6 +539,7 @@ class LiveTrader:
             if bumped <= _get_max_trade_usd():
                 amount_usd = bumped
         if amount_usd < 1.0:  # CLOB marketable-BUY minimum is $1 notional
+            self._log_skip(signal, f"sub_1_notional:{amount_usd:.2f}")
             return None
 
         # Reserve the idempotency key BEFORE submitting: if the process dies
@@ -944,6 +989,33 @@ class LiveTrader:
             clob_passphrase=self._clob_passphrase,
         )
         return self._client
+
+    def _log_skip(self, signal: Signal, reason: str) -> None:
+        """Record a qualifying signal that never reached the book (execute_signal
+        returned None before submitting). Makes the fill funnel measurable: with
+        per-reason counts we can tell how much of the untraded flow is by design
+        (one-bin-per-event, duplicate) versus a lever worth turning (day-cap full,
+        sub-$1 stake). Observability only — must never break execution."""
+        try:
+            is_new = not self._skip_log_path.exists()
+            self._skip_log_path.parent.mkdir(exist_ok=True)
+            with open(self._skip_log_path, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=_SKIP_HEADERS, extrasaction="ignore")
+                if is_new:
+                    writer.writeheader()
+                writer.writerow({
+                    "ts":           datetime.now(timezone.utc).isoformat(),
+                    "market_id":    signal.market.market_id,
+                    "market_title": signal.market.title[:80],
+                    "direction":    signal.direction,
+                    "entry_price":  round(signal.entry_price, 4),
+                    "model_p":      round(signal.model_p, 4),
+                    "edge_pp":      round(signal.edge_pp, 4),
+                    "scan_source":  getattr(signal, "scan_source", "") or "",
+                    "reason":       reason[:80],
+                })
+        except Exception:  # noqa: BLE001 — observability must never break execution
+            pass
 
     def _log_kill(
         self, signal: Signal, price_cap: float, amount_usd: float, reason: str
