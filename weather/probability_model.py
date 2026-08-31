@@ -135,8 +135,27 @@ class ProbabilityModel:
         calibration_log_path: Path = Path("logs/calibration_log.csv"),
         skill_corrector: "HistoricalSkillCorrector | None" = None,
         model_weights: dict[str, float] | None = None,
+        variance_inflation: float | None = None,
+        variance_inflation_enabled: bool | None = None,
+        name: str = "production",
     ):
         self.calibration_log_path = calibration_log_path
+        # A/B identity: "production" is the live pipeline; shadow challengers carry
+        # their own name so their logs/calibrator/telemetry never mix (see
+        # weather.shadow). Purely a label — no behaviour hangs on it.
+        self.name = name
+        # Variance inflation (EMOS-lite λ) as INSTANCE state, not the module global,
+        # so two models with different λ can be scored on the same forecast in one
+        # process (the whole point of the shadow harness). None → the config default,
+        # so the production construction path is byte-for-byte unchanged.
+        self.variance_inflation = (
+            VARIANCE_INFLATION if variance_inflation is None else variance_inflation
+        )
+        self.variance_inflation_enabled = (
+            VARIANCE_INFLATION_ENABLED
+            if variance_inflation_enabled is None
+            else variance_inflation_enabled
+        )
         # Phase 4: per-model member weights. None → the labeled literature prior.
         self.model_weights = MODEL_WEIGHTS if model_weights is None else model_weights
         # Phase 1 MOS. Auto-load by default: a no-op when historical_skill.json is
@@ -193,8 +212,8 @@ class ProbabilityModel:
         # ensemble underdispersion at the source — tail buckets regain the
         # probability mass reality showed they deserve (raw_p<0.10 resolved YES
         # 34.9% forward). λ=1 is an exact no-op; fit offline (see config).
-        if VARIANCE_INFLATION_ENABLED and VARIANCE_INFLATION != 1.0:
-            lam = VARIANCE_INFLATION
+        if self.variance_inflation_enabled and self.variance_inflation != 1.0:
+            lam = self.variance_inflation
             inflated = {}
             for m, vals in member_arrays.items():
                 if not vals:

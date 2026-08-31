@@ -1,12 +1,15 @@
 """Variance inflation (EMOS-lite, Aug 2026): members widen about their model's
 mean BEFORE clip/pre-image/counting, so tail buckets regain probability mass.
-λ=1 must be an exact no-op; the kill switch must revert to raw behavior."""
+λ=1 must be an exact no-op; the kill switch must revert to raw behavior.
+
+λ is per-INSTANCE state (ProbabilityModel.variance_inflation) so shadow
+challengers can score the same forecast at different λ in one process; these
+tests set it on the model, not the module global."""
 
 from datetime import date
 
 import pytest
 
-from weather import probability_model as pm
 from weather.models import EnsembleForecast
 from weather.probability_model import ProbabilityModel
 
@@ -20,59 +23,56 @@ def _forecast():
     })
 
 
-def _model(tmp_path):
-    return ProbabilityModel(calibration_log_path=tmp_path / "c.csv",
-                            skill_corrector=None)
+def _model(tmp_path, lam=1.0, enabled=True):
+    m = ProbabilityModel(calibration_log_path=tmp_path / "c.csv",
+                         skill_corrector=None,
+                         variance_inflation=lam,
+                         variance_inflation_enabled=enabled)
+    return m
 
 
-def test_lambda_one_is_noop(tmp_path, monkeypatch):
-    m = _model(tmp_path)
-    monkeypatch.setattr(pm, "VARIANCE_INFLATION", 1.0)
+def test_lambda_one_is_noop(tmp_path):
+    m = _model(tmp_path, lam=1.0)
     base = m.compute_probability(_forecast(), 33.0, "above").raw_p
-    monkeypatch.setattr(pm, "VARIANCE_INFLATION_ENABLED", False)
+    m.variance_inflation_enabled = False
     off = m.compute_probability(_forecast(), 33.0, "above").raw_p
     assert base == pytest.approx(off)
 
 
-def test_inflation_widens_tail_probability(tmp_path, monkeypatch):
+def test_inflation_widens_tail_probability(tmp_path):
     # 32.0 sits ~2.5σ above the ~30.1 ensemble mean (members 29-31.2): a real
     # tail bucket the raw ensemble prices at ~0.001 but λ=1.5 lifts to ~0.05 —
     # the exact underdispersion shape seen forward (raw<0.10 resolved 34.9%).
-    m = _model(tmp_path)
-    monkeypatch.setattr(pm, "VARIANCE_INFLATION", 1.0)
+    m = _model(tmp_path, lam=1.0)
     base = m.compute_probability(_forecast(), 32.0, "above").raw_p
-    monkeypatch.setattr(pm, "VARIANCE_INFLATION", 1.5)
+    m.variance_inflation = 1.5
     inflated = m.compute_probability(_forecast(), 32.0, "above").raw_p
     assert inflated > base  # tail bucket gains mass
 
 
-def test_inflation_pulls_central_bucket_down(tmp_path, monkeypatch):
+def test_inflation_pulls_central_bucket_down(tmp_path):
     # A bucket at the ensemble center loses mass when the distribution widens.
-    m = _model(tmp_path)
-    monkeypatch.setattr(pm, "VARIANCE_INFLATION", 1.0)
+    m = _model(tmp_path, lam=1.0)
     base = m.compute_probability(_forecast(), 30.0, "equal").raw_p
-    monkeypatch.setattr(pm, "VARIANCE_INFLATION", 1.5)
+    m.variance_inflation = 1.5
     inflated = m.compute_probability(_forecast(), 30.0, "equal").raw_p
     assert inflated < base
 
 
-def test_kill_switch_reverts(tmp_path, monkeypatch):
-    m = _model(tmp_path)
-    monkeypatch.setattr(pm, "VARIANCE_INFLATION", 1.5)
-    monkeypatch.setattr(pm, "VARIANCE_INFLATION_ENABLED", False)
+def test_kill_switch_reverts(tmp_path):
+    m = _model(tmp_path, lam=1.5, enabled=False)
     off = m.compute_probability(_forecast(), 33.0, "above").raw_p
-    monkeypatch.setattr(pm, "VARIANCE_INFLATION", 1.0)
-    monkeypatch.setattr(pm, "VARIANCE_INFLATION_ENABLED", True)
+    m.variance_inflation = 1.0
+    m.variance_inflation_enabled = True
     base = m.compute_probability(_forecast(), 33.0, "above").raw_p
     assert off == pytest.approx(base)
 
 
-def test_mean_preserved_under_inflation(tmp_path, monkeypatch):
+def test_mean_preserved_under_inflation(tmp_path):
     # Widening is about each model's own mean: P(above ensemble-mean) stays
     # ~0.5 regardless of λ — inflation adds dispersion, never bias.
-    m = _model(tmp_path)
-    monkeypatch.setattr(pm, "VARIANCE_INFLATION", 1.0)
+    m = _model(tmp_path, lam=1.0)
     base = m.compute_probability(_forecast(), 30.1, "above").raw_p
-    monkeypatch.setattr(pm, "VARIANCE_INFLATION", 1.6)
+    m.variance_inflation = 1.6
     inflated = m.compute_probability(_forecast(), 30.1, "above").raw_p
     assert abs(inflated - base) < 0.10
