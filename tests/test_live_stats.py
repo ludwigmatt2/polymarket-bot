@@ -116,11 +116,18 @@ class TestModeDispatch:
 
     def test_wallet_live_shows_real_money(self, monkeypatch):
         monkeypatch.setattr(tb, "get_user_mode", lambda uid: "live")
+        # free_cash (94) + deployed (8) == total_value (102): the card's tree must
+        # sum exactly and must never re-subtract deployed from free cash (the
+        # Aug-30 double-count that showed "Available 86" for 94 of real free cash).
         monkeypatch.setattr(tb, "live_wallet_stats", lambda uid, ls=None: {
             "deposited": 100.0, "withdrawn": 0.0, "deployed": 8.0, "realized_pnl": 2.0,
+            "all_time_realized": 2.0, "free_cash": 94.0, "total_value": 102.0,
             "wallet_balance": 102.0, "available": 94.0, "return_pct": 2.0,
+            "total_return_pct": 2.0, "era_roi": 12.5, "resolved_cost": 16.0,
             "pnl_today": 0.0, "pnl_week": 0.0, "pending_count": 1,
             "onchain_verified": True, "ledger_balance": 102.0,
         })
         out = tb.fmt_wallet(1)
         assert "LIVE (real money)" in out and "real, on-chain" in out
+        assert "Total value" in out and "Free cash" in out and "In positions" in out
+        assert "94" in out and "102" in out  # free cash + total value both surfaced

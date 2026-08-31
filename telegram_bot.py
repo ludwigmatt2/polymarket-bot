@@ -387,6 +387,10 @@ def wallet_stats(uid: int) -> dict:
     wallet_balance = deposited - withdrawn + realized_pnl
     available      = wallet_balance - deployed
     return_pct     = (realized_pnl / deposited * 100) if deposited > 0 else None
+    # Paper's wallet_balance is already total equity (cash + positions at cost), so
+    # its all-in return matches the realized figure when nothing's been withdrawn.
+    # Provided so the shared daily digest can read one key across both modes.
+    total_return_pct = ((wallet_balance - deposited) / deposited * 100) if deposited > 0 else None
 
     today_str  = datetime.utcnow().strftime("%Y-%m-%d")
     week_start = (datetime.utcnow() - timedelta(days=7)).isoformat()
@@ -408,6 +412,7 @@ def wallet_stats(uid: int) -> dict:
         "wallet_balance": wallet_balance,
         "available":     available,
         "return_pct":    return_pct,
+        "total_return_pct": total_return_pct,
         "pnl_today":     pnl_today,
         "pnl_week":      pnl_week,
         "resolved_count": len(resolved),
@@ -594,6 +599,13 @@ def read_live_stats(uid: int) -> dict:
     gross_loss = abs(sum(float(r["pnl_usd"]) for r in losses))
     pf         = gross_win / gross_loss if gross_loss > 0 else None
     total_pnl  = sum(float(r["pnl_usd"]) for r in resolved if r.get("pnl_usd"))
+    # ROI on the capital actually put to work in bets that have SETTLED this era —
+    # the honest "how good is the edge" figure. Denominator is the cost basis of
+    # resolved trades only; open positions haven't returned anything yet, so
+    # including their stake would dilute a real result with undecided bets. This is
+    # a return-on-capital-risked measure, distinct from return_pct (realized PnL
+    # over all-time deposits), which mixes an era numerator with an all-time base.
+    resolved_cost = sum(float(r["size_usd"]) for r in resolved if r.get("size_usd"))
     deployed   = sum(float(r["size_usd"]) for r in rows
                      if not r.get("resolved_at") and r.get("size_usd"))
     today_str  = datetime.utcnow().strftime("%Y-%m-%d")
@@ -612,6 +624,8 @@ def read_live_stats(uid: int) -> dict:
         "profit_factor": pf,
         "total_pnl": total_pnl,
         "all_time_pnl": all_time_pnl,
+        "resolved_cost": resolved_cost,
+        "era_roi": (total_pnl / resolved_cost * 100) if resolved_cost > 0 else None,
         "deployed": deployed,
         "pnl_today": pnl_today,
         "pnl_week": pnl_week,
@@ -665,15 +679,33 @@ def live_wallet_stats(uid: int, ls: dict | None = None) -> dict:
             pass
 
     onchain_verified = onchain_balance is not None
-    balance    = onchain_balance if onchain_verified else ledger_balance
-    available  = balance - deployed
+    # `balance` means different things by source, and conflating them caused the
+    # Aug-30 "Available" double-count. The on-chain read is FREE CASH only (pUSD +
+    # unwrapped USDC.e) — money spent on open positions has already left it, now
+    # held as outcome tokens. The ledger fallback is TOTAL equity (deposits −
+    # withdrawals + all-time PnL) — cash *and* positions-at-cost together. Derive a
+    # consistent (free_cash, total_value) pair so no caller subtracts `deployed`
+    # from a number that already excludes it. (The old bug: 58.75 free cash − 40.60
+    # deployed = 18.15 "available", when all 58.75 was in fact deployable — the
+    # 40.60 was never part of that figure.)
+    if onchain_verified:
+        free_cash   = onchain_balance
+        total_value = onchain_balance + deployed
+    else:
+        total_value = ledger_balance
+        free_cash   = ledger_balance - deployed
+    available  = free_cash
     return_pct = (realized / deposited * 100) if deposited > 0 else None
+    total_return_pct = ((total_value - deposited) / deposited * 100) if deposited > 0 else None
     return {
         "deposited": deposited, "withdrawn": withdrawn,
         "deployed": deployed, "realized_pnl": realized,
+        "all_time_realized": all_time_realized,
         "onchain_verified": onchain_verified, "ledger_balance": ledger_balance,
-        "wallet_balance": balance, "available": available,
-        "return_pct": return_pct,
+        "free_cash": free_cash, "total_value": total_value,
+        "wallet_balance": total_value, "available": available,
+        "return_pct": return_pct, "total_return_pct": total_return_pct,
+        "era_roi": ls.get("era_roi"), "resolved_cost": ls.get("resolved_cost", 0.0),
         "pnl_today": ls.get("pnl_today", 0.0), "pnl_week": ls.get("pnl_week", 0.0),
         "pending_count": ls.get("pending", 0),
     }
@@ -760,19 +792,22 @@ def _fmt_status_live(uid: int) -> str:
                 "scheduled scan.\nFund with /deposit.")
 
     lines = [header + "\n"]
-    if ws["return_pct"] is not None:
-        sign = "+" if ws["return_pct"] >= 0 else ""
-        lines.append(f"📈 *{sign}{ws['return_pct']:.1f}% return*"
-                     f"   (${ws['realized_pnl']:+,.2f} on ${ws['deposited']:,.2f} real)")
+    if ls.get("era_roi") is not None:
+        # ROI on capital actually risked in settled bets this era — the honest edge
+        # measure. (return_pct — era PnL over all-time deposits — mixed timeframes.)
+        sign = "+" if ls["era_roi"] >= 0 else ""
+        lines.append(f"📈 *{sign}{ls['era_roi']:.1f}% ROI this era*"
+                     f"   (${ws['realized_pnl']:+,.2f} on ${ls.get('resolved_cost', 0):,.2f} settled)")
     else:
         lines.append(f"📈 Realized PnL: *${ws['realized_pnl']:+,.2f}*"
-                     f"   _(fund via /deposit to track ROI %)_")
+                     f"   _(no settled trades yet this era)_")
     lines.append(f"\n{ls['resolved']} resolved · {ls['pending']} open · {ls['total']} total")
     if ls["win_rate"] is not None:
         lines.append(f"Win rate:      {ls['win_rate']:.1f}%  ({ls['wins']}W / {ls['losses']}L)")
     if ls["profit_factor"] is not None:
         lines.append(f"Prof. factor:  {ls['profit_factor']:.2f}")
-    lines.append(f"Deployed now:  ${ws['deployed']:,.2f}  ·  Available ${ws['available']:,.2f}")
+    lines.append(f"Free cash: ${ws['free_cash']:,.2f}  ·  In positions ${ws['deployed']:,.2f}"
+                 f"  ·  Total ${ws['total_value']:,.2f}")
     if scan:
         lines.append(f"\nLast scan: {scan['scanned_at']} UTC"
                      f" · {scan['high_conf']} high-conf / {scan['total']} signals")
@@ -879,19 +914,31 @@ def _fmt_wallet_live(uid: int) -> str:
         lines.append(f"Deployed right now:   ${ws['deployed']:,.2f}")
         return "\n".join(lines)
     ret_str = ""
-    if ws["return_pct"] is not None:
-        sign = "+" if ws["return_pct"] >= 0 else ""
-        ret_str = f"  ({sign}{ws['return_pct']:.1f}%)"
+    if ws["total_return_pct"] is not None:
+        sign = "+" if ws["total_return_pct"] >= 0 else ""
+        ret_str = f"  ({sign}{ws['total_return_pct']:.1f}% all-in)"
     balance_tag = "_(verified on-chain)_" if ws["onchain_verified"] else "⚠️ _(couldn't reach chain — ledger estimate)_"
-    lines.append(f"💰 Balance:   *${ws['wallet_balance']:,.2f}*{ret_str}  {balance_tag}")
-    lines.append(f"├─ Deposited  ${ws['deposited']:,.2f}  _(real, on-chain)_")
+    # Tree sums exactly: free cash + positions = total value. No figure is double
+    # counted, and 'Free cash' is the real deployable number (was mis-shown as a
+    # smaller 'Available' that had subtracted the deployed capital twice).
+    lines.append(f"💰 Total value:  *${ws['total_value']:,.2f}*{ret_str}  {balance_tag}")
+    lines.append(f"├─ Free cash     ${ws['free_cash']:,.2f}  _(available to deploy)_")
+    lines.append(f"└─ In positions  ${ws['deployed']:,.2f}  _({ws['pending_count']} open · at cost)_")
+    dep_line = f"\n📥 Deposited:  ${ws['deposited']:,.2f}  _(real, on-chain)_"
     if ws["withdrawn"] > 0:
-        lines.append(f"├─ Withdrawn  -${ws['withdrawn']:,.2f}")
-    lines.append(f"├─ Deployed   ${ws['deployed']:,.2f}  ({ws['pending_count']} open positions)")
-    avail_sign = "+" if ws["available"] >= 0 else ""
-    lines.append(f"└─ Available  {avail_sign}${ws['available']:,.2f}")
+        dep_line += f" · withdrawn ${ws['withdrawn']:,.2f}"
+    lines.append(dep_line)
     lines.append(f"\n📊 *Realized PnL (live)*")
-    lines.append(f"All-time:  *${ws['realized_pnl']:+,.2f}*")
+    era_line = f"This era:  *${ws['realized_pnl']:+,.2f}*"
+    if ws.get("era_roi") is not None:
+        era_line += f"  ({ws['era_roi']:+.1f}% ROI on settled)"
+    lines.append(era_line)
+    # Surface the TRUE all-time realized only when it differs from this era's — a
+    # prior go-live attempt's result lives here and must never be relabelled as the
+    # current era's (Aug-30: the era's +$19.86 was captioned "All-time", hiding a
+    # real all-time of +$9.39 after the Jul attempt's ~-$10 drag).
+    if abs(ws.get("all_time_realized", ws["realized_pnl"]) - ws["realized_pnl"]) > 0.005:
+        lines.append(f"All-time:  ${ws['all_time_realized']:+,.2f}  _(incl. earlier attempts)_")
     if abs(ws["pnl_week"]) > 0:
         lines.append(f"This week: ${ws['pnl_week']:+,.2f}")
     if abs(ws["pnl_today"]) > 0:
@@ -2960,13 +3007,18 @@ def _build_digest(uid: int) -> str | None:
     if ws.get("deposited", 0) <= 0 and not rows:
         return None  # nothing set up for this user yet
 
-    ret = f"{ws['return_pct']:+.1f}%" if ws.get("return_pct") is not None else "—"
+    ret_val = ws.get("total_return_pct")
+    if ret_val is None:
+        ret_val = ws.get("return_pct")
+    ret = f"{ret_val:+.1f}%" if ret_val is not None else "—"
     tag = "🟢 LIVE (real money)" if live else "🧪 PAPER"
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # wallet_balance is total account value (cash + positions), so it equals
+    # Available (free cash) + Deployed — the line reconciles by construction.
     L = [
         f"📊 *Daily Digest* — {today}",
         f"{tag}\n",
-        f"💰 Balance *${ws['wallet_balance']:,.2f}*  ({ret})",
+        f"💰 Total value *${ws['wallet_balance']:,.2f}*  ({ret})",
         f"├ Deposited ${ws['deposited']:,.2f} · Deployed ${ws['deployed']:,.2f}",
         f"└ Available ${ws['available']:,.2f}\n",
         f"📈 *Realized PnL{' (live)' if live else ''}*",
