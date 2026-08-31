@@ -792,12 +792,16 @@ def _fmt_status_live(uid: int) -> str:
                 "scheduled scan.\nFund with /deposit.")
 
     lines = [header + "\n"]
-    if ls.get("era_roi") is not None:
-        # ROI on capital actually risked in settled bets this era — the honest edge
-        # measure. (return_pct — era PnL over all-time deposits — mixed timeframes.)
-        sign = "+" if ls["era_roi"] >= 0 else ""
-        lines.append(f"📈 *{sign}{ls['era_roi']:.1f}% ROI this era*"
-                     f"   (${ws['realized_pnl']:+,.2f} on ${ls.get('resolved_cost', 0):,.2f} settled)")
+    if ls.get("era_roi") is not None and ws.get("return_pct") is not None:
+        # ROI on the capital DEPOSITED into the wallet (Startkapital) this era — the
+        # number that answers "what am I earning on the money I put in". Base is
+        # all-time deposits, not the recycled per-bet stake (resolved_cost): once
+        # capital is reused the cumulative stake exceeds the balance and reads as a
+        # confusing denominator. `era_roi is not None` still gates on "settled trades
+        # exist this era" so an unsettled era shows the fallback line, not +0.0%.
+        sign = "+" if ws["return_pct"] >= 0 else ""
+        lines.append(f"📈 *{sign}{ws['return_pct']:.1f}% ROI this era*"
+                     f"   (${ws['realized_pnl']:+,.2f} on ${ws['deposited']:,.2f} deposited)")
     else:
         lines.append(f"📈 Realized PnL: *${ws['realized_pnl']:+,.2f}*"
                      f"   _(no settled trades yet this era)_")
