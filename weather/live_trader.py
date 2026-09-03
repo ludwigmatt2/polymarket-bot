@@ -20,6 +20,7 @@ from .config import (
     DAILY_LOSS_LIMIT_PCT,
     EDGE_SAFETY_MARGIN_PP,
     KELLY_FRACTION,
+    LIVE_EXCLUDED_METRICS,
     MAX_DAY_EXPOSURE_PCT,
     MAX_LIVE_TRADE_USD,
     MAX_SLIPPAGE,
@@ -423,6 +424,13 @@ class LiveTrader:
 
         if self._is_duplicate(signal):
             self._log_skip(signal, "duplicate")
+            return None
+
+        # Metric exclusion: min-temp resolves off a station reading the grid
+        # forecast systematically misses. Block live money while the paper track
+        # keeps recording, so a fix can be proven before we re-enable.
+        if signal.market.metric in LIVE_EXCLUDED_METRICS:
+            self._log_skip(signal, f"excluded_metric:{signal.market.metric}")
             return None
 
         # One bin per event: adjacent buckets of the same temperature ladder are

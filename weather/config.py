@@ -236,6 +236,17 @@ MOS_METRICS = frozenset({"temperature_2m_max", "temperature_2m_min"})
 # disable the member-shift instantly if that native check ever regresses.
 MOS_ENABLED = True
 
+# ── Live metric exclusion (Sep 2026) ───────────────────────────────────────────
+# Minimum-temperature markets are a structural loser: Polymarket resolves off the
+# resolving AIRPORT STATION's overnight low, but the model forecasts the Open-Meteo
+# grid low — which runs ~1–2 °C colder overnight (tarmac/urban siting hold heat a
+# broad grid cell averages away). The model bets NO on warm min-buckets the station
+# keeps hitting. Live record: min-temp 2/9 win, −$25.95; max-temp 39/65, +$12.46.
+# Excluded from LIVE execution ONLY — the paper track still logs min-temp so a
+# per-station min bias-correction can be validated on the shadow harness before
+# re-enable. Empty set = trade every metric.
+LIVE_EXCLUDED_METRICS = frozenset({"temperature_2m_min"})
+
 # ── Lead-time skill decay ──────────────────────────────────────────────────────
 LEAD_TIME_DECAY_PER_DAY = 0.05   # Shrink model_p 5% per day beyond day-1 toward 0.5
 

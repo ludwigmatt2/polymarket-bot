@@ -325,7 +325,7 @@ class TestFillReconciliation:
         # blocked by the one-bin-per-event cap): min($7, $10 − $7) = $3.
         trader._client = _make_mock_client(filled=8.57)  # ~8.57 sh * 0.35 = $3
         sig_two = _make_signal(market_id="mkt_two", market_p=0.35, model_p=0.65)
-        sig_two.market.metric = "temperature_2m_min"
+        sig_two.market.location = Location(city="Paris", lat=48.85, lon=2.35, timezone="Europe/Paris")
         trader.execute_signal(sig_two)
         amt2 = trader._client.create_and_post_market_order.call_args.args[0].amount
         assert amt2 == pytest.approx(3.0, abs=0.01)
@@ -1004,10 +1004,26 @@ class TestExposureCaps:
         trader._client = _make_mock_client(filled=15.0)
         trader.reset_scan_commitments()
         assert trader.execute_signal(_make_signal(market_id="mkt_a")) is not None
-        # different metric = different event (e.g. the "lowest temp" ladder)
+        # different location = different event (another city's max-temp ladder;
+        # min-temp is excluded from live now, so distinguish by city, not metric)
         sig2 = _make_signal(market_id="mkt_b")
-        sig2.market.metric = "temperature_2m_min"
+        sig2.market.location = Location(city="Paris", lat=48.85, lon=2.35, timezone="Europe/Paris")
         assert trader.execute_signal(sig2) is not None
+
+    def test_excluded_metric_skips_live_order(self, tmp_path, monkeypatch):
+        """A LIVE_EXCLUDED_METRICS signal (min-temp) never places a live order and
+        is logged as excluded_metric — the paper track still records it elsewhere."""
+        import weather.live_trader as lt_mod
+        monkeypatch.setattr(lt_mod, "LIVE_EXCLUDED_METRICS", frozenset({"temperature_2m_min"}))
+        trader = _make_trader(tmp_path)
+        trader._client = _make_mock_client(filled=15.0)
+        trader.reset_scan_commitments()
+        sig = _make_signal(market_id="mkt_min")
+        sig.market.metric = "temperature_2m_min"
+        assert trader.execute_signal(sig) is None
+        trader._client.create_and_post_market_order.assert_not_called()
+        # a non-excluded (max-temp) signal in the same scan still trades
+        assert trader.execute_signal(_make_signal(market_id="mkt_max")) is not None
 
     def test_day_exposure_cap_blocks_new_orders(self, tmp_path):
         trader = _make_trader(tmp_path, bankroll=40.0)  # day cap = 40 × 0.40 = $16
