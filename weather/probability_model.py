@@ -206,9 +206,16 @@ class ProbabilityModel:
         variance_inflation: float | None = None,
         variance_inflation_enabled: bool | None = None,
         dispersion_corrector: "DispersionCorrector | None" = None,
+        calibration_halflife_days: float | None = None,
         name: str = "production",
     ):
         self.calibration_log_path = calibration_log_path
+        # Recency-weighted calibration (Workstream B, `recency_cal` shadow spec).
+        # None → every observation weighted equally, so the fit is byte-identical
+        # to production. A float H weights each obs by 0.5**(age_days/H), so the
+        # current regime dominates and the calibrator tracks seasonal drift instead
+        # of being outvoted by a stale summer-heavy history.
+        self.calibration_halflife_days = calibration_halflife_days
         # A/B identity: "production" is the live pipeline; shadow challengers carry
         # their own name so their logs/calibrator/telemetry never mix (see
         # weather.shadow). Purely a label — no behaviour hangs on it.
@@ -241,6 +248,11 @@ class ProbabilityModel:
         self._calibrators_by_dir: dict[str, Any] = {}             # per-direction
         self._calibration_obs: list[tuple[float, float]] = []     # (model_p, actual) global
         self._calibration_obs_by_dir: dict[str, list[tuple[float, float]]] = {}
+        # Per-obs timestamps, index-aligned with the obs lists above. Only consulted
+        # when calibration_halflife_days is set; always populated (cheap) so the
+        # recency fit has ages available. None marks an obs with an unparseable ts.
+        self._calibration_ts: list["datetime | None"] = []
+        self._calibration_ts_by_dir: dict[str, list["datetime | None"]] = {}
         self.calibration_load_error: str | None = None
         self._load_calibration_data()
 
@@ -407,9 +419,12 @@ class ProbabilityModel:
         Appends to the CSV and refits calibrators when thresholds are reached.
         """
         obs = (model_p, float(actual_outcome))
+        now = datetime.utcnow()
         self._calibration_obs.append(obs)
+        self._calibration_ts.append(now)
         if direction:
             self._calibration_obs_by_dir.setdefault(direction, []).append(obs)
+            self._calibration_ts_by_dir.setdefault(direction, []).append(now)
         self._append_calibration_csv(model_p, actual_outcome, direction)
         n = len(self._calibration_obs)
         if n >= self.MIN_CALIBRATION_OBS and n % self.REFIT_INTERVAL == 0:
@@ -433,11 +448,18 @@ class ProbabilityModel:
         return float(min(max(calibrated, lo), hi))
 
     def _fit_calibrator(self) -> None:
-        """Refit global and per-direction calibrators from current observations."""
-        self._calibrator = _fit_single(self._calibration_obs, self.MIN_CALIBRATION_OBS, self.PLATT_THRESHOLD)
+        """Refit global and per-direction calibrators from current observations.
+
+        When calibration_halflife_days is set, each observation is weighted by
+        0.5**(age_days/halflife) so the current regime dominates the fit."""
+        H = self.calibration_halflife_days
+        gw = _recency_weights(self._calibration_ts, H) if H else None
+        self._calibrator = _fit_single(
+            self._calibration_obs, self.MIN_CALIBRATION_OBS, self.PLATT_THRESHOLD, weights=gw)
         self._calibrators_by_dir = {}
         for d, obs in self._calibration_obs_by_dir.items():
-            c = _fit_single(obs, self.MIN_CALIBRATION_OBS, self.PLATT_THRESHOLD)
+            dw = _recency_weights(self._calibration_ts_by_dir.get(d, []), H) if H else None
+            c = _fit_single(obs, self.MIN_CALIBRATION_OBS, self.PLATT_THRESHOLD, weights=dw)
             if c is not None:
                 self._calibrators_by_dir[d] = c
 
@@ -450,9 +472,12 @@ class ProbabilityModel:
                     p = float(row["model_p"])
                     a = float(row["actual_outcome"])
                     d = row.get("direction", "")
+                    ts = _parse_ts(row.get("logged_at", ""))
                     self._calibration_obs.append((p, a))
+                    self._calibration_ts.append(ts)
                     if d:
                         self._calibration_obs_by_dir.setdefault(d, []).append((p, a))
+                        self._calibration_ts_by_dir.setdefault(d, []).append(ts)
             self._fit_calibrator()
         except Exception as exc:
             self.calibration_load_error = str(exc)
@@ -476,7 +501,29 @@ class ProbabilityModel:
 
 # ── Calibrator helpers ────────────────────────────────────────────────────────
 
-def _fit_single(obs: list[tuple[float, float]], min_obs: int, platt_threshold: int) -> Any | None:
+def _parse_ts(s: str) -> "datetime | None":
+    """Parse a calibration_log `logged_at` (naive UTC isoformat); None if unparseable."""
+    try:
+        return datetime.fromisoformat(s) if s else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _recency_weights(ts_list: list["datetime | None"], halflife_days: float) -> "np.ndarray | None":
+    """Weight each obs by 0.5**(age_days / halflife), age measured from the newest
+    timestamp present. Returns None (→ equal weights) when halflife is non-positive
+    or any timestamp is missing, so a partially-stamped log never silently skews."""
+    if not halflife_days or halflife_days <= 0 or not ts_list or any(t is None for t in ts_list):
+        return None
+    newest = max(ts_list)  # type: ignore[type-var]
+    ages = np.array([(newest - t).total_seconds() / 86400.0 for t in ts_list])  # type: ignore[operator]
+    return np.power(0.5, ages / halflife_days)
+
+
+def _fit_single(
+    obs: list[tuple[float, float]], min_obs: int, platt_threshold: int,
+    weights: "np.ndarray | None" = None,
+) -> Any | None:
     if len(obs) < min_obs:
         return None
     X = np.array([p for p, _ in obs])
@@ -485,12 +532,12 @@ def _fit_single(obs: list[tuple[float, float]], min_obs: int, platt_threshold: i
         if len(obs) < platt_threshold:
             from sklearn.linear_model import LogisticRegression
             lr = LogisticRegression(C=1.0, solver="lbfgs")
-            lr.fit(X.reshape(-1, 1), y)
+            lr.fit(X.reshape(-1, 1), y, sample_weight=weights)
             return lr
         else:
             from sklearn.isotonic import IsotonicRegression
             ir = IsotonicRegression(out_of_bounds="clip")
-            ir.fit(X, y)
+            ir.fit(X, y, sample_weight=weights)
             return ir
     except Exception as exc:
         _log.warning("Calibrator fit failed: %s", exc)
