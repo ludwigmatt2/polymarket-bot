@@ -46,6 +46,7 @@ class ModelSpec:
     mos_enabled: bool = True
     emos_percell: bool = False
     model_weights: dict[str, float] | None = None
+    calibration_halflife_days: float | None = None
 
     def build_model(self, log_dir: Path) -> ProbabilityModel:
         """Construct an isolated ProbabilityModel for this spec. MOS off ⇒ no
@@ -63,6 +64,7 @@ class ModelSpec:
             variance_inflation=self.variance_inflation,
             variance_inflation_enabled=self.variance_inflation_enabled,
             dispersion_corrector=dispersion,
+            calibration_halflife_days=self.calibration_halflife_days,
             name=self.name,
         )
 
@@ -79,6 +81,10 @@ DEFAULT_SPECS: list[ModelSpec] = [
     ModelSpec("mos_off", variance_inflation=2.0, mos_enabled=False),
     # The proper per-cell EMOS — the real candidate this harness exists to judge.
     ModelSpec("emos_percell", variance_inflation=2.0, emos_percell=True),
+    # Recency-weighted calibrator (Workstream B): 30-day half-life so the calibrator
+    # tracks the current regime instead of being outvoted by a stale summer history.
+    # The candidate for the summer→autumn calibration drift (Sep 2026).
+    ModelSpec("recency_cal", variance_inflation=2.0, calibration_halflife_days=30.0),
 ]
 
 
