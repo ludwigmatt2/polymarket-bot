@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import csv
 import json
+import sys
 import time
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -21,6 +22,7 @@ from .config import (
     EDGE_SAFETY_MARGIN_PP,
     KELLY_FRACTION,
     LIVE_EXCLUDED_METRICS,
+    LIVE_GATE_LATCHES,
     MAX_DAY_EXPOSURE_PCT,
     MAX_LIVE_TRADE_USD,
     MAX_SLIPPAGE,
@@ -259,6 +261,9 @@ class LiveTrader:
         # the kill log with it automatically.
         self._kill_log_path = log_path.parent / LIVE_KILLS_LOG.name
         self._skip_log_path = log_path.parent / LIVE_SKIPS_LOG.name
+        # Go-live gate latch (see is_unlocked): once the entry gate passes, this
+        # file is written and live stays unlocked regardless of later paper dips.
+        self._latch_path = log_path.parent / "live_gate_latch.json"
         self._idempotency_path = idempotency_path
         self._private_key = private_key
         self._funder_address = funder_address or proxy_address  # accept legacy name
@@ -361,7 +366,32 @@ class LiveTrader:
         )
 
     def is_unlocked(self) -> bool:
-        return self.paper_trader.compute_stats().ready_for_live
+        """Go-live gate. It qualifies ENTRY into live, then latches open.
+
+        With LIVE_GATE_LATCHES, the first time the paper stats clear the bar the
+        unlock is written to `_latch_path`; from then on live stays unlocked even
+        if stats later dip below the bar — a proven bot isn't leashed by a
+        temporary drawdown (the daily-loss kill switch is the live-side backstop).
+        With the flag off, the gate is re-evaluated every call (original behaviour).
+        """
+        if LIVE_GATE_LATCHES and self._latch_path.exists():
+            return True
+        ready = self.paper_trader.compute_stats().ready_for_live
+        if ready and LIVE_GATE_LATCHES and not self._latch_path.exists():
+            self._write_latch()
+        return ready
+
+    def _write_latch(self) -> None:
+        """Persist the one-time go-live unlock. Best-effort — a write failure must
+        never block trading (is_unlocked already returned ready=True)."""
+        try:
+            self._latch_path.parent.mkdir(parents=True, exist_ok=True)
+            self._latch_path.write_text(json.dumps({
+                "unlocked_at": datetime.now(timezone.utc).isoformat(),
+                "note": "Go-live entry gate passed; live stays unlocked (LIVE_GATE_LATCHES).",
+            }))
+        except Exception as e:  # noqa: BLE001 — latch is an optimization, not a gate
+            print(f"  ⚠️  live-gate latch write failed (non-fatal): {e}", file=sys.stderr)
 
     def daily_pnl(self) -> float:
         """Sum of live PnL RESOLVED today (UTC date). Kill switch reads this.

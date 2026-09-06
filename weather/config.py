@@ -199,6 +199,13 @@ MAX_CALIBRATION_SHIFT = 0.25
 # beyond small deliberate tests — these are not the calibrated thresholds.
 GATE_MIN_STATION_RESOLVED = 90
 GATE_MIN_DAYS_ELAPSED = 14
+# The go-live gate is an ENTRY qualifier — prove edge on paper before risking real
+# money — NOT a permanent live leash. Once it has EVER passed, live stays unlocked
+# even if paper stats later dip below the bar (a temporary PF drawdown must not halt
+# an already-proven bot). The unlock is latched per-user to live_gate_latch.json in
+# the trade-log dir. The per-day loss kill switch (DAILY_LOSS_LIMIT_PCT) remains the
+# live-side backstop. False = original behaviour (re-check the gate every scan).
+LIVE_GATE_LATCHES = True
 # Era boundary: only trades SIGNALED after this instant count for the gate.
 # A validation record must measure ONE system (the Jul-9 lesson). Set to the
 # actual Phase-1+2 deploy instant (service restarted 2026-08-06 ~12:27 UTC on
