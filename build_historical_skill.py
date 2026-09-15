@@ -33,6 +33,7 @@ import csv
 import json
 import statistics
 import sys
+import time
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -63,6 +64,9 @@ LEADS = [1, 2, 3, 4, 5]
 # (skill metric → how a daily value is reduced from hourly temperature_2m)
 TEMP_METRICS = {"temperature_2m_max": max, "temperature_2m_min": min}
 START_DATE = date(2024, 1, 1)   # Previous Runs retention floor
+# A rebuild may not replace the live table with less than this fraction of its
+# current coverage — see the degenerate-write guard in main().
+MIN_REBUILD_COVERAGE = 0.9
 
 
 # ── Pure logic (unit-tested, no network) ────────────────────────────────────────
@@ -228,6 +232,31 @@ def _load_cities() -> list[dict]:
     return cities
 
 
+def _get_with_backoff(url: str, params: dict, *, attempts: int = 5):
+    """GET with exponential backoff on 429/5xx.
+
+    Open-Meteo rate-limits per minute. The rebuild fires two multi-year requests per
+    city back to back with no pacing, so an unlucky start (or a validate-only run
+    immediately before, as the systemd unit does) 429s on EVERY city — a whole-table
+    failure from a transient limit. Sep 15 2026: that happened and the run still
+    exited 0, writing an empty table over the live one.
+    """
+    delay = 5.0
+    for attempt in range(1, attempts + 1):
+        r = requests.get(url, params=params, timeout=OPEN_METEO_REQUEST_TIMEOUT * 4)
+        if r.status_code != 429 and r.status_code < 500:
+            r.raise_for_status()
+            return r
+        if attempt == attempts:
+            r.raise_for_status()
+        wait = float(r.headers.get("Retry-After") or delay)
+        print(f"      rate-limited ({r.status_code}), retry {attempt}/{attempts - 1} in {wait:.0f}s",
+              flush=True)
+        time.sleep(wait)
+        delay = min(delay * 2, 120.0)
+    raise RuntimeError("unreachable")
+
+
 def _fetch_previous_runs(lat: float, lon: float, start: date, end: date) -> tuple[list[str], dict[int, list]]:
     """Hourly temperature_2m_previous_day1..5 over [start,end]. Returns (times, {lead: hourly_values})."""
     hourly_vars = ",".join(f"temperature_2m_previous_day{l}" for l in LEADS)
@@ -235,8 +264,7 @@ def _fetch_previous_runs(lat: float, lon: float, start: date, end: date) -> tupl
         "latitude": lat, "longitude": lon, "hourly": hourly_vars,
         "start_date": start.isoformat(), "end_date": end.isoformat(), "timezone": "auto",
     }
-    r = requests.get(OPEN_METEO_PREVIOUS_RUNS_URL, params=params, timeout=OPEN_METEO_REQUEST_TIMEOUT * 4)
-    r.raise_for_status()
+    r = _get_with_backoff(OPEN_METEO_PREVIOUS_RUNS_URL, params)
     h = r.json().get("hourly", {})
     times = h.get("time", [])
     by_lead = {l: h.get(f"temperature_2m_previous_day{l}", []) for l in LEADS}
@@ -250,8 +278,7 @@ def _fetch_archive_daily(lat: float, lon: float, start: date, end: date) -> dict
         "daily": "temperature_2m_max,temperature_2m_min",
         "start_date": start.isoformat(), "end_date": end.isoformat(), "timezone": "auto",
     }
-    r = requests.get(OPEN_METEO_ARCHIVE_URL, params=params, timeout=OPEN_METEO_REQUEST_TIMEOUT * 4)
-    r.raise_for_status()
+    r = _get_with_backoff(OPEN_METEO_ARCHIVE_URL, params)
     d = r.json().get("daily", {})
     times = d.get("time", [])
     out = {}
@@ -316,6 +343,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Build historical forecast-skill (MOS) table")
     ap.add_argument("--max-cities", type=int, default=0, help="limit cities (smoke test)")
     ap.add_argument("--validate-only", action="store_true", help="don't write JSON, just report MAE reduction")
+    ap.add_argument("--allow-shrink", action="store_true",
+                    help="permit writing a table with fewer entries than the live one "
+                         "(normally refused — a shrunk table means targets failed)")
     ap.add_argument("--fail-on-no-ship", action="store_true",
                     help="with --validate-only, exit non-zero if no metric beats flat "
                          "bias by >1%% (lets a scheduled rebuild gate on the verdict)")
@@ -347,11 +377,13 @@ def main() -> None:
     # per-metric list of per-target error structs {lead:{month:[errs]}} for validation
     city_structs: dict[str, list] = defaultdict(list)
 
+    n_failed = 0
     for i, tgt in enumerate(targets, 1):
         try:
             entry, errors = build(tgt)
         except Exception as exc:
             print(f"  [{i}/{len(targets)}] {tgt['label']:<14} FAILED: {exc}")
+            n_failed += 1
             continue
         table[_city_key(entry["lat"], entry["lon"])] = entry
         for metric, errs in errors.items():
@@ -392,6 +424,31 @@ def main() -> None:
         ):
             sys.exit("no metric beat flat bias by >1% — refusing to ship this table")
         return
+
+    # ── Degenerate-write guard ───────────────────────────────────────────────────
+    # This table feeds live trading decisions. On 2026-09-15 a transient Open-Meteo
+    # 429 storm failed all 15 cities, and the run wrote `{}` over a good 30-city
+    # table and exited 0 — the live model silently lost its MOS. Never again: a
+    # rebuild that lost targets is a FAILED rebuild, not a smaller table.
+    #
+    # --fail-on-no-ship gates on FIT QUALITY (is the correction any good) and is a
+    # separate question from this, which gates on COVERAGE (did we actually get the
+    # data). The 429 storm passed the quality gate vacuously, with zero cities.
+    if n_failed:
+        print(f"\n{n_failed}/{len(targets)} targets FAILED to build.")
+    if not table:
+        sys.exit("refusing to write an EMPTY skill table — every target failed "
+                 "(transient rate-limit or network outage; rerun later)")
+    existing = {}
+    if SKILL_PATH.exists():
+        try:
+            existing = json.loads(SKILL_PATH.read_text())
+        except (OSError, ValueError):
+            existing = {}
+    if existing and not args.allow_shrink and len(table) < len(existing) * MIN_REBUILD_COVERAGE:
+        sys.exit(f"refusing to shrink the live skill table from {len(existing)} to "
+                 f"{len(table)} entries ({n_failed} target(s) failed). Rerun when the "
+                 f"upstream is healthy, or pass --allow-shrink if the loss is intended.")
 
     SKILL_PATH.parent.mkdir(parents=True, exist_ok=True)
     SKILL_PATH.write_text(json.dumps(table, indent=2))

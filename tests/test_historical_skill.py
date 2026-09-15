@@ -78,3 +78,76 @@ def test_correction_levels_flat_suffices_when_bias_is_constant():
     struct = {1: {m: [3.0, 3.1, 2.9, 3.0] * 10 for m in (6, 7, 8)}}
     lv = validate_correction_levels([struct], min_cell=10)
     assert abs(lv["seasonal_vs_flat_pct"]) < 5  # negligible difference
+
+
+# ── Degenerate-write guard ────────────────────────────────────────────────────
+# 2026-09-15: a transient Open-Meteo 429 storm failed all 15 cities and the run
+# wrote {} over a good 30-city table, then exited 0 — the live model silently lost
+# its MOS. These pin the guard that makes a lossy rebuild a FAILURE, not a smaller
+# table. Driven through main() because the bug was in the write path, not the fit.
+
+import json
+import sys
+from unittest.mock import patch
+
+import build_historical_skill as bhs
+
+
+def _run_main(tmp_path, monkeypatch, built, existing=None, argv=()):
+    """Drive main() with the network stubbed to yield `built` targets."""
+    skill = tmp_path / "historical_skill.json"
+    if existing is not None:
+        skill.write_text(json.dumps(existing))
+    monkeypatch.setattr(bhs, "SKILL_PATH", skill)
+    monkeypatch.setattr(bhs, "_load_cities",
+                        lambda: [{"city": f"c{i}", "lat": float(i), "lon": float(i)}
+                                 for i in range(len(built))])
+
+    def fake_build(tgt):
+        entry = built[int(tgt["city"][1:])]
+        if entry is None:
+            raise RuntimeError("429 Client Error: Too Many Requests")
+        return entry, {}
+
+    monkeypatch.setattr(bhs, "build_city", lambda t, s, e: fake_build(t))
+    monkeypatch.setattr(sys, "argv", ["build_historical_skill.py", *argv])
+    return skill
+
+
+def _entry(i):
+    return {"city": f"c{i}", "lat": float(i), "lon": float(i), "metrics": {}}
+
+
+def test_refuses_to_write_an_empty_table(tmp_path, monkeypatch):
+    """Every target failed — the 429-storm shape. Must not touch the live table."""
+    good = {"k1": {"city": "keep"}}
+    skill = _run_main(tmp_path, monkeypatch, [None, None, None], existing=good)
+    with pytest.raises(SystemExit) as e:
+        bhs.main()
+    assert "EMPTY" in str(e.value)
+    assert json.loads(skill.read_text()) == good      # live table untouched
+
+
+def test_refuses_to_shrink_the_live_table(tmp_path, monkeypatch):
+    """Partial failure is still a failed rebuild: 1 of 3 cities is not a table."""
+    existing = {f"k{i}": {"city": f"c{i}"} for i in range(3)}
+    skill = _run_main(tmp_path, monkeypatch, [_entry(0), None, None], existing=existing)
+    with pytest.raises(SystemExit) as e:
+        bhs.main()
+    assert "shrink" in str(e.value)
+    assert len(json.loads(skill.read_text())) == 3
+
+
+def test_allow_shrink_overrides_the_guard(tmp_path, monkeypatch):
+    existing = {f"k{i}": {"city": f"c{i}"} for i in range(3)}
+    skill = _run_main(tmp_path, monkeypatch, [_entry(0), None, None],
+                      existing=existing, argv=["--allow-shrink"])
+    bhs.main()
+    assert len(json.loads(skill.read_text())) == 1
+
+def test_full_rebuild_writes_normally(tmp_path, monkeypatch):
+    existing = {f"k{i}": {"city": f"c{i}"} for i in range(3)}
+    skill = _run_main(tmp_path, monkeypatch, [_entry(0), _entry(1), _entry(2)],
+                      existing=existing)
+    bhs.main()
+    assert len(json.loads(skill.read_text())) == 3
