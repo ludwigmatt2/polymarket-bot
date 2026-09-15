@@ -49,7 +49,13 @@ from weather.config import (
 
 from weather.paths import DATA_DIR
 
-CITY_BIAS_CSV = Path("logs/city_bias.csv")
+# Both sides of the rebuild live on the data volume (DATA_DIR/logs). The city list
+# used to be a bare relative Path("logs/…"), which resolved against the CWD — so on
+# the VPS, where DATA_DIR is /opt/polymarket-bot/data, the rebuild wrote its table to
+# data/logs/ but looked for its INPUT in the stale repo-root logs/ and died with
+# "city_bias.csv not found". The table has not been rebuilt since 2026-07-08 for
+# exactly this reason.
+CITY_BIAS_CSV = DATA_DIR / "logs" / "city_bias.csv"
 # Write to the data volume (DATA_DIR/logs) — the same place the corrector reads.
 SKILL_PATH = DATA_DIR / HISTORICAL_SKILL_PATH
 
@@ -210,7 +216,8 @@ def validate_correction_levels(
 
 def _load_cities() -> list[dict]:
     if not CITY_BIAS_CSV.exists():
-        sys.exit("logs/city_bias.csv not found — needed for the city list.")
+        sys.exit(f"{CITY_BIAS_CSV} not found — needed for the city list. "
+                 "Set RAILWAY_VOLUME_MOUNT_PATH if the data volume is elsewhere.")
     seen, cities = set(), []
     for row in csv.DictReader(open(CITY_BIAS_CSV)):
         key = (round(float(row["lat"]), 2), round(float(row["lon"]), 2))
@@ -309,6 +316,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Build historical forecast-skill (MOS) table")
     ap.add_argument("--max-cities", type=int, default=0, help="limit cities (smoke test)")
     ap.add_argument("--validate-only", action="store_true", help="don't write JSON, just report MAE reduction")
+    ap.add_argument("--fail-on-no-ship", action="store_true",
+                    help="with --validate-only, exit non-zero if no metric beats flat "
+                         "bias by >1%% (lets a scheduled rebuild gate on the verdict)")
     ap.add_argument("--stations", action="store_true",
                     help="Phase 2: build station-keyed MOS from IEM actuals (merged into existing table)")
     ap.add_argument("--start", default=START_DATE.isoformat())
@@ -373,6 +383,14 @@ def main() -> None:
 
     if args.validate_only:
         print("\n(validate-only: JSON not written)")
+        # Exit non-zero when nothing earned SHIP, so an automated rebuild can gate
+        # on this (deploy/systemd/pmbot-mos-rebuild.service runs it as ExecStartPre).
+        # Off by default: a human running --validate-only wants the report, not a
+        # failing shell.
+        if args.fail_on_no_ship and not any(
+            (v.get("seasonal_vs_flat_pct") or 0.0) > 1.0 for v in ship.values()
+        ):
+            sys.exit("no metric beat flat bias by >1% — refusing to ship this table")
         return
 
     SKILL_PATH.parent.mkdir(parents=True, exist_ok=True)

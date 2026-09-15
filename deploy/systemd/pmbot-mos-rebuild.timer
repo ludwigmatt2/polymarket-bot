@@ -1,0 +1,14 @@
+[Unit]
+Description=Weekly polymarket-bot MOS skill-table rebuild
+
+[Timer]
+# Sunday 04:10 UTC — after the nightly backup (03:20) so a failed rebuild is
+# always recoverable from a snapshot taken before it, and off the hourly scan
+# boundary. The table only needs to track the season, so weekly is ample.
+OnCalendar=Sun *-*-* 04:10:00
+RandomizedDelaySec=20m
+# Don't silently skip a week because the VPS was down at 04:10.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

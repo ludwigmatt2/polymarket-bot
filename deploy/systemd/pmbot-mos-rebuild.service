@@ -1,0 +1,31 @@
+[Unit]
+Description=polymarket-bot MOS skill-table rebuild (seasonal refresh)
+Documentation=file:/opt/polymarket-bot/docs/PHASE2_PRICE_FLOOR_PLAN.md
+
+[Service]
+Type=oneshot
+User=bot
+Group=bot
+WorkingDirectory=/opt/polymarket-bot
+# The scan resolves DATA_DIR from this; without it the rebuild reads and writes
+# the repo root instead of the data volume and the running bot never sees the
+# new table. Same variable the main service gets from its EnvironmentFile.
+Environment=RAILWAY_VOLUME_MOUNT_PATH=/opt/polymarket-bot/data
+
+# Validate first: --validate-only writes nothing and reports MAE reduction. If the
+# rebuild would make the table WORSE, this fails and the ExecStart below never runs,
+# so a bad fit can't silently replace a good table. Check `journalctl -u
+# pmbot-mos-rebuild` for the MAE line before trusting a refresh.
+ExecStartPre=/opt/polymarket-bot/venv/bin/python build_historical_skill.py --validate-only --fail-on-no-ship
+
+# Keep the table that is currently feeding live decisions, timestamped, so a bad
+# rebuild is one `cp` away from being undone.
+ExecStartPre=/bin/sh -c 'test ! -f data/logs/historical_skill.json || cp -a data/logs/historical_skill.json "data/logs/historical_skill.json.pre_rebuild_$(date -u +%%Y%%m%%d-%%H%%M%%S).bak"'
+
+ExecStart=/opt/polymarket-bot/venv/bin/python build_historical_skill.py
+
+# A rebuild hits the Open-Meteo archive for every city; it is background work and
+# must never compete with the scan that places real orders.
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=3h
