@@ -109,3 +109,57 @@ def test_tracker_never_raises_on_bad_signal(tmp_path):
 def test_default_roster_present():
     names = [s.name for s in DEFAULT_SPECS]
     assert "prod_mirror" in names and "lambda_1_0" in names
+
+
+# ── Calibrator warm-start (T2) ────────────────────────────────────────────────
+# A cold shadow calibrator is not a model difference, it's an artifact: it made
+# prod_mirror diverge from production by a mean 0.061 in model_p (Sep 2026) and
+# so made every challenger incomparable to production. New tracks warm-start
+# from production's calibration_log instead.
+
+def _write_prod_cal(log_dir, n=3):
+    log_dir.mkdir(parents=True, exist_ok=True)
+    p = log_dir / "calibration_log.csv"
+    with open(p, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["logged_at", "model_p", "actual_outcome", "direction"])
+        w.writeheader()
+        for i in range(n):
+            w.writerow({"logged_at": f"2026-09-0{i + 1}T00:00:00",
+                        "model_p": 0.4 + i / 100, "actual_outcome": i % 2, "direction": "YES"})
+    return p
+
+
+def test_new_track_seeds_calibration_from_production(tmp_path):
+    src = _write_prod_cal(tmp_path)
+    ShadowTracker([ModelSpec("fresh")], client=MagicMock(), log_dir=tmp_path)
+    seeded = tmp_path / "shadow" / "fresh" / "calibration_log.csv"
+    assert seeded.exists()
+    assert seeded.read_text() == src.read_text()
+
+
+def test_seeding_never_overwrites_accrued_history(tmp_path):
+    """Seeding is once-per-track. A second construction (every process restart)
+    must not clobber calibration the track has since learned for itself."""
+    _write_prod_cal(tmp_path)
+    ShadowTracker([ModelSpec("fresh")], client=MagicMock(), log_dir=tmp_path)
+    seeded = tmp_path / "shadow" / "fresh" / "calibration_log.csv"
+    seeded.write_text(seeded.read_text() + "2026-09-09T00:00:00,0.77,1,NO\n")
+    after = seeded.read_text()
+    ShadowTracker([ModelSpec("fresh")], client=MagicMock(), log_dir=tmp_path)
+    assert seeded.read_text() == after
+
+
+def test_seeding_is_a_noop_without_a_production_log(tmp_path):
+    """Fresh install, nothing to warm-start from — must not crash the scan."""
+    ShadowTracker([ModelSpec("fresh")], client=MagicMock(), log_dir=tmp_path)
+    assert not (tmp_path / "shadow" / "fresh" / "calibration_log.csv").exists()
+
+
+def test_seeded_obs_reach_the_track_calibrator(tmp_path):
+    """The point of seeding: the model actually LOADS the warm-start rows, so a
+    challenger starts from production's p→outcome mapping rather than empty."""
+    _write_prod_cal(tmp_path, n=5)
+    tracker = ShadowTracker([ModelSpec("fresh", mos_enabled=False)],
+                            client=MagicMock(), log_dir=tmp_path)
+    _, gen, _ = tracker.tracks[0]
+    assert gen.model.n_calibration_obs == 5

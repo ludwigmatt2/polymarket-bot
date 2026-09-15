@@ -73,6 +73,44 @@ def _stats(rows: list[dict]) -> dict | None:
     }
 
 
+# Above this mean |Δ model_p| between production and prod_mirror, the mirror is a
+# different model rather than a reproduction and the baseline can't be trusted.
+# Real divergence measured Sep 2026 (cold shadow calibrators) was 0.061.
+FAITHFUL_MAX_DP = 0.02
+
+
+def _faithfulness(paths: dict[str, Path], since: str) -> dict | None:
+    """How closely prod_mirror reproduces production on the markets BOTH scored.
+
+    The harness is only trustworthy if its baseline is faithful; prod_mirror
+    exists for exactly that check (see weather/shadow.py DEFAULT_SPECS). This
+    surfaces the drift automatically instead of leaving it to be noticed by hand.
+    Returns None when either track is missing or they share no resolved market.
+    """
+    if "production" not in paths or "prod_mirror" not in paths:
+        return None
+
+    def _by_market(p: Path) -> dict[str, dict]:
+        out: dict[str, dict] = {}
+        for r in _load(p, since):
+            if r.get("actual_outcome") in ("0", "1") and _num(r.get("model_p")) is not None:
+                out.setdefault(r.get("market_id", ""), r)
+        return out
+
+    prod, mirror = _by_market(paths["production"]), _by_market(paths["prod_mirror"])
+    shared = set(prod) & set(mirror)
+    if not shared:
+        return None
+    deltas = [abs(_num(prod[m]["model_p"]) - _num(mirror[m]["model_p"])) for m in shared]
+    return {
+        "shared": len(shared),
+        "mean_dp": sum(deltas) / len(deltas),
+        "max_dp": max(deltas),
+        "prod_only": len(set(prod) - set(mirror)),
+        "mirror_only": len(set(mirror) - set(prod)),
+    }
+
+
 def _load(path: Path, since: str) -> list[dict]:
     if not path.exists():
         return []
@@ -88,14 +126,46 @@ def main() -> None:
     args = ap.parse_args()
     log_dir = Path(args.log_dir)
 
-    tracks: list[tuple[str, Path]] = [("production", log_dir / "paper_trades.csv")]
+    # Fail loudly on a wrong log dir. DATA_DIR falls back to the repo root unless
+    # RAILWAY_VOLUME_MOUNT_PATH is set — the systemd unit sets it via EnvironmentFile,
+    # but a hand-run `sudo -u bot venv/bin/python` does NOT, so this used to read an
+    # empty /opt/polymarket-bot/logs and print "no resolved trades yet" for every
+    # track. That reads as "nothing is running" when everything is fine.
+    prod_log = log_dir / "paper_trades.csv"
+    if not prod_log.exists():
+        sys.exit(
+            f"No paper_trades.csv under {log_dir}\n"
+            "  The log dir is DATA_DIR/logs, and DATA_DIR falls back to the repo root\n"
+            "  unless RAILWAY_VOLUME_MOUNT_PATH is set. On the VPS run:\n"
+            "    sudo -u bot env RAILWAY_VOLUME_MOUNT_PATH=/opt/polymarket-bot/data \\\n"
+            "      venv/bin/python scripts/compare_tracks.py\n"
+            "  or pass --log-dir explicitly."
+        )
+
+    tracks: list[tuple[str, Path]] = [("production", prod_log)]
     shadow_root = log_dir / "shadow"
     if shadow_root.is_dir():
         for d in sorted(shadow_root.iterdir()):
             if (d / "paper_trades.csv").exists():
                 tracks.append((d.name, d / "paper_trades.csv"))
+    else:
+        print(f"warning: no shadow/ under {log_dir} — showing production only. "
+              "Shadow tracks need SHADOW_TRACKS_ENABLED=1 on the service.\n",
+              file=sys.stderr)
 
     print(f"Track comparison — signals since {args.since}\n")
+
+    fid = _faithfulness(dict(tracks), args.since)
+    if fid and fid["mean_dp"] > FAITHFUL_MAX_DP:
+        print(f"!! prod_mirror has DRIFTED from production: mean |Δ model_p| "
+              f"{fid['mean_dp']:.3f} (max {fid['max_dp']:.3f}) over {fid['shared']} "
+              f"shared markets; {fid['mirror_only']} markets it traded and production "
+              f"did not, {fid['prod_only']} the reverse.\n"
+              f"   prod_mirror's job is to REPRODUCE production, so while this holds "
+              f"the challenger columns below\n"
+              f"   are comparable to each other but NOT to production — do not promote "
+              f"anything off them.\n", file=sys.stderr)
+
     header = f"{'track':<16}{'n':>5}{'WR':>7}{'PF':>7}{'PnL':>10}{'mBrier':>9}{'mktBrier':>10}  skill"
     print(header)
     print("-" * len(header))

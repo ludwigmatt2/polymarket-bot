@@ -22,6 +22,7 @@ forward confirms them (see [[equity_bankroll_and_skip_funnel]] session).
 
 from __future__ import annotations
 
+import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -88,6 +89,43 @@ DEFAULT_SPECS: list[ModelSpec] = [
 ]
 
 
+def _seed_calibration_log(log_dir: Path, track_dir: Path) -> bool:
+    """Warm-start a NEW track's calibrator from production's calibration_log.
+
+    Without this a shadow track starts cold, and a cold calibrator is not a
+    model difference — it's an artifact. It made prod_mirror, whose whole job is
+    to reproduce production, diverge by a mean 0.061 in model_p (max 0.259) and
+    trade 66 markets production never saw (Sep 2026). While that holds, no
+    challenger result can be read against production, which is the comparison
+    that decides a promotion.
+
+    Honest caveat: the seeded rows carry PRODUCTION's model_p against real
+    outcomes, not the challenger's. For prod_mirror that is exact. For a genuine
+    challenger it is a warm start — its calibrator begins from production's
+    p→outcome mapping and diverges as its own resolutions accrue. That is the
+    intended behaviour: a challenger should have to earn its way off the
+    production prior, not be handicapped by an empty one. recency_cal still
+    expresses its hypothesis, because it re-weights the same seeded history by age
+    (and a 30-day half-life is meaningless on a log that starts today).
+
+    Only seeds when the track has no calibration_log yet, so it happens once per
+    track and never rewrites accrued history. Returns True if it seeded.
+    """
+    dest = track_dir / "calibration_log.csv"
+    if dest.exists():
+        return False
+    src = log_dir / "calibration_log.csv"
+    if not src.exists():
+        return False
+    try:
+        shutil.copyfile(src, dest)
+        return True
+    except OSError as e:  # noqa: BLE001 — a shadow must never break the scan
+        print(f"  [shadow] calibration seed failed for {track_dir.name}: {e}",
+              file=sys.stderr)
+        return False
+
+
 class ShadowTracker:
     """Runs a roster of challenger models over each scan's production forecasts
     and logs each track's own qualifying signals. Built once per process and
@@ -102,6 +140,7 @@ class ShadowTracker:
             # don't build nested parents themselves.
             track_dir = log_dir / "shadow" / spec.name
             track_dir.mkdir(parents=True, exist_ok=True)
+            _seed_calibration_log(log_dir, track_dir)
             model = spec.build_model(log_dir)
             gen = SignalGenerator(model, client)
             paper = PaperTrader(log_path=track_dir / "paper_trades.csv")
