@@ -254,6 +254,28 @@ MOS_ENABLED = True
 # re-enable. Empty set = trade every metric.
 LIVE_EXCLUDED_METRICS = frozenset({"temperature_2m_min"})
 
+# ── Live price floor (Sep 2026) ────────────────────────────────────────────────
+# Cheap contracts are a structural loser, the same shape as the min-temp leak: the
+# model systematically overprices a region the market prices correctly. The ensemble
+# tail is fatter than reality after the whole-degree rounding pre-image, so buckets
+# far from the median get too much mass — the model says p≈0.29 where the book says
+# 0.14–0.18, and the book wins. Gate-era record (max-temp, live-reachable hourly +
+# intraday signals; the retired scan_source="longshot" harvest excluded) splits
+# 5/43 win (11.6%, −28.5% ROI) below 0.40 against 120/204 (58.8%, +14.8%) at or above.
+# Live era: 0-for-9 on fills under $0.20.
+#
+# Gated on signal.entry_price — the MID, not the executable ask (see the Gate-4
+# note in signal_generator). Era mean slippage mid→fill is 0.0059 (max 0.02), so
+# the mid is a faithful gating variable and errs conservative.
+#
+# 0.40 is where the data changes regime, NOT where profit factor peaks. Floors of
+# 0.45+ score better on the 83-trade live era (PF 1.46 vs 1.31) — that is fitting
+# noise. Any tighter floor must come from a forward shadow track, not a sweep.
+#
+# LIVE execution ONLY: the paper track keeps logging sub-floor signals so a tail
+# fix can be validated on the shadow harness before re-enable. 0.0 = no floor.
+LIVE_MIN_ENTRY_PRICE = 0.40
+
 # ── Lead-time skill decay ──────────────────────────────────────────────────────
 LEAD_TIME_DECAY_PER_DAY = 0.05   # Shrink model_p 5% per day beyond day-1 toward 0.5
 

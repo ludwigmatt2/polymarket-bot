@@ -23,6 +23,7 @@ from .config import (
     KELLY_FRACTION,
     LIVE_EXCLUDED_METRICS,
     LIVE_GATE_LATCHES,
+    LIVE_MIN_ENTRY_PRICE,
     MAX_DAY_EXPOSURE_PCT,
     MAX_LIVE_TRADE_USD,
     MAX_SLIPPAGE,
@@ -461,6 +462,14 @@ class LiveTrader:
         # keeps recording, so a fix can be proven before we re-enable.
         if signal.market.metric in LIVE_EXCLUDED_METRICS:
             self._log_skip(signal, f"excluded_metric:{signal.market.metric}")
+            return None
+
+        # Price floor: cheap contracts are a structural loser (the ensemble tail is
+        # fatter than reality, so far-from-median buckets get too much mass). Same
+        # live-only treatment as the metric exclusion above — the paper track keeps
+        # logging these so a tail fix can be proven before we re-enable.
+        if signal.entry_price < LIVE_MIN_ENTRY_PRICE:
+            self._log_skip(signal, f"below_price_floor:{signal.entry_price:.3f}")
             return None
 
         # One bin per event: adjacent buckets of the same temperature ladder are

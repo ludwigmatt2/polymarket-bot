@@ -77,6 +77,16 @@ from weather.models import Location, Signal, WeatherMarket
 # Test helpers
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _no_price_floor(monkeypatch):
+    """Most tests here predate LIVE_MIN_ENTRY_PRICE and use a default signal whose
+    entry_price (0.35) sits below it. Disable the floor by default so those tests
+    keep exercising what they were written for; TestPriceFloor turns it back on
+    explicitly, the same way TestExposureCaps does for LIVE_EXCLUDED_METRICS."""
+    import weather.live_trader as lt_mod
+    monkeypatch.setattr(lt_mod, "LIVE_MIN_ENTRY_PRICE", 0.0)
+
+
 def _make_signal(
     market_id: str = "mkt_abc123",
     direction: str = "YES",
@@ -1184,3 +1194,65 @@ class TestSkipLogging:
         trader.execute_signal(sig)          # second is a duplicate → skip
         rows = list(csv.DictReader(open(tmp_path / "live_order_skips.csv")))
         assert any(r["reason"] == "duplicate" for r in rows)
+
+
+class TestPriceFloor:
+    """LIVE_MIN_ENTRY_PRICE — cheap contracts are a structural loser (gate era:
+    5/43 win below 0.40 vs 120/204 at or above). Live-only, exactly like
+    LIVE_EXCLUDED_METRICS: no order goes out, but the paper track is untouched."""
+
+    @staticmethod
+    def _floor(monkeypatch, value=0.40):
+        import weather.live_trader as lt_mod
+        monkeypatch.setattr(lt_mod, "LIVE_MIN_ENTRY_PRICE", value)
+
+    def test_below_floor_skips_live_order(self, tmp_path, monkeypatch):
+        self._floor(monkeypatch)
+        trader = _make_trader(tmp_path)
+        trader._client = _make_mock_client(filled=15.0)
+        trader.reset_scan_commitments()
+        # YES at market_p 0.18 → entry_price 0.18, the shape that went 0-for-9 live
+        cheap = _make_signal(market_id="mkt_cheap", direction="YES", market_p=0.18)
+        assert cheap.entry_price < 0.40
+        assert trader.execute_signal(cheap) is None
+        trader._client.create_and_post_market_order.assert_not_called()
+        # a signal at the floor in the same scan still trades
+        ok = _make_signal(market_id="mkt_ok", direction="YES", market_p=0.45)
+        assert trader.execute_signal(ok) is not None
+
+    def test_below_floor_is_logged_with_the_price(self, tmp_path, monkeypatch):
+        self._floor(monkeypatch)
+        trader = _make_trader(tmp_path)
+        trader._client = _make_mock_client(filled=15.0)
+        trader.execute_signal(_make_signal(market_id="mkt_cheap",
+                                           direction="YES", market_p=0.18))
+        rows = list(csv.DictReader(open(tmp_path / "live_order_skips.csv")))
+        assert len(rows) == 1
+        assert rows[0]["reason"] == "below_price_floor:0.180"
+
+    def test_floor_reads_contract_cost_not_market_p(self, tmp_path, monkeypatch):
+        """NO pays 1−market_p, so a HIGH market_p is a CHEAP contract. Direction is
+        held constant here: NO at market_p 0.90 costs $0.10 and must be blocked,
+        NO at market_p 0.30 costs $0.70 and must trade. A guard that read market_p
+        instead of entry_price would get both backwards."""
+        self._floor(monkeypatch)
+        trader = _make_trader(tmp_path)
+        trader._client = _make_mock_client(filled=15.0)
+        trader.reset_scan_commitments()
+        cheap_no = _make_signal(market_id="mkt_cheap_no", direction="NO",
+                                market_p=0.90, model_p=0.05)
+        assert cheap_no.entry_price == pytest.approx(0.10)
+        assert trader.execute_signal(cheap_no) is None
+        rich_no = _make_signal(market_id="mkt_rich_no", direction="NO",
+                               market_p=0.30, model_p=0.05)
+        assert rich_no.entry_price == pytest.approx(0.70)
+        assert trader.execute_signal(rich_no) is not None
+
+    def test_zero_floor_disables_the_guard(self, tmp_path, monkeypatch):
+        """Kill switch: LIVE_MIN_ENTRY_PRICE = 0.0 trades every price again."""
+        self._floor(monkeypatch, 0.0)
+        trader = _make_trader(tmp_path)
+        trader._client = _make_mock_client(filled=15.0)
+        assert trader.execute_signal(
+            _make_signal(market_id="mkt_cheap", direction="YES", market_p=0.05)
+        ) is not None
