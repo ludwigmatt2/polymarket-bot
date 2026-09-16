@@ -232,14 +232,23 @@ is the natural place to also make the price floor per-station, if it ever needs 
 
 ---
 
-## Housekeeping (not blocking, but overdue)
+## Housekeeping — both cleared Sep 16 2026
 
-- `GATE_MIN_STATION_RESOLVED=90` / `GATE_MIN_DAYS_ELAPSED=14` are still the manually-lowered
-  values (from 150/21, Aug 20). The gate now latches entry-only (`9bbd659`), so these only
-  matter for a future re-qualification — but restore them or document the override as permanent.
-- `fix/gate-on-executable-ask` (`70492b3`) is still unmerged with the decision open. It
-  changes what we *measure*, not what we trade. T1 touches the same price semantics; decide it
-  in the same session or explicitly defer again.
+- ✅ **Gate thresholds restored to 150/21** (`3084fd1`). Inert: the record is 294
+  station-resolved over 41 days, so both clear either way. But it surfaced the fact worth
+  keeping in view — **with honest thresholds the gate does NOT pass**, failing on quality
+  (station PF 1.16 < 1.5; model Brier 0.2277 vs market 0.2229), not sample size. Live runs
+  only because `LIVE_GATE_LATCHES` holds the Aug-20 unlock open. Read it as an argument
+  against adding capital, not against continuing a ~$3/position test.
+- ✅ **`fix/gate-on-executable-ask` MERGED** (`e49d172`, + `cff71bb` for the floor
+  interaction). The Aug-27 objection ("sub-floor signals replay at PF 1.90") turned out to
+  be contaminated by the cheap-longshot band nobody had isolated yet. Restricted to
+  entry ≥ 0.40 with **both arms priced at the ask** — the only honest comparison, since live
+  always pays the ask — today's gate returns +$591.67 / PF 1.30 on n=249 against the ask
+  gate's **+$594.10 / PF 1.44 on n=176**: the same profit from 29% fewer trades, with the
+  73 rejected signals coming in at PF 1.02. Never quote the mid-priced +$654/PF 1.33 figure;
+  it is the inflation this change removes, and quoting it is what kept the decision open
+  for three weeks.
 
 ## Sequencing
 
