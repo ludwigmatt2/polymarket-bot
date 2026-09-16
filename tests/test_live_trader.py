@@ -1256,3 +1256,40 @@ class TestPriceFloor:
         assert trader.execute_signal(
             _make_signal(market_id="mkt_cheap", direction="YES", market_p=0.05)
         ) is not None
+
+
+class TestPriceFloorOnExecutableAsk:
+    """After GATE_ON_EXECUTABLE_ASK, Signal.entry_price is the traded side's ASK,
+    not the mid. The floor must gate on that — a contract whose mid clears $0.40
+    but whose ask does not is one we'd actually pay over the floor for."""
+
+    def test_floor_uses_the_ask_when_one_was_captured(self, tmp_path, monkeypatch):
+        import weather.live_trader as lt_mod
+        monkeypatch.setattr(lt_mod, "LIVE_MIN_ENTRY_PRICE", 0.40)
+        trader = _make_trader(tmp_path)
+        trader._client = _make_mock_client(filled=15.0)
+        trader.reset_scan_commitments()
+
+        # Mid-implied cost 0.42 (clears), executable ask 0.38 (does not).
+        sig = _make_signal(market_id="mkt_ask", direction="YES", market_p=0.42)
+        sig.exec_price = 0.38
+        assert sig.entry_price == pytest.approx(0.38)
+        assert trader.execute_signal(sig) is None
+        trader._client.create_and_post_market_order.assert_not_called()
+
+        # Same mid, ask at the floor → trades.
+        ok = _make_signal(market_id="mkt_ask_ok", direction="YES", market_p=0.42)
+        ok.exec_price = 0.41
+        assert trader.execute_signal(ok) is not None
+
+    def test_no_book_falls_back_to_the_mid(self, tmp_path, monkeypatch):
+        """exec_price 0.0 = book absent. entry_price reverts to the mid-implied
+        cost, so paper-only and backtest paths keep the pre-Aug-27 arithmetic."""
+        import weather.live_trader as lt_mod
+        monkeypatch.setattr(lt_mod, "LIVE_MIN_ENTRY_PRICE", 0.40)
+        trader = _make_trader(tmp_path)
+        trader._client = _make_mock_client(filled=15.0)
+        sig = _make_signal(market_id="mkt_nobook", direction="YES", market_p=0.35)
+        assert sig.exec_price == 0.0
+        assert sig.entry_price == pytest.approx(0.35)
+        assert trader.execute_signal(sig) is None

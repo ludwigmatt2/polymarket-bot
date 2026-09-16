@@ -286,9 +286,13 @@ LIVE_EXCLUDED_METRICS = frozenset({"temperature_2m_min"})
 # 5/43 win (11.6%, −28.5% ROI) below 0.40 against 120/204 (58.8%, +14.8%) at or above.
 # Live era: 0-for-9 on fills under $0.20.
 #
-# Gated on signal.entry_price — the MID, not the executable ask (see the Gate-4
-# note in signal_generator). Era mean slippage mid→fill is 0.0059 (max 0.02), so
-# the mid is a faithful gating variable and errs conservative.
+# Gated on signal.entry_price, which is what one contract COSTS on the side being
+# bought — so it catches a cheap NO (1−market_p) as well as a cheap YES. With
+# GATE_ON_EXECUTABLE_ASK on, that is the traded side's best ask, i.e. exactly what
+# a marketable order pays; it falls back to the mid-implied price on any path
+# without a book (backtests, sidecar down), which is ~0.006 cheaper on the era's
+# numbers and so errs slightly permissive there. Either way the floor is measured
+# against cost, which is the quantity the finding is about.
 #
 # 0.40 is where the data changes regime, NOT where profit factor peaks. Floors of
 # 0.45+ score better on the 83-trade live era (PF 1.46 vs 1.31) — that is fitting
