@@ -210,17 +210,23 @@ MAX_CALIBRATION_SHIFT = 0.25
 # edge means beating the crowd). The gate unlocks live order placement;
 # flipping mode stays manual.
 #
-# LOWERED Aug 20 2026 — explicit user decision, not a re-derived design value.
-# Original design: 150 / 21. Actual record at the time: 91 verified trades /
-# 14 days, PF 2.04 (>>1.5), model Brier 0.218 < market 0.241, drawdown 7.7%
-# (<<20% cap) — every QUALITY check already cleared comfortably; only sample
-# size and calendar span were short. Lowered to match what's actually
-# accumulated (not to zero) so a real go-live test could run on ~$40 of test
-# capital in the reconnected July wallet, ahead of full statistical
-# confidence. RESTORE TO 150 / 21 before trusting this gate again for anything
-# beyond small deliberate tests — these are not the calibrated thresholds.
-GATE_MIN_STATION_RESOLVED = 90
-GATE_MIN_DAYS_ELAPSED = 14
+# RESTORED to the design values Sep 16 2026. They were lowered to 90/14 on Aug 20
+# as an explicit user decision, to let a real go-live test run on ~$40 of test
+# capital before full statistical confidence had accumulated. That reason has
+# expired: the record now stands at 294 station-resolved trades over 41 days, so
+# both thresholds clear with room either way and the override no longer changes
+# any outcome — it was only a stale trap for the next reader.
+#
+# Note what the gate says with honest thresholds: it does NOT pass today. It fails
+# on QUALITY, not sample size — station PF 1.16 (needs 1.5) and model Brier 0.2277
+# against the market's 0.2229, i.e. the model does not beat the crowd price. That
+# is the same verdict the shadow harness reaches from a different direction (see
+# docs/PHASE2_PRICE_FLOOR_PLAN.md). Live trading continues only because
+# LIVE_GATE_LATCHES holds the Aug-20 unlock open by design; the daily-loss kill
+# switch is the live-side backstop. Treat a failing gate as a standing argument
+# against scaling capital up, not as a reason to halt a small deliberate test.
+GATE_MIN_STATION_RESOLVED = 150
+GATE_MIN_DAYS_ELAPSED = 21
 # The go-live gate is an ENTRY qualifier — prove edge on paper before risking real
 # money — NOT a permanent live leash. Once it has EVER passed, live stays unlocked
 # even if paper stats later dip below the bar (a temporary PF drawdown must not halt
