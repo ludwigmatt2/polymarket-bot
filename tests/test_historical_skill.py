@@ -118,36 +118,63 @@ def _entry(i):
     return {"city": f"c{i}", "lat": float(i), "lon": float(i), "metrics": {}}
 
 
-def test_refuses_to_write_an_empty_table(tmp_path, monkeypatch):
-    """Every target failed — the 429-storm shape. Must not touch the live table."""
+def test_every_target_failing_refuses_to_rewrite(tmp_path, monkeypatch):
+    """The 429-storm shape: nothing built. Must exit non-zero so systemd reports a
+    failure, and must leave the live table exactly as it was."""
     good = {"k1": {"city": "keep"}}
     skill = _run_main(tmp_path, monkeypatch, [None, None, None], existing=good)
     with pytest.raises(SystemExit) as e:
         bhs.main()
-    assert "EMPTY" in str(e.value)
-    assert json.loads(skill.read_text()) == good      # live table untouched
+    assert "every target failed" in str(e.value)
+    assert json.loads(skill.read_text()) == good
 
 
-def test_refuses_to_shrink_the_live_table(tmp_path, monkeypatch):
-    """Partial failure is still a failed rebuild: 1 of 3 cities is not a table."""
-    existing = {f"k{i}": {"city": f"c{i}"} for i in range(3)}
+def test_partial_failure_keeps_the_entries_it_could_not_rebuild(tmp_path, monkeypatch):
+    """1 of 3 cities built. Because the pass merges, the two it could not reach
+    keep their existing entries rather than vanishing — a partial outage degrades
+    freshness, never coverage."""
+    existing = {f"{float(i)},{float(i)}": {"city": f"c{i}"} for i in range(3)}
     skill = _run_main(tmp_path, monkeypatch, [_entry(0), None, None], existing=existing)
-    with pytest.raises(SystemExit) as e:
-        bhs.main()
-    assert "shrink" in str(e.value)
-    assert len(json.loads(skill.read_text())) == 3
-
-
-def test_allow_shrink_overrides_the_guard(tmp_path, monkeypatch):
-    existing = {f"k{i}": {"city": f"c{i}"} for i in range(3)}
-    skill = _run_main(tmp_path, monkeypatch, [_entry(0), None, None],
-                      existing=existing, argv=["--allow-shrink"])
     bhs.main()
-    assert len(json.loads(skill.read_text())) == 1
+    out = json.loads(skill.read_text())
+    assert len(out) == 3
+    assert out["1.0,1.0"]["city"] == "c1" and out["2.0,2.0"]["city"] == "c2"
+
+
+def test_empty_table_is_still_refused(tmp_path, monkeypatch):
+    """Fresh install, every target fails: nothing to merge into, nothing built."""
+    skill = _run_main(tmp_path, monkeypatch, [None])
+    with pytest.raises(SystemExit):
+        bhs.main()
+    assert not skill.exists()
+
 
 def test_full_rebuild_writes_normally(tmp_path, monkeypatch):
-    existing = {f"k{i}": {"city": f"c{i}"} for i in range(3)}
+    existing = {f"{float(i)},{float(i)}": {"city": f"c{i}"} for i in range(3)}
     skill = _run_main(tmp_path, monkeypatch, [_entry(0), _entry(1), _entry(2)],
                       existing=existing)
     bhs.main()
     assert len(json.loads(skill.read_text())) == 3
+
+
+def test_city_rebuild_merges_and_keeps_station_entries(tmp_path, monkeypatch):
+    """A city-only rebuild must REFRESH city entries without deleting the
+    station-keyed ones. _nearest_city resolves every traded market to its
+    resolving airport (NYC->KLGA, Miami->KMIA), so those entries are what the
+    live model actually reads; starting from {} dropped all of them and left
+    behind city entries nothing looks up. Sep 20 2026: the weekly timer hit
+    exactly this and was only stopped by the shrink guard."""
+    existing = {
+        "40.78,-73.88": {"city": "KLGA", "lat": 40.78, "lon": -73.88, "metrics": {}},
+        "25.79,-80.29": {"city": "KMIA", "lat": 25.79, "lon": -80.29, "metrics": {}},
+        "0.0,0.0":      {"city": "c0", "lat": 0.0, "lon": 0.0, "metrics": {"stale": {}}},
+    }
+    skill = _run_main(tmp_path, monkeypatch, [_entry(0)], existing=existing)
+    bhs.main()
+    out = json.loads(skill.read_text())
+    # station entries survive untouched
+    assert out["40.78,-73.88"]["city"] == "KLGA"
+    assert out["25.79,-80.29"]["city"] == "KMIA"
+    # the rebuilt city entry is refreshed, not duplicated
+    assert out["0.0,0.0"]["metrics"] == {}
+    assert len(out) == 3

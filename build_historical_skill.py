@@ -371,8 +371,16 @@ def main() -> None:
             cities = cities[:args.max_cities]
         targets = [{**c, "label": c["city"]} for c in cities]
         build = lambda t: build_city(t, start, end)  # noqa: E731
-        table = {}
-        print(f"Building skill for {len(targets)} cities, {start} → {end}\n")
+        # Merge, exactly as --stations does. Starting from {} deleted every
+        # STATION-keyed entry the live table holds, and those are the ones the
+        # model actually uses: _nearest_city resolves a resolving airport at ~0 km,
+        # so NYC→KLGA, Miami→KMIA, Dallas→KDAL. A city-only rebuild would have
+        # replaced a 30-entry table (14 cities + 16 stations) with 15 city entries
+        # that nothing looks up, silently dropping MOS for every traded market.
+        # Refresh what this pass builds; never delete what it doesn't.
+        table = json.loads(SKILL_PATH.read_text()) if SKILL_PATH.exists() else {}
+        print(f"Building skill for {len(targets)} cities, {start} → {end} "
+              f"(merging into {len(table)} existing entries)\n")
 
     # per-metric list of per-target error structs {lead:{month:[errs]}} for validation
     city_structs: dict[str, list] = defaultdict(list)
@@ -426,29 +434,37 @@ def main() -> None:
         return
 
     # ── Degenerate-write guard ───────────────────────────────────────────────────
-    # This table feeds live trading decisions. On 2026-09-15 a transient Open-Meteo
-    # 429 storm failed all 15 cities, and the run wrote `{}` over a good 30-city
-    # table and exited 0 — the live model silently lost its MOS. Never again: a
-    # rebuild that lost targets is a FAILED rebuild, not a smaller table.
+    # This table feeds live trading decisions, so a rebuild that lost targets is a
+    # FAILED rebuild, not a smaller table.
     #
-    # --fail-on-no-ship gates on FIT QUALITY (is the correction any good) and is a
-    # separate question from this, which gates on COVERAGE (did we actually get the
-    # data). The 429 storm passed the quality gate vacuously, with zero cities.
+    # --fail-on-no-ship gates on FIT QUALITY (is the correction any good); this
+    # gates on COVERAGE (did we actually get the data). They are different
+    # questions, and on 2026-09-15 a 429 storm passed the quality gate vacuously
+    # with zero cities built, wrote `{}` over a good table, and exited 0.
+    #
+    # Both passes now MERGE into the live table, so entries can no longer be lost
+    # by omission — the remaining job is to fail LOUDLY when a pass built nothing,
+    # so systemd reports it instead of silently rewriting the table unchanged.
+    n_ok = len(targets) - n_failed
     if n_failed:
         print(f"\n{n_failed}/{len(targets)} targets FAILED to build.")
-    if not table:
-        sys.exit("refusing to write an EMPTY skill table — every target failed "
+    if not n_ok:
+        sys.exit("every target failed to build — refusing to rewrite the table "
                  "(transient rate-limit or network outage; rerun later)")
+    if not table:
+        sys.exit("refusing to write an EMPTY skill table")
     existing = {}
     if SKILL_PATH.exists():
         try:
             existing = json.loads(SKILL_PATH.read_text())
         except (OSError, ValueError):
             existing = {}
+    # Backstop: with merging this should be unreachable, but a future pass that
+    # forgets to merge would be caught here rather than in production.
     if existing and not args.allow_shrink and len(table) < len(existing) * MIN_REBUILD_COVERAGE:
         sys.exit(f"refusing to shrink the live skill table from {len(existing)} to "
-                 f"{len(table)} entries ({n_failed} target(s) failed). Rerun when the "
-                 f"upstream is healthy, or pass --allow-shrink if the loss is intended.")
+                 f"{len(table)} entries ({n_failed} target(s) failed) — a pass that "
+                 f"does not merge would do this. Pass --allow-shrink if intended.")
 
     SKILL_PATH.parent.mkdir(parents=True, exist_ok=True)
     SKILL_PATH.write_text(json.dumps(table, indent=2))
