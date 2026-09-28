@@ -51,16 +51,20 @@ FIELDS = [
 ]
 
 
-def _existing_keys(path: Path) -> set[tuple[str, str, str, str]]:
-    """(icao, target_day, kind, snapshot-date) already on disk — the dedup key.
-    Keying on snapshot DATE (not full timestamp) makes a same-day rerun a no-op,
-    so an accidental double-fire of the timer can't duplicate rows."""
+def _existing_keys_for_today(path: Path, today_key: str) -> set[tuple[str, str, str]]:
+    """(icao, target_day, kind) already snapshotted today — the dedup key.
+    A row from any earlier day can never match today's lookups (the caller
+    always checks against today_key), so only today's rows are worth holding —
+    scanning/keeping the full history here would grow unboundedly for no
+    benefit. Same effect as before: an accidental double-fire of the timer
+    can't duplicate rows."""
     if not path.exists():
         return set()
     keys = set()
     with path.open() as f:
         for row in csv.DictReader(f):
-            keys.add((row["icao"], row["target_day"], row["kind"], row["snapshot_at"][:10]))
+            if row["snapshot_at"][:10] == today_key:
+                keys.add((row["icao"], row["target_day"], row["kind"]))
     return keys
 
 
@@ -77,7 +81,7 @@ def main() -> None:
     now = datetime.now(timezone.utc)
     snapshot_at = now.isoformat()
     today_key = now.date().isoformat()
-    existing = _existing_keys(ARCHIVE_PATH)
+    existing = _existing_keys_for_today(ARCHIVE_PATH, today_key)
 
     ARCHIVE_PATH.parent.mkdir(parents=True, exist_ok=True)
     is_new = not ARCHIVE_PATH.exists()
@@ -106,7 +110,7 @@ def main() -> None:
                 day = today_local + timedelta(days=lead)
 
                 for kind, metric in KINDS.items():
-                    key = (icao, day.isoformat(), kind, today_key)
+                    key = (icao, day.isoformat(), kind)
                     if key in existing:
                         skipped_dup += 1
                         continue

@@ -45,12 +45,20 @@ MIN_N_FOR_VERDICT = 40
 LEAD_BUCKETS = [("0-1d", range(0, 2)), ("2-3d", range(2, 4)), ("4-6d", range(4, 7))]
 
 
-def _truth_c(icao: str, day: date, kind: str) -> float | None:
+def _truth_row(icao: str, day: date) -> dict[str, float] | None:
+    """{"max": degC, "min": degC} for one IEM call — daily_maxmin already
+    returns both, so callers must cache by (icao, day) and read out the kind
+    they need, rather than re-fetching per kind (that doubled this script's
+    IEM traffic and runtime for every resolved station/day)."""
     r = iem_client.daily_maxmin(icao, day)
     if not r:
         return None
-    v = r.get(f"{kind}_f")
-    return iem_client.f_to_c(v) if v is not None else None
+    out = {}
+    for kind in ("max", "min"):
+        v = r.get(f"{kind}_f")
+        if v is not None:
+            out[kind] = iem_client.f_to_c(v)
+    return out or None
 
 
 def _load_rows() -> list[dict]:
@@ -68,7 +76,7 @@ def main() -> None:
 
     # resolved[(icao, kind)] -> list of dicts with mos/om_raw/om_corr errors + z
     per_station_lead: dict[tuple[str, str], list[dict]] = defaultdict(list)
-    truth_cache: dict[tuple[str, str], float | None] = {}
+    truth_cache: dict[tuple[str, str], dict[str, float] | None] = {}
     n_pending = n_no_truth = n_resolved = 0
 
     for row in rows:
@@ -77,10 +85,11 @@ def main() -> None:
             n_pending += 1
             continue
         icao, kind = row["icao"], row["kind"]
-        tkey = (icao, row["target_day"], kind)
+        tkey = (icao, row["target_day"])
         if tkey not in truth_cache:
-            truth_cache[tkey] = _truth_c(icao, day, kind)
-        truth = truth_cache[tkey]
+            truth_cache[tkey] = _truth_row(icao, day)
+        truth_row = truth_cache[tkey]
+        truth = truth_row.get(kind) if truth_row else None
         if truth is None:
             n_no_truth += 1
             continue
@@ -114,13 +123,12 @@ def main() -> None:
               "running for a few days.")
         return
 
-    def mae(recs: list[dict], key: str) -> tuple[float, int] | None:
-        vals = [abs(r[key]) for r in recs if key in r]
-        return (statistics.mean(vals), len(vals)) if vals else None
+    def vals(recs: list[dict], key: str) -> list[float]:
+        return [r[key] for r in recs if key in r]
 
-    def bias(recs: list[dict], key: str) -> float | None:
-        vals = [r[key] for r in recs if key in r]
-        return statistics.mean(vals) if vals else None
+    def mae(recs: list[dict], key: str) -> tuple[float, int] | None:
+        v = vals(recs, key)
+        return (statistics.mean(abs(x) for x in v), len(v)) if v else None
 
     mosmix_wins = mosmix_losses = 0
     print(f"{'station':8} {'lead':6} {'n':>4}  {'MOSMIX MAE':>11} {'OM-raw MAE':>11} "
@@ -130,13 +138,13 @@ def main() -> None:
         om_raw = mae(recs, "om_raw_err")
         om_corr = mae(recs, "om_corr_err")
         n = len(recs)
-        zs = [r["mos_z"] for r in recs if "mos_z" in r]
+        zs = vals(recs, "mos_z")
         z_str = f"{statistics.mean(zs):+.2f}/{statistics.pstdev(zs):.2f}" if len(zs) >= 2 else "n/a"
         mos_str = f"{mos[0]:.2f} (n={mos[1]})" if mos else "n/a"
         om_raw_str = f"{om_raw[0]:.2f} (n={om_raw[1]})" if om_raw else "n/a"
         om_corr_str = f"{om_corr[0]:.2f} (n={om_corr[1]})" if om_corr else "n/a"
-        bias_mos = bias(recs, "mos_err")
-        bias_str = f"{bias_mos:+.2f}" if bias_mos is not None else "n/a"
+        mos_errs = vals(recs, "mos_err")
+        bias_str = f"{statistics.mean(mos_errs):+.2f}" if mos_errs else "n/a"
         print(f"{icao:8} {bucket:6} {n:>4}  {mos_str:>11} {om_raw_str:>11} {om_corr_str:>12}  "
               f"{bias_str:>12}  {z_str:>12}")
 

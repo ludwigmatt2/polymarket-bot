@@ -25,6 +25,7 @@ from zoneinfo import ZoneInfo
 
 _BASE = "https://opendata.dwd.de/weather/local_forecasts/mos/MOSMIX_L/single_stations"
 _UA = {"User-Agent": "Mozilla/5.0"}
+_RETRY_DELAYS_S = (1.0, 2.0, 4.0)
 
 # A MOSMIX run is valid ~6h (DWD ships 4 runs/day: 03/09/15/21 UTC); mirrors
 # WeatherClient.DISK_CACHE_TTL_S, the same cadence reasoning for Open-Meteo.
@@ -177,9 +178,26 @@ def _cache_put(fc: MosmixForecast) -> None:
         pass
 
 
+def _fetch_kmz(url: str) -> bytes | None:
+    """GET with retry-on-transient-failure, mirroring iem_client._get's shape —
+    without it, a single dropped connection reads identically to "station not
+    in MOSMIX" and silently degrades the feature for a full _CACHE_TTL_S."""
+    req = urllib.request.Request(url, headers=_UA)
+    for delay in (0.0, *_RETRY_DELAYS_S):
+        if delay:
+            time.sleep(delay)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.read()
+        except Exception:  # noqa: BLE001 — retry; no SLA means transient failures are routine
+            continue
+    return None
+
+
 def fetch_station(wmo: str, use_cache: bool = True) -> MosmixForecast | None:
-    """Latest MOSMIX_L forecast for a WMO station id, or None — unknown id, DWD
-    outage, or a malformed payload all stand the feature down rather than raise."""
+    """Latest MOSMIX_L forecast for a WMO station id, or None — unknown id, a
+    DWD outage that outlasts retries, or a malformed payload all stand the
+    feature down rather than raise."""
     wmo = (wmo or "").strip()
     if not wmo:
         return None
@@ -188,11 +206,8 @@ def fetch_station(wmo: str, use_cache: bool = True) -> MosmixForecast | None:
         if cached is not None:
             return cached
     url = f"{_BASE}/{wmo}/kml/MOSMIX_L_LATEST_{wmo}.kmz"
-    try:
-        req = urllib.request.Request(url, headers=_UA)
-        with urllib.request.urlopen(req, timeout=30) as r:
-            data = r.read()
-    except Exception:  # noqa: BLE001 — no SLA; a miss must not raise
+    data = _fetch_kmz(url)
+    if data is None:
         return None
     fc = _parse_kmz(data)
     if fc is None:

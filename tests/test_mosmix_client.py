@@ -87,9 +87,25 @@ def _isolated_cache_dir(tmp_path, monkeypatch):
     importlib.reload(paths)
 
 
-def test_parse_us_station_empty_tx_tn(monkeypatch):
+@pytest.fixture(autouse=True)
+def _no_retry_delay(monkeypatch):
+    # fetch_station retries on failure with real backoff (_RETRY_DELAYS_S);
+    # the outage/missing-station tests below make it exhaust all retries, so
+    # without this they'd burn ~7s each on real sleeps.
+    monkeypatch.setattr(mx.time, "sleep", lambda _s: None)
+
+
+@pytest.mark.parametrize("tx_tn", [
+    "- - - - - - - - - -",                                                    # typical US station (no DSM TX/TN)
+    "290.0 290.0 291.0 291.0 292.0 292.0 293.0 293.0 294.0 294.0",             # typical international station
+], ids=["empty_tx_tn", "populated_tx_tn"])
+def test_parse_ignores_tx_tn_either_way(monkeypatch, tx_tn):
+    """_parse_kmz only reads TTT/E_TTT (see weather/mosmix_client.py) — TX/TN
+    being all '-' or fully populated must parse identically either way. This
+    is NOT a US-vs-international behavior difference (there isn't one); it's
+    robustness to a KMZ shape variance DWD actually ships."""
     cap = {}
-    _mock_urlopen(monkeypatch, _kmz_bytes("72503", "- - - - - - - - - -"), capture=cap)
+    _mock_urlopen(monkeypatch, _kmz_bytes("72503", tx_tn), capture=cap)
     fc = mx.fetch_station("72503")
     assert fc is not None
     assert fc.wmo == "72503"
@@ -97,17 +113,14 @@ def test_parse_us_station_empty_tx_tn(monkeypatch):
     assert len(fc.times) == 10
     assert fc.ttt_c[0] == pytest.approx(280.0 - 273.15)
 
-    m = mx.daily_extreme(fc, date(2026, 9, 28), "America/New_York", "max")
-    assert m == (_EXPECT_MAX, _EXPECT_SIGMA)
 
-
-def test_parse_intl_station_populated_tx_tn(monkeypatch):
-    _mock_urlopen(monkeypatch, _kmz_bytes("07157", "290.0 290.0 291.0 291.0 292.0 292.0 293.0 293.0 294.0 294.0"))
-    fc = mx.fetch_station("07157")
+@pytest.mark.parametrize("kind,expected", [("max", _EXPECT_MAX), ("min", _EXPECT_MIN)])
+def test_daily_extreme_by_kind(monkeypatch, kind, expected):
+    _mock_urlopen(monkeypatch, _kmz_bytes("72503", "- - - - - - - - - -"))
+    fc = mx.fetch_station("72503")
     assert fc is not None
-    assert fc.wmo == "07157"
-    m = mx.daily_extreme(fc, date(2026, 9, 28), "America/New_York", "min")
-    assert m == (_EXPECT_MIN, _EXPECT_SIGMA)
+    m = mx.daily_extreme(fc, date(2026, 9, 28), "America/New_York", kind)
+    assert m == (expected, _EXPECT_SIGMA)
 
 
 def test_daily_extreme_day_not_covered_returns_none(monkeypatch):
