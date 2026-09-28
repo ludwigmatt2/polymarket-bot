@@ -35,5 +35,5 @@ back over `historical_skill.json` and restart `polymarket-bot.service`.
 
 **Note.** This rebuilds the CITY table against ERA5 grid actuals — the same target
 the current table uses. It fixes staleness, not the grid-vs-station blindness that
-`docs/PHASE1_STATION_MOS_PLAN.md` Workstream A is about. When a station-trained table
+`docs/PHASE3_STATION_FORECAST_PLAN.md` is about. When a station-trained table
 exists, point `ExecStart` at `--stations` and this timer keeps that fresh instead.

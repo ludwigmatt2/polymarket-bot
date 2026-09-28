@@ -1,3 +1,28 @@
+> # ✅ CLOSED OUT — historical record, not a work item
+>
+> **Closed 2026-09-28.** Every task here is either done or answered. Active work moved to
+> `PHASE3_STATION_FORECAST_PLAN.md`.
+>
+> | task | outcome |
+> |---|---|
+> | T1 price floor | DONE `ffc8b95` — but see the reversal below |
+> | T2 shadow warm-start | DONE `b2e45d5` + re-seed Sep 15. **Worked**: prod_mirror mean \|Δp\| 0.061 → 0.0044, direction agreement 40/40. The harness is trustworthy now. |
+> | T3 compare_tracks footgun | DONE `b2e45d5` |
+> | T4 promote `lambda_1_0` | **REJECTED.** Its edge was selection (skipping the cheap band), not skill. Two weeks post-reseed it is the WORST track (PF 0.77). Keep `VARIANCE_INFLATION=2.0`. |
+> | T5 kill/keep `recency_cal` | **KEEP, unpromoted.** Rehabilitated from worst to ~matching production — the old verdict was the cold-calibrator artifact. Not better than prod; no reason to promote. |
+> | T6 tail investigation | DONE `a77a7b8` — refuted its own "fat tails" premise; produced `scripts/calibration_by_price.py` and found the MOS/rebuild bugs. |
+> | T7 Workstream A | **Superseded** by Phase 3 (buy MOSMIX instead of building a station MOS). |
+>
+> **⚠️ The T1 price floor did not hold up out of sample.** It was fitted on a −0.046 edge in
+> the sub-$0.40 band; out of sample that band came in at **+0.116**. The ≥$0.40 band is stable
+> (+0.059 → +0.060) but neither band is statistically significant. Read this document's
+> confident band-level claims as **in-sample fits**, not established facts. The floor is still
+> deployed as risk reduction, not as proven edge.
+>
+> **What survives intact and is worth re-reading:** "Finding 6" — one unsegmented
+> subpopulation (the cheap band) corrupted three separate engineering decisions over two
+> months. **Always report results segmented by price band.**
+
 # Phase 2 — Price floor, honest baselines, and the model backlog
 
 **Status:** planned · **Created:** 2026-09-14 · **Branch to build on:** `main` (`9bbd659`)

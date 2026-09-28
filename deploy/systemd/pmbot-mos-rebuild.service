@@ -1,6 +1,6 @@
 [Unit]
 Description=polymarket-bot MOS skill-table rebuild (seasonal refresh)
-Documentation=file:/opt/polymarket-bot/docs/PHASE2_PRICE_FLOOR_PLAN.md
+Documentation=file:/opt/polymarket-bot/docs/PHASE3_STATION_FORECAST_PLAN.md
 
 [Service]
 Type=oneshot

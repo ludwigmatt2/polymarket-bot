@@ -1,3 +1,27 @@
+> # ⚠️ SUPERSEDED — do not work from this document
+>
+> **Superseded 2026-09-28 by `PHASE3_STATION_FORECAST_PLAN.md`.** Kept only for the
+> diagnosis in "Why", which still holds: the market resolves on an airport station and the
+> model forecasts a grid cell.
+>
+> **What changed.** This plan proposed building our *own* station-trained MOS table from IEM
+> observations (Workstream A, T0–T6). **It was never started** and is now obsolete: DWD
+> MOSMIX already publishes station-calibrated statistical forecasts for 18 of our 19
+> stations, free, with their own uncertainty (`E_TTT`). Buying the finished product beats
+> building it.
+>
+> **Claims in here that are now FALSE:**
+> - *"The only station-native forecast is NWS MOS, which is US-only"* (also in
+>   `archive/IEM_INTEGRATION_PLAN.md`) — **wrong**. MOSMIX is global.
+> - Workstream B mechanism A (`recency_cal`) was built and, on two weeks of clean shadow
+>   data, merely **matches** production rather than beating it.
+> - Workstream B mechanism B (scheduled MOS rebuild) shipped, then **deleted the station
+>   half of the live table** on its first run (fixed in `4cabed8`). See memory
+>   `mos_contributes_nothing`.
+> - The premise that our MOS layer is worth maintaining: `mos_off` now scores identically to
+>   `prod_mirror` three separate times, and offline the seasonal table beats flat bias by
+>   only +0.5%, below its own ship bar. Phase 3 T5 turns `MOS_ENABLED` off.
+
 # Phase 1 — Per-station min-temp bias correction
 
 **Status:** planned (not started) · **Created:** 2026-09-03 · **Branch to build on:** `feat/shadow-model-tracks`
