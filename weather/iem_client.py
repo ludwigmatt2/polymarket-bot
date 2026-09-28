@@ -33,44 +33,48 @@ _UA = {"User-Agent": "Mozilla/5.0"}
 _MIN_INTERVAL_S = 1.05  # IEM requests ≤ 1 req/s per IP
 _last_call = [0.0]
 
-# ICAO → (IEM network, station sid, IANA tz, lat, lon). US ASOS = "{STATE}_ASOS"
-# (one underscore) with sid = ICAO minus the leading K; international = "{CC}__ASOS"
-# (two underscores) with sid = full ICAO. Coords are the station's own location
-# (from the IEM network GeoJSON) — used to forecast AT the station, not the city.
-# Seeded for the traded cities; extend as new stations appear.
-_STATION_REGISTRY: dict[str, tuple[str, str, str, float, float]] = {
-    "KLGA": ("NY_ASOS", "LGA", "America/New_York", 40.7794, -73.8803),   # NYC / LaGuardia
-    "KMIA": ("FL_ASOS", "MIA", "America/New_York", 25.7880, -80.3169),   # Miami Intl
-    "KDFW": ("TX_ASOS", "DFW", "America/Chicago", 32.8968, -97.0380),    # Dallas/Fort Worth (unused by markets; kept for MOS table)
-    "KDAL": ("TX_ASOS", "DAL", "America/Chicago", 32.8471, -96.8518),    # Dallas Love Field — the station Polymarket ACTUALLY resolves on
-    "KATL": ("GA_ASOS", "ATL", "America/New_York", 33.6301, -84.4418),   # Atlanta
-    "RKSI": ("KR__ASOS", "RKSI", "Asia/Seoul", 37.4667, 126.4500),       # Seoul / Incheon
-    "VHHH": ("HK__ASOS", "VHHH", "Asia/Hong_Kong", 22.3094, 113.9219),   # Hong Kong Intl
-    "LFPB": ("FR__ASOS", "LFPB", "Europe/Paris", 48.9672, 2.4272),       # Paris / Le Bourget
-    "LFPG": ("FR__ASOS", "LFPG", "Europe/Paris", 49.0153, 2.5344),       # Paris / Charles de Gaulle
-    "LLBG": ("IL__ASOS", "LLBG", "Asia/Jerusalem", 32.0114, 34.8867),    # Tel Aviv / Ben Gurion (NOAA-sourced markets, °C)
-    "EGLC": ("GB__ASOS", "EGLC", "Europe/London", 51.5053, 0.0553),      # London City Airport (°F markets!)
-    "RJTT": ("JP__ASOS", "RJTT", "Asia/Tokyo", 35.5533, 139.7811),       # Tokyo / Haneda (°C)
+# ICAO → (IEM network, station sid, IANA tz, lat, lon, DWD MOSMIX WMO id).
+# US ASOS = "{STATE}_ASOS" (one underscore) with sid = ICAO minus the leading K;
+# international = "{CC}__ASOS" (two underscores) with sid = full ICAO. Coords are
+# the station's own location (from the IEM network GeoJSON) — used to forecast AT
+# the station, not the city. Seeded for the traded cities; extend as new stations
+# appear. wmo = None where the station isn't in MOSMIX (verified 2026-09-22 —
+# see docs/PHASE3_STATION_FORECAST_PLAN.md) or hasn't been looked up yet; never
+# guess an id.
+_STATION_REGISTRY: dict[str, tuple[str, str, str, float, float, str | None]] = {
+    "KLGA": ("NY_ASOS", "LGA", "America/New_York", 40.7794, -73.8803, "72503"),   # NYC / LaGuardia
+    "KMIA": ("FL_ASOS", "MIA", "America/New_York", 25.7880, -80.3169, "72202"),   # Miami Intl
+    "KDFW": ("TX_ASOS", "DFW", "America/Chicago", 32.8968, -97.0380, "72259"),    # Dallas/Fort Worth (unused by markets; kept for MOS table)
+    "KDAL": ("TX_ASOS", "DAL", "America/Chicago", 32.8471, -96.8518, None),       # Dallas Love Field — the station Polymarket ACTUALLY resolves on; NOT in MOSMIX (T6)
+    "KATL": ("GA_ASOS", "ATL", "America/New_York", 33.6301, -84.4418, "72219"),   # Atlanta
+    "RKSI": ("KR__ASOS", "RKSI", "Asia/Seoul", 37.4667, 126.4500, "47113"),       # Seoul / Incheon
+    "VHHH": ("HK__ASOS", "VHHH", "Asia/Hong_Kong", 22.3094, 113.9219, "45007"),   # Hong Kong Intl
+    "LFPB": ("FR__ASOS", "LFPB", "Europe/Paris", 48.9672, 2.4272, "07150"),       # Paris / Le Bourget
+    "LFPG": ("FR__ASOS", "LFPG", "Europe/Paris", 49.0153, 2.5344, "07157"),       # Paris / Charles de Gaulle
+    "LLBG": ("IL__ASOS", "LLBG", "Asia/Jerusalem", 32.0114, 34.8867, "40180"),    # Tel Aviv / Ben Gurion (NOAA-sourced markets, °C)
+    "EGLC": ("GB__ASOS", "EGLC", "Europe/London", 51.5053, 0.0553, "P0478"),      # London City Airport (°F markets!)
+    "RJTT": ("JP__ASOS", "RJTT", "Asia/Tokyo", 35.5533, 139.7811, "47671"),       # Tokyo / Haneda (°C)
     # Jul-8 registry expansion (scripts/discover_stations.py — IEM+WU verified):
-    "LEMD": ("ES__ASOS", "LEMD", "Europe/Madrid", 40.4667, -3.5556),     # Madrid / Barajas (°C)
-    "OMDB": ("AE__ASOS", "OMDB", "Asia/Dubai", 25.2539, 55.3656),        # Dubai Intl (°F markets!)
-    "WSSS": ("SG__ASOS", "WSSS", "Asia/Singapore", 1.3667, 103.9833),    # Singapore / Changi (°C)
-    "ZSPD": ("CN__ASOS", "ZSPD", "Asia/Shanghai", 31.1167, 121.7667),    # Shanghai / Pudong (°C)
+    "LEMD": ("ES__ASOS", "LEMD", "Europe/Madrid", 40.4667, -3.5556, "08221"),     # Madrid / Barajas (°C)
+    "OMDB": ("AE__ASOS", "OMDB", "Asia/Dubai", 25.2539, 55.3656, None),          # Dubai Intl (°F markets!); MOSMIX id not yet verified
+    "WSSS": ("SG__ASOS", "WSSS", "Asia/Singapore", 1.3667, 103.9833, "48698"),    # Singapore / Changi (°C)
+    "ZSPD": ("CN__ASOS", "ZSPD", "Asia/Shanghai", 31.1167, 121.7667, "58362"),    # Shanghai / Pudong (°C)
     # Canadian networks are CA_{PROVINCE}_ASOS (three segments — see is_us()).
-    "CYYZ": ("CA_ON_ASOS", "CYYZ", "America/Toronto", 43.6772, -79.6306),  # Toronto / Pearson (°C)
+    "CYYZ": ("CA_ON_ASOS", "CYYZ", "America/Toronto", 43.6772, -79.6306, "71624"),  # Toronto / Pearson (°C)
     # Jul-10 registry expansion (scripts/discover_stations.py — IEM+WU verified):
-    "ZGSZ": ("CN__ASOS", "ZGSZ", "Asia/Shanghai", 22.5500, 114.1000),  # Shenzhen Bao'an (°C)
+    "ZGSZ": ("CN__ASOS", "ZGSZ", "Asia/Shanghai", 22.5500, 114.1000, "59493"),  # Shenzhen Bao'an (°C)
 }
 
 
 def station_meta(icao: str) -> dict | None:
-    """Return {icao, network, sid, tz, lat, lon} for a known station, else None."""
+    """Return {icao, network, sid, tz, lat, lon, wmo} for a known station, else
+    None. wmo (DWD MOSMIX station id) may itself be None — see registry comment."""
     key = (icao or "").strip().upper()
     e = _STATION_REGISTRY.get(key)
     if not e:
         return None
-    net, sid, tz, lat, lon = e
-    return {"icao": key, "network": net, "sid": sid, "tz": tz, "lat": lat, "lon": lon}
+    net, sid, tz, lat, lon, wmo = e
+    return {"icao": key, "network": net, "sid": sid, "tz": tz, "lat": lat, "lon": lon, "wmo": wmo}
 
 
 def is_us(icao: str) -> bool:
@@ -167,15 +171,21 @@ def metar_peak(icao: str, day: date, kind: str = "max") -> float | None:
 
 def mos_forecast(icao: str, run_dt: datetime, model: str = "MEX") -> list[dict]:
     """NWS MOS station forecast via IEM (US-only). `n_x` per row = the 12-h max/min
-    °F. Returns [] for international stations (IEM has no international MOS)."""
-    sts = run_dt.strftime("%Y-%m-%dT%H:%M")
-    ets = (run_dt + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M")
+    °F. Returns [] for international stations (IEM has no international MOS).
+
+    sts/ets MUST carry a UTC offset — IEM's validator rejects naive timestamps
+    (pydantic timezone_aware error) the same way asos.py does (see metar_peak).
+    A bare `except` previously turned that 422 into a silent [] for every call;
+    narrowed here so a real regression fails loudly instead of looking like
+    "no MOS for this station"."""
+    sts = run_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    ets = (run_dt + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
         data = json.loads(_get("/cgi-bin/request/mos.py", {
             "station": (icao or "").strip().upper(), "model": model,
             "sts": sts, "ets": ets, "format": "json",
         }))
-    except Exception:  # noqa: BLE001
+    except (OSError, json.JSONDecodeError):
         return []
     if isinstance(data, list):
         return data

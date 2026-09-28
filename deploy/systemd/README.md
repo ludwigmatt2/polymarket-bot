@@ -37,3 +37,37 @@ back over `historical_skill.json` and restart `polymarket-bot.service`.
 the current table uses. It fixes staleness, not the grid-vs-station blindness that
 `docs/PHASE3_STATION_FORECAST_PLAN.md` is about. When a station-trained table
 exists, point `ExecStart` at `--stations` and this timer keeps that fresh instead.
+
+## `pmbot-mosmix-snapshot` — daily Phase 3 T1 archiver
+
+**Why.** DWD's MOSMIX open-data endpoint keeps no historical archive (~2-3 days
+of past runs only, verified 2026-09-28) and Open-Meteo's ensemble API is the
+same story (~3-4 days) — neither can be backtested retroactively. T1's "does
+MOSMIX beat our pipeline at the station" question can only be answered by
+recording all three forecasts (MOSMIX, raw Open-Meteo, skill-corrected) for the
+same station/day/moment, going forward, and joining against IEM truth once each
+day resolves. This timer is that recording. See `scripts/mosmix_snapshot.py`'s
+module docstring for the full reasoning.
+
+**Install:**
+
+```sh
+sudo cp deploy/systemd/pmbot-mosmix-snapshot.* /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now pmbot-mosmix-snapshot.timer
+systemctl list-timers pmbot-mosmix-snapshot.timer      # confirm it is scheduled
+```
+
+**First run — do it by hand and read the output before trusting the timer:**
+
+```sh
+sudo systemctl start pmbot-mosmix-snapshot.service
+journalctl -u pmbot-mosmix-snapshot -n 50 --no-pager
+```
+
+**Reading the results.** Run `venv/bin/python scripts/mosmix_backcheck.py` any
+time — it reports whatever n the archive has accumulated so far and explicitly
+refuses to print a go/no-go verdict below its own n threshold. Expect "not
+answerable yet" for the first 1-3 weeks; that is the correct output, not a bug.
+The archive lives at `data/logs/mosmix_archive.csv` — safe to inspect directly,
+one row per (station, target day, kind, snapshot day).

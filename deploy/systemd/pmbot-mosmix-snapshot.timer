@@ -1,0 +1,16 @@
+[Unit]
+Description=Daily polymarket-bot MOSMIX forward-forecast snapshot
+
+[Timer]
+# 05:00 UTC — after the nightly backup (03:20) and off the mos-rebuild's Sunday
+# 04:10 slot, off the hourly scan boundary. Once/day is enough: MOSMIX only
+# reissues 4x/day and the archive's value is elapsed calendar time, not run
+# density — see mosmix_snapshot.py's module docstring.
+OnCalendar=*-*-* 05:00:00
+RandomizedDelaySec=15m
+# Don't silently lose a day of accumulation because the VPS was down at 05:00 —
+# the archive's whole point is elapsed time, so a skipped day is not recoverable.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

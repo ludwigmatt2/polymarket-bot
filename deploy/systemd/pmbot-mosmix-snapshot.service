@@ -1,0 +1,23 @@
+[Unit]
+Description=polymarket-bot MOSMIX forward-forecast snapshot (Phase 3 T1 archiver)
+Documentation=file:/opt/polymarket-bot/docs/PHASE3_STATION_FORECAST_PLAN.md
+
+[Service]
+Type=oneshot
+User=bot
+Group=bot
+WorkingDirectory=/opt/polymarket-bot
+# The scan resolves DATA_DIR from this; without it the snapshot reads/writes the
+# repo root instead of the data volume and the archive never accumulates where
+# mosmix_backcheck.py looks for it.
+Environment=RAILWAY_VOLUME_MOUNT_PATH=/opt/polymarket-bot/data
+
+# DWD has no SLA and Open-Meteo has its own rate limits — one bad station/day
+# must not sink the run (the script already degrades per-combo internally);
+# this timeout is a backstop against a full hang, not the expected path.
+ExecStart=/opt/polymarket-bot/venv/bin/python scripts/mosmix_snapshot.py
+TimeoutStartSec=20m
+
+# Background work — never compete with the scan that places real orders.
+Nice=10
+IOSchedulingClass=idle

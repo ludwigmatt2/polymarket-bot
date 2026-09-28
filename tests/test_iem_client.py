@@ -71,9 +71,21 @@ def test_metar_peak_max_and_min(monkeypatch):
 
 
 def test_mos_forecast_us_list(monkeypatch):
-    _mock_urlopen(monkeypatch, '[{"ftime":"2026-07-05T00:00","n_x":96.0}]')
+    cap = {}
+    _mock_urlopen(monkeypatch, '[{"ftime":"2026-07-05T00:00","n_x":96.0}]', cap)
     rows = iem.mos_forecast("KLGA", datetime(2026, 7, 3), "MEX")
     assert rows and rows[0]["n_x"] == 96.0
+    # T7 regression: IEM's mos.py rejects naive timestamps (pydantic
+    # timezone_aware error) — sts/ets must carry an explicit UTC 'Z'.
+    assert "sts=2026-07-03T00%3A00%3A00Z" in cap["url"]
+    assert "ets=2026-07-03T01%3A00%3A00Z" in cap["url"]
+
+
+def test_mos_forecast_bad_json_returns_empty(monkeypatch):
+    # A real IEM 422 (naive-timestamp rejection, pre-T7) came back as
+    # non-JSON body; must degrade to [] rather than raise.
+    _mock_urlopen(monkeypatch, "Internal Server Error")
+    assert iem.mos_forecast("KLGA", datetime(2026, 7, 3)) == []
 
 
 def test_mos_forecast_intl_empty(monkeypatch):
