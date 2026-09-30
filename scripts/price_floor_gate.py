@@ -72,7 +72,9 @@ def _won(row: dict) -> bool:
     return yes if row.get("direction") == "YES" else not yes
 
 
-def _load_band(since: str) -> list[dict]:
+def _load_band() -> list[dict]:
+    """Every resolved, non-longshot, sub-$0.40 row — the file is read once here;
+    callers slice this list by signal_time rather than each re-reading it."""
     if not PAPER_LOG.exists():
         sys.exit(f"No paper_trades.csv at {PAPER_LOG}\n"
                   "  On the VPS: sudo -u bot env RAILWAY_VOLUME_MOUNT_PATH=/opt/polymarket-bot/data \\\n"
@@ -88,10 +90,12 @@ def _load_band(since: str) -> list[dict]:
         ep = _num(r.get("entry_price"))
         if ep is None or ep >= BAND_HIGH:
             continue
-        if str(r.get("signal_time", "")) < since:
-            continue
         out.append(r)
     return out
+
+
+def _since(rows: list[dict], since: str) -> list[dict]:
+    return [r for r in rows if str(r.get("signal_time", "")) >= since]
 
 
 def _edge_and_z(rows: list[dict]) -> dict | None:
@@ -108,7 +112,7 @@ def _edge_and_z(rows: list[dict]) -> dict | None:
     eff_n = n / CORR_FACTOR
     var = realized * (1 - realized) / eff_n if 0 < realized < 1 else None
     z = edge / (var ** 0.5) if var else None
-    return {"n": n, "eff_n": eff_n, "realized": realized, "market": market, "edge": edge, "z": z}
+    return {"n": n, "realized": realized, "market": market, "edge": edge, "z": z}
 
 
 def _weeks_since(iso: str) -> float:
@@ -120,9 +124,10 @@ def main() -> None:
     print(f"Price-floor gate — is the ${BAND_HIGH:.2f} floor (LIVE_MIN_ENTRY_PRICE) "
           f"worth lowering?\n")
 
+    all_rows = _load_band()
+
     # ── context: the pre-lock record — NEVER the verdict ────────────────────
-    context = _load_band(GATE_ERA_START)
-    pre_lock = [r for r in context if str(r.get("signal_time", "")) < LOCK_DATE]
+    pre_lock = [r for r in _since(all_rows, GATE_ERA_START) if str(r.get("signal_time", "")) < LOCK_DATE]
     cs = _edge_and_z(pre_lock)
     print("CONTEXT ONLY (pre-lock record, already known to have flipped sign across "
           "windows — see edge_decay_sep2026.md / longshot_price_leak.md):")
@@ -136,7 +141,7 @@ def main() -> None:
           "  take the docstring's word for why a pooled historical read isn't trusted here.\n")
 
     # ── the actual gate: only NEW data since LOCK_DATE counts ───────────────
-    rows = _load_band(LOCK_DATE)
+    rows = _since(all_rows, LOCK_DATE)
     weeks = _weeks_since(LOCK_DATE)
     s = _edge_and_z(rows)
     n = s["n"] if s else 0

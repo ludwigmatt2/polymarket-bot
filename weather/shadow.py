@@ -54,20 +54,28 @@ class ModelSpec:
     # second station-forecast source without another ModelSpec field.
     station_forecast: str | None = None
 
+    def __post_init__(self) -> None:
+        """MOSMIX IS the MOS correction for a spec that uses it — stacking the
+        historical-skill shift on top would double-correct (see
+        StationForecastCorrector's docstring). Normalized HERE, not just in
+        build_model(), so the contradictory combination (mos_enabled=True,
+        station_forecast="mosmix") can't be constructed at all — a spec that
+        claims mos_enabled=True while actually running without MOS would be a
+        silent lie about its own config."""
+        if self.station_forecast == "mosmix" and self.mos_enabled:
+            object.__setattr__(self, "mos_enabled", False)
+
     def build_model(self, log_dir: Path) -> ProbabilityModel:
         """Construct an isolated ProbabilityModel for this spec. MOS off ⇒ no
         skill corrector, so signal_generator falls back to flat city bias exactly
         as it would if MOS had no data (the honest 'MOS contributes nothing' arm).
         emos_percell ⇒ attach the per-cell dispersion corrector, which overrides
         the scalar λ where the skill table has a trusted cell. station_forecast
-        ⇒ MOSMIX anchors the ensemble mean instead of MOS — mos_enabled is
-        forced off here regardless of the field's own value, since MOSMIX IS
-        the MOS correction for this spec and stacking both would double-correct
-        (see StationForecastCorrector's docstring)."""
-        mosmix = self.station_forecast == "mosmix"
-        corrector = HistoricalSkillCorrector() if (self.mos_enabled and not mosmix) else None
+        ⇒ MOSMIX anchors the ensemble mean instead of MOS (__post_init__ already
+        guarantees mos_enabled is False whenever this is set)."""
+        corrector = HistoricalSkillCorrector() if self.mos_enabled else None
         dispersion = DispersionCorrector(base_lambda=self.variance_inflation) if self.emos_percell else None
-        station = StationForecastCorrector() if mosmix else None
+        station = StationForecastCorrector() if self.station_forecast == "mosmix" else None
         cal_path = log_dir / "shadow" / self.name / "calibration_log.csv"
         return ProbabilityModel(
             calibration_log_path=cal_path,
@@ -105,8 +113,9 @@ DEFAULT_SPECS: list[ModelSpec] = [
     # clean read on whether station calibration beats no calibration. T1's
     # go/no-go (scripts/mosmix_backcheck.py) is still open; this track exists
     # to accumulate T3's forward data in parallel, not to pre-empt T1 — do not
-    # read its numbers as a verdict until T1 clears its own gate.
-    ModelSpec("mosmix", variance_inflation=2.0, mos_enabled=False, station_forecast="mosmix"),
+    # read its numbers as a verdict until T1 clears its own gate. (No
+    # mos_enabled=False here — ModelSpec.__post_init__ normalizes it.)
+    ModelSpec("mosmix", variance_inflation=2.0, station_forecast="mosmix"),
 ]
 
 

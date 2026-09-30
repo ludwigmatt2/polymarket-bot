@@ -92,10 +92,11 @@ def test_mosmix_spec_attaches_station_forecast_corrector(tmp_path):
 
 def test_mosmix_spec_forces_mos_off_even_if_mos_enabled_true(tmp_path):
     """MOSMIX IS the MOS correction for this spec — stacking the historical-skill
-    shift on top would double-correct. build_model must force this regardless of
-    what mos_enabled says, so a future edit to the DEFAULT_SPECS entry can't
-    silently reintroduce the double-correction."""
+    shift on top would double-correct. __post_init__ normalizes mos_enabled to
+    False the moment such a spec is constructed (not just inside build_model),
+    so the contradictory combination can't exist even transiently."""
     spec = ModelSpec("mosmix", station_forecast="mosmix", mos_enabled=True)
+    assert spec.mos_enabled is False
     model = spec.build_model(tmp_path)
     assert model.skill_corrector is None
 

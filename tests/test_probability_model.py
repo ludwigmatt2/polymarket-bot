@@ -380,6 +380,17 @@ class TestComputeProbabilityStationForecast:
         def target_mean(self, lat, lon, metric, target_date):
             return self._target
 
+    @staticmethod
+    def _half_forecast() -> EnsembleForecast:
+        """2/4 members above 90 — shared by the two no-shift tests below, which
+        differ only in HOW the corrector declines to shift (returns None vs.
+        isn't attached at all), not in the forecast itself."""
+        return EnsembleForecast(
+            lat=25.77, lon=-80.19, target_date=date(2026, 5, 1),
+            metric="temperature_2m_max",
+            member_arrays={"gfs_seamless": [88.0, 89.0, 91.0, 92.0]},
+        )
+
     def test_shift_moves_pooled_mean_to_target(self, tmp_path):
         forecast = EnsembleForecast(
             lat=25.77, lon=-80.19, target_date=date(2026, 5, 1),
@@ -413,25 +424,15 @@ class TestComputeProbabilityStationForecast:
         assert result.n_members == 3
 
     def test_none_target_leaves_members_unshifted(self, tmp_path):
-        forecast = EnsembleForecast(
-            lat=25.77, lon=-80.19, target_date=date(2026, 5, 1),
-            metric="temperature_2m_max",
-            member_arrays={"gfs_seamless": [88.0, 89.0, 91.0, 92.0]},  # 2/4 above 90
-        )
         model = ProbabilityModel(
             calibration_log_path=tmp_path / "cal.csv", skill_corrector=None,
             station_forecast_corrector=self._FakeCorrector(None),
         )
-        result = model.compute_probability(forecast, threshold=90.0, direction="above")
+        result = model.compute_probability(self._half_forecast(), threshold=90.0, direction="above")
         assert 0.3 < result.raw_p < 0.7  # unshifted "half" behavior, unchanged
 
     def test_no_corrector_is_a_pure_noop(self, tmp_path):
-        forecast = EnsembleForecast(
-            lat=25.77, lon=-80.19, target_date=date(2026, 5, 1),
-            metric="temperature_2m_max",
-            member_arrays={"gfs_seamless": [88.0, 89.0, 91.0, 92.0]},
-        )
         model = ProbabilityModel(calibration_log_path=tmp_path / "cal.csv", skill_corrector=None)
         assert model.station_forecast_corrector is None
-        result = model.compute_probability(forecast, threshold=90.0, direction="above")
+        result = model.compute_probability(self._half_forecast(), threshold=90.0, direction="above")
         assert 0.3 < result.raw_p < 0.7
