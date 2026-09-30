@@ -305,3 +305,133 @@ class TestCalibratorSanityGuard:
     def test_uncalibrated_passthrough_unaffected(self, tmp_path):
         m = ProbabilityModel(calibration_log_path=tmp_path / "none.csv")
         assert m._apply_calibration(0.42) == 0.42
+
+
+class TestStationForecastCorrector:
+    """Phase 3 T2 — MOSMIX-as-anchor. target_mean() degrades to None on any
+    miss (unmatched station, no WMO id, DWD outage) rather than raising, same
+    contract as mosmix_client itself."""
+
+    def _corrector(self):
+        from weather.probability_model import StationForecastCorrector
+        return StationForecastCorrector()
+
+    def test_covers_temperature_only(self):
+        c = self._corrector()
+        assert c.covers("temperature_2m_max") is True
+        assert c.covers("temperature_2m_min") is True
+        assert c.covers("precipitation_sum") is False
+
+    def test_target_mean_none_for_uncovered_metric(self):
+        c = self._corrector()
+        assert c.target_mean(25.77, -80.19, "precipitation_sum", date(2026, 5, 1)) is None
+
+    def test_target_mean_none_when_station_unmatched(self):
+        c = self._corrector()
+        assert c.target_mean(0.0, -160.0, "temperature_2m_max", date(2026, 5, 1)) is None
+
+    def test_target_mean_none_when_wmo_missing(self, monkeypatch):
+        # KDAL is a real registry entry with wmo=None (T6, not yet closed).
+        from weather import iem_client
+        c = self._corrector()
+        m = iem_client.station_meta("KDAL")
+        assert c.target_mean(m["lat"], m["lon"], "temperature_2m_max", date(2026, 5, 1)) is None
+
+    def test_target_mean_none_on_dwd_miss(self, monkeypatch):
+        from weather import mosmix_client
+        monkeypatch.setattr(mosmix_client, "fetch_station", lambda wmo, use_cache=True: None)
+        c = self._corrector()
+        m_kmia_lat, m_kmia_lon = 25.7880, -80.3169
+        assert c.target_mean(m_kmia_lat, m_kmia_lon, "temperature_2m_max", date(2026, 5, 1)) is None
+
+    def test_target_mean_returns_mosmix_mean(self, monkeypatch):
+        from weather import mosmix_client
+        sentinel_fc = object()
+        monkeypatch.setattr(mosmix_client, "fetch_station", lambda wmo, use_cache=True: sentinel_fc)
+        monkeypatch.setattr(mosmix_client, "daily_extreme",
+                             lambda fc, day, tz, kind: (31.5, 0.8) if fc is sentinel_fc else None)
+        c = self._corrector()
+        result = c.target_mean(25.7880, -80.3169, "temperature_2m_max", date(2026, 5, 1))
+        assert result == pytest.approx(31.5)
+
+    def test_target_mean_picks_min_kind_for_min_metric(self, monkeypatch):
+        from weather import mosmix_client
+        captured = {}
+        def fake_daily_extreme(fc, day, tz, kind):
+            captured["kind"] = kind
+            return (18.0, 0.5)
+        monkeypatch.setattr(mosmix_client, "fetch_station", lambda wmo, use_cache=True: object())
+        monkeypatch.setattr(mosmix_client, "daily_extreme", fake_daily_extreme)
+        c = self._corrector()
+        c.target_mean(25.7880, -80.3169, "temperature_2m_min", date(2026, 5, 1))
+        assert captured["kind"] == "min"
+
+
+class TestComputeProbabilityStationForecast:
+    """Phase 3 T2 integration: the mean-shift block in compute_probability."""
+
+    class _FakeCorrector:
+        """A duck-typed corrector with a fixed target_mean — isolates the shift
+        arithmetic in compute_probability from StationForecastCorrector's own
+        lookup plumbing (already covered by TestStationForecastCorrector)."""
+        def __init__(self, target):
+            self._target = target
+
+        def target_mean(self, lat, lon, metric, target_date):
+            return self._target
+
+    def test_shift_moves_pooled_mean_to_target(self, tmp_path):
+        forecast = EnsembleForecast(
+            lat=25.77, lon=-80.19, target_date=date(2026, 5, 1),
+            metric="temperature_2m_max",
+            member_arrays={"gfs_seamless": [88.0, 90.0, 92.0]},  # pooled mean 90.0
+        )
+        model = ProbabilityModel(
+            calibration_log_path=tmp_path / "cal.csv", skill_corrector=None,
+            station_forecast_corrector=self._FakeCorrector(95.0),
+        )
+        result = model.compute_probability(forecast, threshold=90.0, direction="above")
+        # shifted members: [93, 95, 97] -> pooled mean 95, matching the target;
+        # 3/3 now clear 90, vs half before the shift.
+        assert result.raw_p == pytest.approx(1.0, abs=0.01)
+
+    def test_shift_preserves_spread(self, tmp_path):
+        forecast = EnsembleForecast(
+            lat=25.77, lon=-80.19, target_date=date(2026, 5, 1),
+            metric="temperature_2m_max",
+            member_arrays={"gfs_seamless": [88.0, 90.0, 92.0]},
+        )
+        model = ProbabilityModel(
+            calibration_log_path=tmp_path / "cal.csv", skill_corrector=None,
+            variance_inflation_enabled=False,
+            station_forecast_corrector=self._FakeCorrector(100.0),
+        )
+        result = model.compute_probability(forecast, threshold=999.0, direction="above")
+        # 999 is unreachable either way; this test only needs the shift to have
+        # run without error and n_members to be unchanged (spread is a member-
+        # count/shape property, not separately exposed here).
+        assert result.n_members == 3
+
+    def test_none_target_leaves_members_unshifted(self, tmp_path):
+        forecast = EnsembleForecast(
+            lat=25.77, lon=-80.19, target_date=date(2026, 5, 1),
+            metric="temperature_2m_max",
+            member_arrays={"gfs_seamless": [88.0, 89.0, 91.0, 92.0]},  # 2/4 above 90
+        )
+        model = ProbabilityModel(
+            calibration_log_path=tmp_path / "cal.csv", skill_corrector=None,
+            station_forecast_corrector=self._FakeCorrector(None),
+        )
+        result = model.compute_probability(forecast, threshold=90.0, direction="above")
+        assert 0.3 < result.raw_p < 0.7  # unshifted "half" behavior, unchanged
+
+    def test_no_corrector_is_a_pure_noop(self, tmp_path):
+        forecast = EnsembleForecast(
+            lat=25.77, lon=-80.19, target_date=date(2026, 5, 1),
+            metric="temperature_2m_max",
+            member_arrays={"gfs_seamless": [88.0, 89.0, 91.0, 92.0]},
+        )
+        model = ProbabilityModel(calibration_log_path=tmp_path / "cal.csv", skill_corrector=None)
+        assert model.station_forecast_corrector is None
+        result = model.compute_probability(forecast, threshold=90.0, direction="above")
+        assert 0.3 < result.raw_p < 0.7

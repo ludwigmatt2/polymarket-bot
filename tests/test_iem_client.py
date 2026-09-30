@@ -43,6 +43,24 @@ def test_is_us():
     assert iem.is_us("ZZZZ") is False
 
 
+def test_icao_for_latlon_exact_and_near_match():
+    m = iem.station_meta("KLGA")
+    assert iem.icao_for_latlon(m["lat"], m["lon"]) == "KLGA"
+    # small offset (~1km), well inside the default 5km tolerance
+    assert iem.icao_for_latlon(m["lat"] + 0.01, m["lon"]) == "KLGA"
+
+
+def test_icao_for_latlon_no_match_far_away():
+    # middle of the Pacific — nowhere near any registered station
+    assert iem.icao_for_latlon(0.0, -160.0) is None
+
+
+def test_icao_for_latlon_respects_tolerance():
+    m = iem.station_meta("KLGA")
+    # ~1km offset matches at the default tolerance but not at an unrealistically tight one
+    assert iem.icao_for_latlon(m["lat"] + 0.01, m["lon"], max_distance_km=0.1) is None
+
+
 def test_daily_maxmin_parses(monkeypatch):
     cap = {}
     _mock_urlopen(monkeypatch,

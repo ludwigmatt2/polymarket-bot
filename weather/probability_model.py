@@ -22,6 +22,13 @@ from typing import Any
 
 _log = logging.getLogger(__name__)
 
+# Sentinel distinguishing "caller didn't specify skill_corrector" (auto-load the
+# default table — the production calling convention) from an EXPLICIT
+# skill_corrector=None (genuinely disable MOS — what weather.shadow's mos_off
+# and mosmix specs both need). Python can't tell those apart via a plain `None`
+# default; see ProbabilityModel.__init__.
+_AUTO_SKILL_CORRECTOR = object()
+
 import numpy as np
 from scipy.stats import gaussian_kde
 
@@ -193,6 +200,58 @@ class DispersionCorrector:
         return float(min(max(lam, self.lam_min), self.lam_max))
 
 
+class StationForecastCorrector:
+    """Phase 3 T2 — DWD MOSMIX as an anchor for the ensemble mean (see
+    docs/PHASE3_STATION_FORECAST_PLAN.md T2: "anchor, don't replace"). Unlike
+    HistoricalSkillCorrector's shift (a looked-up historical bias number), this
+    shifts every member so the POOLED ensemble mean equals MOSMIX's own
+    station-calibrated forecast for that exact day, keeping the ensemble's own
+    spread untouched — the smallest possible change that reuses the entire
+    downstream pipeline (rounding pre-image, KDE, calibration).
+
+    This IS the MOS correction for a spec that uses it — MOSMIX already
+    corrects for the grid-vs-station gap our historical-skill table exists to
+    approximate, so stacking both double-corrects. Build a shadow ModelSpec
+    with mos_enabled=False whenever station_forecast is set (enforced in
+    weather.shadow.ModelSpec.build_model, not here — this class has no
+    opinion about what else is active).
+
+    Deployed only as a shadow challenger ("mosmix"); production is untouched
+    until Phase 3 T3's forward gate passes. Returns None wherever the station
+    isn't covered, isn't matched, or DWD has no data right now — mosmix_client
+    has no SLA, so a miss must degrade to "no shift" (the caller's ensemble
+    mean stands as-is), never raise.
+    """
+
+    COVERED_METRICS = frozenset({"temperature_2m_max", "temperature_2m_min"})
+
+    def covers(self, metric: str) -> bool:
+        return metric in self.COVERED_METRICS
+
+    def target_mean(self, lat: float, lon: float, metric: str, target_date) -> float | None:
+        """MOSMIX's own daily-extreme mean (°C) for the station nearest
+        (lat, lon), or None. Only the mean is used here — T2 explicitly keeps
+        the ensemble's own spread; MOSMIX's sigma is for a later inverse-
+        variance blend (T5), not this mean-shift."""
+        if not self.covers(metric):
+            return None
+        from . import iem_client, mosmix_client
+
+        icao = iem_client.icao_for_latlon(lat, lon)
+        if icao is None:
+            return None
+        meta = iem_client.station_meta(icao)
+        wmo = meta["wmo"] if meta else None
+        if not wmo:
+            return None
+        fc = mosmix_client.fetch_station(wmo)
+        if fc is None:
+            return None
+        kind = "max" if metric == "temperature_2m_max" else "min"
+        result = mosmix_client.daily_extreme(fc, target_date, meta["tz"], kind)
+        return result[0] if result else None
+
+
 class ProbabilityModel:
     MIN_CALIBRATION_OBS = 30    # minimum to activate any calibrator
     PLATT_THRESHOLD = 300       # switch from Platt to isotonic above this
@@ -201,12 +260,13 @@ class ProbabilityModel:
     def __init__(
         self,
         calibration_log_path: Path = Path("logs/calibration_log.csv"),
-        skill_corrector: "HistoricalSkillCorrector | None" = None,
+        skill_corrector: "HistoricalSkillCorrector | None" = _AUTO_SKILL_CORRECTOR,
         model_weights: dict[str, float] | None = None,
         variance_inflation: float | None = None,
         variance_inflation_enabled: bool | None = None,
         dispersion_corrector: "DispersionCorrector | None" = None,
         calibration_halflife_days: float | None = None,
+        station_forecast_corrector: "StationForecastCorrector | None" = None,
         name: str = "production",
     ):
         self.calibration_log_path = calibration_log_path
@@ -236,12 +296,25 @@ class ProbabilityModel:
         # λ overrides the scalar variance_inflation wherever the skill table has a
         # trusted cell; elsewhere the scalar stands in. None → flat scalar λ (prod).
         self.dispersion_corrector = dispersion_corrector
+        # Phase 3 T2 (optional challenger). None on every existing spec, including
+        # production — unlike skill_corrector this is never auto-constructed,
+        # since it's meaningless without also disabling skill_corrector (see
+        # StationForecastCorrector's docstring; weather.shadow enforces that).
+        self.station_forecast_corrector = station_forecast_corrector
         # Phase 4: per-model member weights. None → the labeled literature prior.
         self.model_weights = MODEL_WEIGHTS if model_weights is None else model_weights
-        # Phase 1 MOS. Auto-load by default: a no-op when historical_skill.json is
-        # absent or the metric isn't covered, and only active when callers pass
-        # lead_day/month (the live signal path does; most unit tests don't).
-        if skill_corrector is None:
+        # Phase 1 MOS. Auto-load ONLY when the caller didn't specify the arg at
+        # all (a no-op when historical_skill.json is absent or the metric isn't
+        # covered, and only active when callers pass lead_day/month — the live
+        # signal path does; most unit tests don't). An EXPLICIT
+        # skill_corrector=None must mean "disabled", not "use the default" —
+        # weather.shadow's mos_off and mosmix specs both depend on that being
+        # true. Before _AUTO_SKILL_CORRECTOR existed, `is None` couldn't tell
+        # the two apart, so passing None auto-loaded the real (VPS-populated)
+        # table anyway — mos_off was silently running WITH MOS the whole time,
+        # structurally identical to prod_mirror (see PROJECT memory:
+        # mos_contributes_nothing.md's numbers are this bug's fingerprint).
+        if skill_corrector is _AUTO_SKILL_CORRECTOR:
             skill_corrector = HistoricalSkillCorrector()
         self.skill_corrector = skill_corrector
         self._calibrator: Any = None                               # global calibrator
@@ -289,6 +362,22 @@ class ProbabilityModel:
             )
             if shift is not None:
                 member_arrays = {m: [v - shift for v in vals] for m, vals in member_arrays.items()}
+
+        # Phase 3 T2: DWD MOSMIX as an anchor. Mutually exclusive with the MOS
+        # shift above by construction (weather.shadow builds a "mosmix" spec
+        # with skill_corrector=None) — this pools ALL members across models
+        # (not per-model like the MOS shift) and translates them so the pooled
+        # mean equals MOSMIX's own station forecast, keeping the ensemble's own
+        # spread untouched. See StationForecastCorrector's docstring for why.
+        if self.station_forecast_corrector is not None:
+            target = self.station_forecast_corrector.target_mean(
+                forecast.lat, forecast.lon, forecast.metric, forecast.target_date
+            )
+            if target is not None:
+                pooled = [v for vals in member_arrays.values() for v in vals]
+                if pooled:
+                    shift = (sum(pooled) / len(pooled)) - target
+                    member_arrays = {m: [v - shift for v in vals] for m, vals in member_arrays.items()}
 
         # Variance inflation (EMOS-lite) — AFTER the MOS shift (bias first, then
         # dispersion), BEFORE the clip (the observation clips the FORECAST

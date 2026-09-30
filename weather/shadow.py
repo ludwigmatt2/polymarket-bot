@@ -32,6 +32,7 @@ from .probability_model import (
     DispersionCorrector,
     HistoricalSkillCorrector,
     ProbabilityModel,
+    StationForecastCorrector,
 )
 from .signal_generator import SignalGenerator
 
@@ -48,15 +49,25 @@ class ModelSpec:
     emos_percell: bool = False
     model_weights: dict[str, float] | None = None
     calibration_halflife_days: float | None = None
+    # Phase 3 T2 (docs/PHASE3_STATION_FORECAST_PLAN.md). Only "mosmix" is
+    # meaningful today; the string (not a bool) leaves room for a future
+    # second station-forecast source without another ModelSpec field.
+    station_forecast: str | None = None
 
     def build_model(self, log_dir: Path) -> ProbabilityModel:
         """Construct an isolated ProbabilityModel for this spec. MOS off ⇒ no
         skill corrector, so signal_generator falls back to flat city bias exactly
         as it would if MOS had no data (the honest 'MOS contributes nothing' arm).
         emos_percell ⇒ attach the per-cell dispersion corrector, which overrides
-        the scalar λ where the skill table has a trusted cell."""
-        corrector = HistoricalSkillCorrector() if self.mos_enabled else None
+        the scalar λ where the skill table has a trusted cell. station_forecast
+        ⇒ MOSMIX anchors the ensemble mean instead of MOS — mos_enabled is
+        forced off here regardless of the field's own value, since MOSMIX IS
+        the MOS correction for this spec and stacking both would double-correct
+        (see StationForecastCorrector's docstring)."""
+        mosmix = self.station_forecast == "mosmix"
+        corrector = HistoricalSkillCorrector() if (self.mos_enabled and not mosmix) else None
         dispersion = DispersionCorrector(base_lambda=self.variance_inflation) if self.emos_percell else None
+        station = StationForecastCorrector() if mosmix else None
         cal_path = log_dir / "shadow" / self.name / "calibration_log.csv"
         return ProbabilityModel(
             calibration_log_path=cal_path,
@@ -66,6 +77,7 @@ class ModelSpec:
             variance_inflation_enabled=self.variance_inflation_enabled,
             dispersion_corrector=dispersion,
             calibration_halflife_days=self.calibration_halflife_days,
+            station_forecast_corrector=station,
             name=self.name,
         )
 
@@ -86,6 +98,15 @@ DEFAULT_SPECS: list[ModelSpec] = [
     # tracks the current regime instead of being outvoted by a stale summer history.
     # The candidate for the summer→autumn calibration drift (Sep 2026).
     ModelSpec("recency_cal", variance_inflation=2.0, calibration_halflife_days=30.0),
+    # Phase 3 T2: DWD MOSMIX anchors the ensemble mean at stations it covers
+    # (18/19 traded — KDAL/OMDB fall back to an unshifted ensemble, same as
+    # mos_off, until T6 closes that gap). Compare against mos_off specifically
+    # — same variance_inflation, only the mean-anchor source differs — for a
+    # clean read on whether station calibration beats no calibration. T1's
+    # go/no-go (scripts/mosmix_backcheck.py) is still open; this track exists
+    # to accumulate T3's forward data in parallel, not to pre-empt T1 — do not
+    # read its numbers as a verdict until T1 clears its own gate.
+    ModelSpec("mosmix", variance_inflation=2.0, mos_enabled=False, station_forecast="mosmix"),
 ]
 
 

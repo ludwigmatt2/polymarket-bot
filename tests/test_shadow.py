@@ -82,6 +82,40 @@ def test_lambda_discriminates_on_a_tail_bucket(tmp_path):
         lo.compute_probability(fc, 99.0, "above").raw_p
 
 
+# ── Phase 3 T2: mosmix spec ────────────────────────────────────────────────────
+def test_mosmix_spec_attaches_station_forecast_corrector(tmp_path):
+    from weather.probability_model import StationForecastCorrector
+    spec = ModelSpec("mosmix", station_forecast="mosmix")
+    model = spec.build_model(tmp_path)
+    assert isinstance(model.station_forecast_corrector, StationForecastCorrector)
+
+
+def test_mosmix_spec_forces_mos_off_even_if_mos_enabled_true(tmp_path):
+    """MOSMIX IS the MOS correction for this spec — stacking the historical-skill
+    shift on top would double-correct. build_model must force this regardless of
+    what mos_enabled says, so a future edit to the DEFAULT_SPECS entry can't
+    silently reintroduce the double-correction."""
+    spec = ModelSpec("mosmix", station_forecast="mosmix", mos_enabled=True)
+    model = spec.build_model(tmp_path)
+    assert model.skill_corrector is None
+
+
+def test_non_mosmix_spec_has_no_station_forecast_corrector(tmp_path):
+    spec = ModelSpec("plain", station_forecast=None)
+    model = spec.build_model(tmp_path)
+    assert model.station_forecast_corrector is None
+
+
+def test_default_specs_include_mosmix_paired_with_mos_off():
+    names = {s.name: s for s in DEFAULT_SPECS}
+    assert "mosmix" in names
+    mosmix, mos_off = names["mosmix"], names["mos_off"]
+    assert mosmix.station_forecast == "mosmix"
+    # Same variance_inflation as mos_off so mosmix-vs-mos_off isolates the mean-
+    # anchor source, not an incidental λ difference (see DEFAULT_SPECS comment).
+    assert mosmix.variance_inflation == mos_off.variance_inflation
+
+
 # ── tracker mechanics ─────────────────────────────────────────────────────────
 def test_evaluate_and_log_writes_isolated_files(tmp_path):
     # mos_enabled=False so the test doesn't depend on a local skill table shifting

@@ -77,6 +77,21 @@ def station_meta(icao: str) -> dict | None:
     return {"icao": key, "network": net, "sid": sid, "tz": tz, "lat": lat, "lon": lon, "wmo": wmo}
 
 
+def icao_for_latlon(lat: float, lon: float, max_distance_km: float = 5.0) -> str | None:
+    """Reverse lookup: the registry ICAO whose own coords are within
+    max_distance_km, or None. market_scanner constructs every Location from
+    this same registry's (lat, lon) (see station_meta), so this is a
+    same-source match — a tight tolerance is correct here, unlike
+    HistoricalSkillCorrector._nearest_city's fuzzy 100km nearest-city search."""
+    from .city_bias import _haversine
+    best, best_d = None, float("inf")
+    for icao, e in _STATION_REGISTRY.items():
+        d = _haversine(lat, lon, e[3], e[4])
+        if d < best_d:
+            best_d, best = d, icao
+    return best if best is not None and best_d < max_distance_km else None
+
+
 def is_us(icao: str) -> bool:
     """True for CONUS/US ASOS networks — the DSM-backed sites. US networks are
     exactly two segments ({STATE}_ASOS, incl. California's CA_ASOS); international
