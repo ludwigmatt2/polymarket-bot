@@ -44,10 +44,10 @@ from weather.live_trader import LiveTrader, check_geoblock
 from weather.paper_trader import PaperTrader
 from weather.position_monitor import PositionMonitor, print_divergences, print_flags
 from weather.price_tracker import PriceTracker
-from weather.probability_model import ProbabilityModel
+from weather.probability_model import DispersionCorrector, ProbabilityModel
 from weather.signal_generator import SignalGenerator
 from weather.weather_client import WeatherClient
-from weather.config import SHADOW_TRACKS_ENABLED
+from weather.config import LIVE_EMOS_PERCELL_ENABLED, SHADOW_TRACKS_ENABLED, VARIANCE_INFLATION
 
 # Shadow A/B tracker — built once per process (models load calibrators once), then
 # reused across scans. None until the first scan with SHADOW_TRACKS_ENABLED.
@@ -1206,7 +1206,13 @@ def main() -> None:
 
     # Build components
     client        = WeatherClient()
-    model         = ProbabilityModel(calibration_log_path=log_dir / "calibration_log.csv")
+    # Per-cell EMOS dispersion, promoted from the "emos_percell" shadow track
+    # (see weather/config.py:LIVE_EMOS_PERCELL_ENABLED for the promotion
+    # rationale and kill switch). None when disabled — byte-for-byte the prior
+    # scalar-λ behavior.
+    dispersion    = DispersionCorrector(base_lambda=VARIANCE_INFLATION) if LIVE_EMOS_PERCELL_ENABLED else None
+    model         = ProbabilityModel(calibration_log_path=log_dir / "calibration_log.csv",
+                                      dispersion_corrector=dispersion)
     bias          = CityBiasCorrector()
     scanner       = WeatherMarketScanner()
     price_tracker = PriceTracker()

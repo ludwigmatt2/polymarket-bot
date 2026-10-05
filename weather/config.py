@@ -300,13 +300,20 @@ LIVE_EXCLUDED_METRICS = frozenset({"temperature_2m_min"})
 # numbers and so errs slightly permissive there. Either way the floor is measured
 # against cost, which is the quantity the finding is about.
 #
-# 0.40 is where the data changes regime, NOT where profit factor peaks. Floors of
-# 0.45+ score better on the 83-trade live era (PF 1.46 vs 1.31) — that is fitting
-# noise. Any tighter floor must come from a forward shadow track, not a sweep.
-#
-# LIVE execution ONLY: the paper track keeps logging sub-floor signals so a tail
-# fix can be validated on the shadow harness before re-enable. 0.0 = no floor.
-LIVE_MIN_ENTRY_PRICE = 0.40
+# Lowered 2026-10-05 from 0.40 to 0.05 — a deliberate, discussed decision, NOT a
+# finding that the sub-0.40 band has proven edge (it hasn't: the full paper
+# history there is +0.028 edge at z=+0.58, not significant, and the sign flips
+# weekly — see edge_decay_sep2026.md). The real-money record for Jul8-Sep15
+# (the only period ever live-tested there) was a clear loser (n=18, 11% win,
+# -$24.66) — confirmed by paper's OWN data over that same exact window
+# (n=134, 17.9% win, -$789), so paper and live agree once matched on time; the
+# apparent "paper says profitable" read was comparing a different, later
+# calendar window, not a real methodology gap. 0.05 keeps out the most
+# illiquid/extreme-payout-multiple markets while unlocking the rest. The
+# forward, pre-registered read on whether this band has real edge going
+# forward is scripts/price_floor_gate.py — it does not answer before n>=250
+# AND 6 weeks elapsed from its 2026-09-30 lock. 0.0 = no floor at all.
+LIVE_MIN_ENTRY_PRICE = 0.05
 
 # ── Lead-time skill decay ──────────────────────────────────────────────────────
 LEAD_TIME_DECAY_PER_DAY = 0.05   # Shrink model_p 5% per day beyond day-1 toward 0.5
@@ -347,6 +354,21 @@ MODEL_WEIGHTING_ENABLED = True
 # vs market ~0.119 on the same buckets) — the calibrator retrain stacks on top.
 VARIANCE_INFLATION = 2.0
 VARIANCE_INFLATION_ENABLED = True
+
+# Promoted to live 2026-10-05 from the "emos_percell" shadow spec — the
+# strongest challenger in weather.shadow.DEFAULT_SPECS by Brier margin (+0.0077
+# vs market, full population, n=116), PF (1.82) and win rate (52%) at the time
+# of promotion, and the cleanest performer specifically in the sub-$0.40 bands
+# this same change unlocks (see LIVE_MIN_ENTRY_PRICE). n=116 is below this
+# project's own 250-trade decision threshold — this is the strongest available
+# candidate, not a proven one; promoting it live at the existing small stake
+# size is how it earns (or loses) that confirmation faster. Attaches a
+# DispersionCorrector (per-cell EMOS variance inflation) on top of the same
+# scalar VARIANCE_INFLATION base. Env-overridable kill switch, unlike the
+# plain-literal knobs above, because this — like GATE_ON_EXECUTABLE_ASK — is
+# new live-execution behavior that may need a fast revert without a code
+# deploy. 1 = on (default), 0 = revert to the flat scalar λ (prior behavior).
+LIVE_EMOS_PERCELL_ENABLED = os.environ.get("LIVE_EMOS_PERCELL_ENABLED", "1") != "0"
 
 # ── Shadow model tracks (forward A/B, Aug 2026) ────────────────────────────────
 # Run challenger model configs (weather.shadow.DEFAULT_SPECS) alongside the live

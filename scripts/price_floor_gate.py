@@ -1,6 +1,21 @@
-"""Pre-registered gate: should LIVE_MIN_ENTRY_PRICE (the $0.40 floor) be lowered?
+"""Pre-registered gate: does the sub-$0.40 band have real edge?
 
-Context. weather/config.py:LIVE_MIN_ENTRY_PRICE=0.40 blocks live from trading any
+UPDATE 2026-10-05: LIVE_MIN_ENTRY_PRICE was lowered from 0.40 to 0.05 — a
+deliberate decision, not this gate clearing (it hadn't: n=8 of the required
+250 at the time). The call was made on a fresh, direct look at the real-money
+record (Jul8-Sep15 live fills: n=18, 11% win, -$24.66) and paper's own data
+over that SAME window (n=134, 17.9% win, -$789) agreeing with each other once
+matched on time, plus the structural favorite-longshot-bias argument — not on
+the paper-only post-floor read this gate would have produced eventually. This
+script's BAND_HIGH stays 0.40 for continuity with its original design; going
+forward its signal_time>=LOCK_DATE rows mix the now-live 0.05-0.40 zone with
+the still-untested <0.05 zone, so a future "n>=250" verdict here answers a
+narrower question than originally framed — treat it as about the <0.05 band
+specifically, and watch LIVE's actual fills in 0.05-0.40 against paper's
+simulation for that zone directly instead.
+
+Context (as originally written, now partially superseded by the above).
+weather/config.py:LIVE_MIN_ENTRY_PRICE was 0.40, blocking live from trading any
 market priced under $0.40. It was set from an IN-SAMPLE finding (memory:
 longshot_price_leak — sub-$0.40 edge -0.046, and a real-fills era-replay: 18 fills
 blocked, 1 win, -$38.79). The out-of-sample check (memory: edge_decay_sep2026)
@@ -52,7 +67,8 @@ from weather.config import GATE_ERA_START  # noqa: E402
 from weather.paths import DATA_DIR  # noqa: E402
 
 PAPER_LOG = DATA_DIR / "logs" / "paper_trades.csv"
-BAND_HIGH = 0.40  # the current floor — this script only ever looks BELOW it
+BAND_HIGH = 0.40  # the ORIGINAL floor, kept for continuity — no longer the live
+                  # floor (now 0.05, see module docstring's 2026-10-05 update)
 LOCK_DATE = "2026-09-30T00:00:00+00:00"  # do not move this once set
 MIN_N = 250
 MIN_WEEKS = 6
