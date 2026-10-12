@@ -27,6 +27,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .config import LIVE_EMOS_PERCELL_ENABLED, VARIANCE_INFLATION
 from .paper_trader import PaperTrader
 from .probability_model import (
     DispersionCorrector,
@@ -96,7 +97,15 @@ class ModelSpec:
 # harness proving it can discriminate) plus a near-optimum probe. The proper
 # per-cell EMOS challenger is appended once fit_emos.py produces its table.
 DEFAULT_SPECS: list[ModelSpec] = [
-    ModelSpec("prod_mirror", variance_inflation=2.0, mos_enabled=True),
+    # Must track weather_bot.py's ACTUAL live construction, including its kill
+    # switches — a hardcoded snapshot goes stale the next time production's
+    # recipe changes. It did: Oct 5 2026 promoted emos_percell dispersion via
+    # LIVE_EMOS_PERCELL_ENABLED and this literal wasn't updated, so prod_mirror
+    # silently mirrored the PRE-promotion recipe for a week (caught via
+    # compare_tracks.py's drift check — see [[skill_corrector_sentinel_bug]] for
+    # the same staleness failure mode). Read live from config, not a literal.
+    ModelSpec("prod_mirror", variance_inflation=VARIANCE_INFLATION, mos_enabled=True,
+              emos_percell=LIVE_EMOS_PERCELL_ENABLED),
     ModelSpec("lambda_1_0", variance_inflation=1.0, variance_inflation_enabled=False),
     ModelSpec("lambda_2_5", variance_inflation=2.5),
     ModelSpec("mos_off", variance_inflation=2.0, mos_enabled=False),

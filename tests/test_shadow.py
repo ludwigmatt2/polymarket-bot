@@ -67,9 +67,25 @@ def test_prod_mirror_matches_a_default_model(tmp_path):
     prod = ProbabilityModel(calibration_log_path=tmp_path / "p.csv", skill_corrector=None)
     mirror = ModelSpec("prod_mirror", variance_inflation=2.0).build_model(tmp_path)
     mirror.skill_corrector = None  # match the no-MOS default model above
+    mirror.dispersion_corrector = None  # match the no-dispersion default model above
     fc = _forecast()
     assert mirror.compute_probability(fc, 98.0, "above").raw_p == \
         pytest.approx(prod.compute_probability(fc, 98.0, "above").raw_p, abs=1e-9)
+
+
+def test_default_prod_mirror_tracks_the_live_emos_percell_switch():
+    """weather_bot.py's live model attaches a DispersionCorrector iff
+    LIVE_EMOS_PERCELL_ENABLED. prod_mirror's whole job is to reproduce whatever
+    production actually runs, so it must track that same switch dynamically —
+    not a hardcoded snapshot that goes stale the next time the switch flips.
+    This is exactly the bug found 2026-10-12: prod_mirror drifted from
+    production for a week after the Oct 5 emos_percell promotion because this
+    spec was still hardcoded to the pre-promotion recipe."""
+    from weather.config import LIVE_EMOS_PERCELL_ENABLED, VARIANCE_INFLATION
+
+    mirror = next(s for s in DEFAULT_SPECS if s.name == "prod_mirror")
+    assert mirror.emos_percell == LIVE_EMOS_PERCELL_ENABLED
+    assert mirror.variance_inflation == VARIANCE_INFLATION
 
 
 def test_lambda_discriminates_on_a_tail_bucket(tmp_path):
