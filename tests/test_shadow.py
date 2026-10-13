@@ -214,3 +214,65 @@ def test_seeded_obs_reach_the_track_calibrator(tmp_path):
                             client=MagicMock(), log_dir=tmp_path)
     _, gen, _ = tracker.tracks[0]
     assert gen.model.n_calibration_obs == 5
+
+
+# ── Gate 6 parity + scalar_lambda counterfactual (Oct 2026) ───────────────────
+# Shadows ran with price_tracker=None and skipped Gate 6, so they were more
+# permissive than production. They now read production's PriceTracker as-of the
+# production signal_time (read-only, never double-recording).
+
+def _tracker_with_history(tmp_path, market_id, samples):
+    from weather.price_tracker import PriceTracker
+    t = PriceTracker(log_path=tmp_path / "price_history.csv")
+    t._cache[market_id] = [{"price": p, "ts": ts} for ts, p in samples]
+    return t
+
+
+def test_scalar_lambda_is_the_pre_promotion_recipe():
+    spec = {s.name: s for s in DEFAULT_SPECS}["scalar_lambda"]
+    assert spec.emos_percell is False and spec.mos_enabled is True
+    assert spec.variance_inflation == 2.0
+
+
+def test_gate6_parity_blocks_fast_mover_in_shadow(tmp_path):
+    now = datetime.now(timezone.utc)
+    # +0.20 over the window (> MAX_PRICE_VELOCITY_PP 0.15) → production rejects.
+    tr = _tracker_with_history(tmp_path, "shadow_mkt",
+                               [(now - timedelta(hours=5), 0.16), (now - timedelta(hours=1), 0.36)])
+    sigs = _production_signals(tmp_path)
+    specs = [ModelSpec("alpha", variance_inflation=2.0, mos_enabled=False)]
+
+    off = ShadowTracker(specs, client=MagicMock(), log_dir=tmp_path / "off")
+    assert off.evaluate_and_log(sigs) == {"alpha": 1}      # no tracker → Gate 6 skipped
+
+    on = ShadowTracker(specs, client=MagicMock(), log_dir=tmp_path / "on")
+    on.attach_price_tracker(tr)
+    assert on.evaluate_and_log(sigs) == {"alpha": 0}       # Gate 6 now rejects
+
+
+def test_gate6_view_ignores_samples_recorded_after_the_signal(tmp_path):
+    # Production records THIS scan's price after its own gate check. The shadow
+    # must not see it, or velocity differs from what production's gate computed.
+    sigs = _production_signals(tmp_path)
+    t0 = sigs[0].signal_time
+    tr = _tracker_with_history(tmp_path, "shadow_mkt", [
+        (t0 - timedelta(hours=4), 0.30),
+        (t0 - timedelta(hours=1), 0.34),
+        (t0 + timedelta(seconds=1), 0.60),   # recorded post-gate this scan
+    ])
+    tracker = ShadowTracker([ModelSpec("alpha", mos_enabled=False)],
+                            client=MagicMock(), log_dir=tmp_path / "t")
+    tracker.attach_price_tracker(tr)
+    tracker._price_view.as_of = t0
+    assert tracker._price_view.get_velocity("shadow_mkt", 6) == pytest.approx(0.04)
+
+
+def test_gate6_view_never_writes_to_production_history(tmp_path):
+    now = datetime.now(timezone.utc)
+    tr = _tracker_with_history(tmp_path, "shadow_mkt", [(now - timedelta(hours=2), 0.30)])
+    tracker = ShadowTracker([ModelSpec("a", mos_enabled=False), ModelSpec("b", mos_enabled=False)],
+                            client=MagicMock(), log_dir=tmp_path / "t")
+    tracker.attach_price_tracker(tr)
+    tracker.evaluate_and_log(_production_signals(tmp_path))
+    assert len(tr._cache["shadow_mkt"]) == 1
+    assert not (tmp_path / "price_history.csv").exists()

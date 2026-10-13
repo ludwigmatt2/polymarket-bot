@@ -25,6 +25,7 @@ from __future__ import annotations
 import shutil
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .config import LIVE_EMOS_PERCELL_ENABLED, VARIANCE_INFLATION
@@ -111,6 +112,13 @@ DEFAULT_SPECS: list[ModelSpec] = [
     ModelSpec("mos_off", variance_inflation=2.0, mos_enabled=False),
     # The proper per-cell EMOS — the real candidate this harness exists to judge.
     ModelSpec("emos_percell", variance_inflation=2.0, emos_percell=True),
+    # The pre-Oct-5 production recipe, pinned: scalar λ, MOS on, NO per-cell
+    # dispersion. prod_mirror now tracks production (= emos_percell), so this is
+    # the true counterfactual for the LIVE_EMOS_PERCELL_ENABLED promotion — the
+    # only clean A/B of "did promoting emos_percell help". Deliberately a
+    # literal (unlike prod_mirror): its whole point is to NOT follow the live
+    # switch. Warm-starts from production's calibration_log like any new track.
+    ModelSpec("scalar_lambda", variance_inflation=2.0, mos_enabled=True, emos_percell=False),
     # Recency-weighted calibrator (Workstream B): 30-day half-life so the calibrator
     # tracks the current regime instead of being outvoted by a stale summer history.
     # The candidate for the summer→autumn calibration drift (Sep 2026).
@@ -165,6 +173,36 @@ def _seed_calibration_log(log_dir: Path, track_dir: Path) -> bool:
         return False
 
 
+class _AsOfPriceView:
+    """Read-only Gate 6 view over PRODUCTION's PriceTracker, as of a given instant.
+
+    Shadows used to run with price_tracker=None, silently skipping Gate 6 (odds
+    velocity) — they were more permissive than production and took trades
+    production's gate rejected (Oct 2026, [[emos_percell_gap_investigation]]).
+    Two things make a naive shared tracker wrong:
+      * record() must be a no-op — production already recorded this scan's
+        price, and a second write per track would double-count the history.
+      * production records a market's price AFTER its own gate check, so by the
+        time a shadow runs, the newest sample is THIS scan's price. Production's
+        velocity never saw it. Reading strictly before `as_of` (the production
+        signal_time, which precedes that record) reproduces production's number.
+    """
+
+    def __init__(self, tracker):
+        self._tracker = tracker
+        self.as_of: datetime | None = None
+
+    def record(self, market_id: str, yes_price: float) -> None:  # noqa: ARG002
+        return None
+
+    def get_velocity(self, market_id: str, window_hours: float) -> float | None:
+        if self._tracker is None:
+            return None
+        as_of = self.as_of or datetime.now(timezone.utc)
+        return self._tracker.velocity_between(
+            market_id, as_of - timedelta(hours=window_hours), as_of)
+
+
 class ShadowTracker:
     """Runs a roster of challenger models over each scan's production forecasts
     and logs each track's own qualifying signals. Built once per process and
@@ -172,6 +210,9 @@ class ShadowTracker:
 
     def __init__(self, specs: list[ModelSpec], client, log_dir: Path):
         self.log_dir = log_dir
+        # Gate 6 parity: None until attach_price_tracker() hands us production's
+        # tracker (run_scan does, each scan — a resolve-only process never needs it).
+        self._price_view = _AsOfPriceView(None)
         self.tracks: list[tuple[ModelSpec, SignalGenerator, PaperTrader]] = []
         for spec in specs:
             # Each track owns an isolated directory for its paper log + calibrator.
@@ -181,9 +222,14 @@ class ShadowTracker:
             track_dir.mkdir(parents=True, exist_ok=True)
             _seed_calibration_log(log_dir, track_dir)
             model = spec.build_model(log_dir)
-            gen = SignalGenerator(model, client)
+            gen = SignalGenerator(model, client, price_tracker=self._price_view)
             paper = PaperTrader(log_path=track_dir / "paper_trades.csv")
             self.tracks.append((spec, gen, paper))
+
+    def attach_price_tracker(self, tracker) -> None:
+        """Point Gate 6 at production's PriceTracker (read-only). Idempotent;
+        until called (or with None) shadows skip Gate 6 like velocity-less data."""
+        self._price_view._tracker = tracker
 
     def evaluate_and_log(self, production_signals: list) -> dict[str, int]:
         """Re-score every market the production scan evaluated under each
@@ -199,6 +245,7 @@ class ShadowTracker:
                 if fc is None or mkt is None:
                     continue
                 try:
+                    self._price_view.as_of = getattr(s, "signal_time", None)
                     sig = gen.evaluate(mkt, forecast=fc)
                     if sig.quality_gate_passed and paper.log_trade(sig):
                         n += 1

@@ -133,6 +133,8 @@ def run_scan(
     if SHADOW_TRACKS_ENABLED and signals:
         try:
             tracker = _get_shadow_tracker(generator.client, log_dir)
+            # Gate 6 parity: shadows read (never write) production's price history.
+            tracker.attach_price_tracker(generator.price_tracker)
             counts = tracker.evaluate_and_log(signals)
             if any(counts.values()):
                 summary = " ".join(f"{k}={v}" for k, v in counts.items() if v)

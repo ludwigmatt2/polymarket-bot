@@ -72,6 +72,18 @@ class PriceTracker:
 
         return round(window_rows[-1]["price"] - window_rows[0]["price"], 4)
 
+    def velocity_between(self, market_id: str, start: datetime, end: datetime) -> float | None:
+        """Price delta (newest - oldest) over samples with start <= ts < end.
+
+        Same arithmetic as get_velocity but anchored at an explicit instant, so a
+        reader can reproduce what the gate saw BEFORE later samples were recorded
+        (the shadow harness's Gate 6 parity — see weather/shadow.py).
+        """
+        rows = [r for r in self._cache.get(market_id, []) if start <= r["ts"] < end]
+        if len(rows) < 2:
+            return None
+        return round(rows[-1]["price"] - rows[0]["price"], 4)
+
     def _load_recent_into_cache(self) -> None:
         """Populate cache from file on startup, skipping rows outside the window."""
         if not self.log_path.exists():
