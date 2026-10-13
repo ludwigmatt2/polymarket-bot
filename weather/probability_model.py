@@ -225,6 +225,13 @@ class StationForecastCorrector:
 
     COVERED_METRICS = frozenset({"temperature_2m_max", "temperature_2m_min"})
 
+    def __init__(self, bias_table=None):
+        """bias_table: optional weather.mosmix_bias.MosmixBiasTable. When given,
+        MOSMIX's mean is shifted by its learned per-(station, kind) bias before
+        anchoring (T1 found real systematic bias at EGLC/KATL/RJTT/RKSI). None
+        -> raw MOSMIX, byte-identical to the original behaviour."""
+        self.bias_table = bias_table
+
     def covers(self, metric: str) -> bool:
         return metric in self.COVERED_METRICS
 
@@ -249,7 +256,14 @@ class StationForecastCorrector:
             return None
         kind = "max" if metric == "temperature_2m_max" else "min"
         result = mosmix_client.daily_extreme(fc, target_date, meta["tz"], kind)
-        return result[0] if result else None
+        if not result:
+            return None
+        mean = result[0]
+        if self.bias_table is not None:
+            bias = self.bias_table.lookup(icao, kind)
+            if bias is not None:
+                mean -= bias
+        return mean
 
 
 class ProbabilityModel:

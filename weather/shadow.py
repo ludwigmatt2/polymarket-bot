@@ -29,6 +29,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .config import LIVE_EMOS_PERCELL_ENABLED, VARIANCE_INFLATION
+from .mosmix_bias import MosmixBiasTable
 from .paper_trader import PaperTrader
 from .probability_model import (
     DispersionCorrector,
@@ -55,6 +56,9 @@ class ModelSpec:
     # meaningful today; the string (not a bool) leaves room for a future
     # second station-forecast source without another ModelSpec field.
     station_forecast: str | None = None
+    # Apply the learned per-station MOSMIX bias (weather.mosmix_bias) before
+    # anchoring. Only meaningful with station_forecast="mosmix".
+    station_bias_correction: bool = False
 
     def __post_init__(self) -> None:
         """MOSMIX IS the MOS correction for a spec that uses it — stacking the
@@ -77,7 +81,11 @@ class ModelSpec:
         guarantees mos_enabled is False whenever this is set)."""
         corrector = HistoricalSkillCorrector() if self.mos_enabled else None
         dispersion = DispersionCorrector(base_lambda=self.variance_inflation) if self.emos_percell else None
-        station = StationForecastCorrector() if self.station_forecast == "mosmix" else None
+        station = None
+        if self.station_forecast == "mosmix":
+            table = (MosmixBiasTable.load(log_dir / "mosmix_bias.json")
+                     if self.station_bias_correction else None)
+            station = StationForecastCorrector(bias_table=table)
         cal_path = log_dir / "shadow" / self.name / "calibration_log.csv"
         return ProbabilityModel(
             calibration_log_path=cal_path,
@@ -133,6 +141,14 @@ DEFAULT_SPECS: list[ModelSpec] = [
     # read its numbers as a verdict until T1 clears its own gate. (No
     # mos_enabled=False here — ModelSpec.__post_init__ normalizes it.)
     ModelSpec("mosmix", variance_inflation=2.0, station_forecast="mosmix"),
+    # MOSMIX + learned per-station bias (T1 follow-up, Oct 2026). Paired with
+    # "mosmix": identical except the bias shift, so mosmix_bc-vs-mosmix isolates
+    # what the correction is worth. Table = data/logs/mosmix_bias.json, refit
+    # daily by scripts/mosmix_snapshot.py; absent/stale file => behaves exactly
+    # like "mosmix". Offline causal walk-forward (scripts/mosmix_bias_eval.py)
+    # is promising but spans ~15 days of one regime — forward data decides.
+    ModelSpec("mosmix_bc", variance_inflation=2.0, station_forecast="mosmix",
+              station_bias_correction=True),
 ]
 
 

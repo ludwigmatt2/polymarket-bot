@@ -34,7 +34,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from weather import iem_client, mosmix_client  # noqa: E402
+from weather import iem_client, mosmix_bias, mosmix_client  # noqa: E402
 from weather.models import Location  # noqa: E402
 from weather.paths import DATA_DIR  # noqa: E402
 from weather.probability_model import HistoricalSkillCorrector  # noqa: E402
@@ -147,6 +147,15 @@ def main() -> None:
 
     print(f"mosmix_snapshot: wrote {written} rows, skipped {skipped_dup} dup / "
           f"{skipped_nodata} no-data / {skipped_no_wmo} no-wmo -> {ARCHIVE_PATH}")
+
+    # Refit the per-station bias table the "mosmix_bc" shadow track reads. Done
+    # here (an existing daily timer) so no new systemd unit is needed. Isolated:
+    # a failed refit leaves yesterday's table in place and never fails the run.
+    try:
+        n = mosmix_bias.refit_from_archive(ARCHIVE_PATH, DATA_DIR / "logs" / "mosmix_bias.json")
+        print(f"mosmix_snapshot: bias table refit -> {n} (station, kind) entries")
+    except Exception as e:  # noqa: BLE001
+        print(f"mosmix_snapshot: bias refit failed (kept previous table): {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":
