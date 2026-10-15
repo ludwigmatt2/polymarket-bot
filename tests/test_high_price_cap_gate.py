@@ -73,4 +73,5 @@ def test_load_fills_filters_unresolved_and_unfilled(tmp_path):
         w.writerow(cols)
         w.writerows(rows)
     out = gate.load_fills(p)
-    assert len(out) == 1 and out[0]["stake"] == 5.0 and out[0]["pnl"] == 5.0
+    # pnl is NET of the taker fee: 5.0 - 5.0 * 0.05 * (1 - 0.5)
+    assert len(out) == 1 and out[0]["stake"] == 5.0 and abs(out[0]["pnl"] - 4.875) < 1e-9

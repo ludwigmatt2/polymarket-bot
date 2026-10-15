@@ -21,6 +21,10 @@ THE GATE (locked 2026-10-15 before scoring new data — do not loosen):
   - Metric: ROI(short) - ROI(long), ROI = pnl / stake. Day-clustered bootstrap
     P(diff > 0): paper is the larger sample (>= 0.90 needed), live is the real
     money (>= 0.80 needed). Both diffs must be > 0 and live ROI(short) > 0.
+  - AMENDED 2026-10-15 (same day, before any post-lock row had resolved,
+    n=0): ROI is NET of the Polymarket taker fee (weather/fees.py,
+    0.05*p*(1-p) per share, measured on-chain) for both sets — neither CSV
+    subtracts it. The in-sample table above is gross and is context only.
   - Action on PROCEED is also pre-stated: a smaller stake multiplier for lead
     >= 12h (env-overridable, shadow-evaluated first), NOT blanket exclusion.
 
@@ -37,6 +41,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from weather.fees import taker_fee_usd  # noqa: E402
 from weather.paths import DATA_DIR  # noqa: E402
 
 LIVE_LOG = DATA_DIR / "logs" / "live_trades.csv"
@@ -85,10 +90,12 @@ def _load(path: Path, *, live: bool) -> list[dict]:
                     continue
                 if r.get("metric") == "precipitation_sum":
                     continue
+                px = _num(r["entry_price"])
                 stake = _num(r.get("size_usd"))
             pnl = _num(r.get("pnl_usd"))
             if not stake or pnl is None or r.get("actual_outcome", "") == "":
                 continue
+            pnl -= taker_fee_usd(stake, px)
             lead = _lead_hours(r.get("signal_time", ""), r.get("resolution_date", ""))
             if lead is None:
                 continue

@@ -38,6 +38,12 @@ numbers after seeing a result):
     >= BOOT_P_MIN (80%) of resamples AND the delta has the same sign in both
     halves of the window.
   - PnL under a cap is pnl * min(1, cap/stake): linear, no bankroll feedback.
+  - AMENDED 2026-10-15 (same day, before any post-lock fill had resolved,
+    n=0): all PnL is NET of the Polymarket taker fee (weather/fees.py,
+    0.05*p*(1-p) per share, measured on-chain). live_trades.csv's pnl_usd is
+    gross of it; with a ~2.4% fee the band's "break-even" win rate moves up and
+    a gross-only gate would flatter every variant. The in-sample numbers quoted
+    above are gross and are context only.
 
 Run: venv/bin/python scripts/high_price_cap_gate.py
 """
@@ -52,6 +58,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from weather.fees import taker_fee_usd  # noqa: E402
 from weather.paths import DATA_DIR  # noqa: E402
 
 LIVE_LOG = DATA_DIR / "logs" / "live_trades.csv"
@@ -76,7 +83,8 @@ def _num(x):
 
 def load_fills(path: Path = LIVE_LOG) -> list[dict]:
     """Resolved, actually-filled live rows as {px, stake, pnl, t}. stake is the
-    USD cost (filled_size * filled_price), the quantity a cap would bound."""
+    USD cost (filled_size * filled_price), the quantity a cap would bound; pnl
+    is NET of the taker fee."""
     if not path.exists():
         sys.exit(f"No live_trades.csv at {path}\n"
                  "  On the VPS: sudo -u bot env RAILWAY_VOLUME_MOUNT_PATH=/opt/polymarket-bot/data \\\n"
@@ -89,7 +97,9 @@ def load_fills(path: Path = LIVE_LOG) -> list[dict]:
             size, px, pnl = _num(r.get("filled_size")), _num(r.get("filled_price")), _num(r.get("pnl_usd"))
             if not size or px is None or pnl is None or r.get("actual_outcome", "") == "":
                 continue
-            out.append({"px": px, "stake": size * px, "pnl": pnl, "t": r.get("signal_time", "")})
+            stake = size * px
+            out.append({"px": px, "stake": stake, "pnl": pnl - taker_fee_usd(stake, px),
+                        "t": r.get("signal_time", "")})
     return out
 
 

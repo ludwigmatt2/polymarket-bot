@@ -32,6 +32,12 @@ THE GATE (locked 2026-10-15 before scoring new data — do not loosen):
     Recommended KELLY_FRACTION = current 0.25 x median s* (rounded to 0.01).
   - Otherwise keep sizing. A result with s* >= 1 does NOT justify going bigger
     under this gate; that is a separate, harder claim.
+AMENDED 2026-10-15 (same day, before any post-lock fill had resolved, n=0): pnl
+and the bankroll path are NET of the Polymarket taker fee (weather/fees.py,
+0.05*p*(1-p) per share, measured on-chain; live_trades.csv pnl_usd is gross of
+it). Realized edge is reported net of fee per share too. A fee of ~2.4% of
+stake is as large as the whole realized edge, so a gross replay would call
+sizing optimal where the net one may not.
 Caveats baked in: no bankroll feedback beyond the compounding above, concurrent
 open positions are treated as sequential, and BANKROLL_START is the wallet
 equity measured on-chain 2026-10-15 (pUSD 76.50 + open positions 12.68).
@@ -51,6 +57,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from weather.config import KELLY_FRACTION  # noqa: E402
+from weather.fees import fee_per_share, taker_fee_usd  # noqa: E402
 from weather.paths import DATA_DIR  # noqa: E402
 
 LIVE_LOG = DATA_DIR / "logs" / "live_trades.csv"
@@ -85,7 +92,9 @@ def load_fills(path: Path = LIVE_LOG) -> list[dict]:
             size, px, pnl = _num(r.get("filled_size")), _num(r.get("filled_price")), _num(r.get("pnl_usd"))
             if not size or not px or pnl is None or r.get("actual_outcome", "") == "":
                 continue
-            out.append({"stake": size * px, "px": px, "pnl": pnl,
+            stake = size * px
+            out.append({"stake": stake, "px": px, "pnl": pnl - taker_fee_usd(stake, px),
+                        "gross_win": pnl > 0,
                         "edge": _num(r.get("edge_pp")),
                         "t": r.get("signal_time", ""), "res": r.get("resolved_at", "")})
     return out
@@ -128,11 +137,12 @@ def evaluate(rows: list[dict]) -> dict:
     if not rows:
         return res
     n = len(rows)
-    wins = sum(1 for r in rows if r["pnl"] > 0)
+    wins = sum(1 for r in rows if r["gross_win"])
     claimed = [r["edge"] for r in rows if r["edge"] is not None]
     res.update(
         s_star=best_multiplier(rows),
-        realized_edge=wins / n - statistics.mean(r["px"] for r in rows),
+        # win rate - price paid - fee per share: the edge a share actually earned.
+        realized_edge=wins / n - statistics.mean(r["px"] + fee_per_share(r["px"]) for r in rows),
         claimed_edge=statistics.mean(claimed) if claimed else None,
         curve={s: log_growth(sorted(rows, key=lambda r: r["res"]), s) for s in (0.25, 0.5, 0.75, 1.0, 1.25)},
     )
@@ -154,7 +164,7 @@ def main() -> None:
     print(f"GATE (locked {LOCK_DATE}): need n>={MIN_N} resolved live fills. So far: n={r['n']}.\n")
     if r["n"]:
         ce = f"{r['claimed_edge']*100:.1f}pp" if r.get("claimed_edge") is not None else "n/a"
-        print(f"  context: claimed edge {ce}, realized edge {r['realized_edge']*100:+.1f}pp")
+        print(f"  context: claimed edge {ce}, realized edge (net of fee) {r['realized_edge']*100:+.1f}pp")
         print(f"  context: hindsight growth-optimal multiplier s* = {r['s_star']:.2f}")
         print("  context: log-growth by multiplier: " +
               "  ".join(f"{s:.2f}x={g:+.3f}" for s, g in r["curve"].items()) + "\n")

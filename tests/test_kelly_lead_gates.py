@@ -24,7 +24,7 @@ def _fill(i, win, stake=4.0, px=0.5):
     # win returns +stake*(1/px-1) = +stake at px=0.5; loss returns -stake.
     pnl = stake if win else -stake
     day = 16 + i % 20
-    return {"stake": stake, "px": px, "pnl": pnl, "edge": 0.13,
+    return {"stake": stake, "px": px, "pnl": pnl, "gross_win": win, "edge": 0.13,
             "t": f"2026-10-{day:02d}T08:00:00+00:00", "res": f"2026-10-{day:02d}T20:{i % 60:02d}:00+00:00"}
 
 
@@ -71,6 +71,29 @@ def test_kelly_loader_filters_unresolved_and_unfilled(tmp_path):
         w.writerows(rows)
     out = kelly.load_fills(p)
     assert len(out) == 1 and out[0]["stake"] == 5.0
+    # pnl is NET of the taker fee: 5.0 - 5.0*0.05*(1-0.5)
+    assert abs(out[0]["pnl"] - 4.875) < 1e-9 and out[0]["gross_win"] is True
+
+
+def test_lead_loaders_subtract_fee(tmp_path):
+    cols = ["order_status", "filled_size", "filled_price", "actual_outcome", "pnl_usd",
+            "signal_time", "resolution_date"]
+    p = tmp_path / "live_trades.csv"
+    with p.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(cols)
+        w.writerow(["matched", "10", "0.5", "1", "5.0", "2026-10-16T00:00:00+00:00", "2026-10-16T06:00:00+00:00"])
+    out = lead.load_live(p)
+    assert len(out) == 1 and abs(out[0]["pnl"] - 4.875) < 1e-9 and out[0]["lead"] == 6.0
+    pc = tmp_path / "paper_trades.csv"
+    with pc.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["entry_price", "size_usd", "actual_outcome", "pnl_usd", "metric",
+                    "signal_time", "resolution_date"])
+        w.writerow(["0.4", "20", "1", "30", "temperature_2m_max",
+                    "2026-10-16T00:00:00+00:00", "2026-10-16T06:00:00+00:00"])
+    pout = lead.load_paper(pc)
+    assert abs(pout[0]["pnl"] - (30 - 20 * 0.05 * 0.6)) < 1e-9
 
 
 # ── lead_time_gate ──────────────────────────────────────────────────────────
