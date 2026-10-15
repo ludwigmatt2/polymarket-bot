@@ -66,11 +66,16 @@ class SignalGenerator:
         client: WeatherClient,
         price_tracker=None,
         bias_corrector: CityBiasCorrector | None = None,
+        min_net_ev_pp: float | None = None,
     ):
         self.model = model
         self.client = client
         self.price_tracker = price_tracker
         self.bias_corrector = bias_corrector or CityBiasCorrector()
+        # Gate 4 floor. Production leaves this None (= config MIN_NET_EV_PP); only
+        # a shadow track (weather.shadow ModelSpec.min_net_ev_pp) overrides it, to
+        # measure what a lower floor WOULD have done without touching live.
+        self.min_net_ev_pp = MIN_NET_EV_PP if min_net_ev_pp is None else min_net_ev_pp
 
     def evaluate(self, market: WeatherMarket, forecast=None) -> Signal:
         """
@@ -209,7 +214,7 @@ class SignalGenerator:
         # Re-check gate 4 after both shrinkages
         if gate_passed:
             net_ev_shrunk = edge_pp - EDGE_SAFETY_MARGIN_PP
-            if net_ev_shrunk < MIN_NET_EV_PP:
+            if net_ev_shrunk < self.min_net_ev_pp:
                 gate_passed = False
                 rejection_reason = f"gate4_after_shrinkage:{net_ev_shrunk:.3f}"
 
@@ -371,8 +376,8 @@ class SignalGenerator:
                 else (market.yes_price if side_is_yes else 1.0 - market.yes_price))
         gross_ev = p_win - cost
         net_ev = gross_ev - EDGE_SAFETY_MARGIN_PP
-        if net_ev < MIN_NET_EV_PP:
-            return False, f"gate4_margin_adjusted_edge:{net_ev:.3f}_required:{MIN_NET_EV_PP}", 0.0
+        if net_ev < self.min_net_ev_pp:
+            return False, f"gate4_margin_adjusted_edge:{net_ev:.3f}_required:{self.min_net_ev_pp}", 0.0
 
         # Gate 4.5: edge CEILING — a claimed edge this large is evidence of model
         # error, not opportunity (>0.20pp ran PF 0.66-0.81 in both halves of the

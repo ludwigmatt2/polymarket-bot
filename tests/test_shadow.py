@@ -276,3 +276,35 @@ def test_gate6_view_never_writes_to_production_history(tmp_path):
     tracker.evaluate_and_log(_production_signals(tmp_path))
     assert len(tr._cache["shadow_mkt"]) == 1
     assert not (tmp_path / "price_history.csv").exists()
+
+
+# ── lowedge: Gate 4 floor probe ───────────────────────────────────────────────
+def test_signal_generator_floor_defaults_to_config():
+    from weather.config import MIN_NET_EV_PP
+    model = MagicMock()
+    assert SignalGenerator(model=model, client=MagicMock()).min_net_ev_pp == MIN_NET_EV_PP
+    assert SignalGenerator(model=model, client=MagicMock(), min_net_ev_pp=0.0).min_net_ev_pp == 0.0
+
+
+def test_lowedge_spec_is_prod_recipe_with_only_the_floor_relaxed():
+    by = {s.name: s for s in DEFAULT_SPECS}
+    low, prod = by["lowedge"], by["prod_mirror"]
+    assert low.min_net_ev_pp == 0.0 and prod.min_net_ev_pp is None
+    for f in ("variance_inflation", "variance_inflation_enabled", "mos_enabled",
+              "emos_percell", "model_weights", "calibration_halflife_days",
+              "station_forecast", "station_bias_correction"):
+        assert getattr(low, f) == getattr(prod, f), f
+
+
+def test_lowedge_admits_a_sub_threshold_edge_that_production_rejects(tmp_path):
+    low = ModelSpec("lowedge", variance_inflation=2.0, min_net_ev_pp=0.0)
+    prod = ModelSpec("prod", variance_inflation=2.0)
+    tracker = ShadowTracker([low, prod], MagicMock(), tmp_path)
+    gens = {spec.name: gen for spec, gen, _ in tracker.tracks}
+    # yes_price 0.44 against a ~0.5 model: ~6pp edge — under the 11pp production
+    # floor, over the 3pp margin the relaxed floor still requires.
+    sig_prod = gens["prod"].evaluate(_market(0.44), forecast=_forecast())
+    sig_low = gens["lowedge"].evaluate(_market(0.44), forecast=_forecast())
+    assert 0.03 < sig_low.edge_pp < 0.11
+    assert not sig_prod.quality_gate_passed
+    assert sig_low.quality_gate_passed

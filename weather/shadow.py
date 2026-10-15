@@ -59,6 +59,12 @@ class ModelSpec:
     # Apply the learned per-station MOSMIX bias (weather.mosmix_bias) before
     # anchoring. Only meaningful with station_forecast="mosmix".
     station_bias_correction: bool = False
+    # Gate 4 floor override for this track (None = production's MIN_NET_EV_PP).
+    # Unlike every other field this changes the DECISION, not the model output:
+    # the track keeps production's exact recipe and only admits lower-edge
+    # signals, so its sub-threshold rows are a clean "what if the floor were
+    # lower" read. See scripts/lowedge_gate.py.
+    min_net_ev_pp: float | None = None
 
     def __post_init__(self) -> None:
         """MOSMIX IS the MOS correction for a spec that uses it — stacking the
@@ -149,6 +155,15 @@ DEFAULT_SPECS: list[ModelSpec] = [
     # is promising but spans ~15 days of one regime — forward data decides.
     ModelSpec("mosmix_bc", variance_inflation=2.0, station_forecast="mosmix",
               station_bias_correction=True),
+    # Gate 4 floor probe (Oct 2026): production's exact recipe (tracks the live
+    # emos_percell switch like prod_mirror) with Gate 4 relaxed to
+    # net_ev >= 0.0, i.e. claimed edge >= EDGE_SAFETY_MARGIN_PP (3pp) instead of
+    # 11pp. Every other gate (ceiling, velocity, confidence, depth, ...) is
+    # unchanged. Rows with edge_pp >= 0.11 duplicate production; the signal is
+    # the 3-11pp band production never logs. Judged ONLY by the pre-registered
+    # scripts/lowedge_gate.py — do not read this track's total PnL.
+    ModelSpec("lowedge", variance_inflation=VARIANCE_INFLATION, mos_enabled=True,
+              emos_percell=LIVE_EMOS_PERCELL_ENABLED, min_net_ev_pp=0.0),
 ]
 
 
@@ -238,7 +253,8 @@ class ShadowTracker:
             track_dir.mkdir(parents=True, exist_ok=True)
             _seed_calibration_log(log_dir, track_dir)
             model = spec.build_model(log_dir)
-            gen = SignalGenerator(model, client, price_tracker=self._price_view)
+            gen = SignalGenerator(model, client, price_tracker=self._price_view,
+                                  min_net_ev_pp=spec.min_net_ev_pp)
             paper = PaperTrader(log_path=track_dir / "paper_trades.csv")
             self.tracks.append((spec, gen, paper))
 
