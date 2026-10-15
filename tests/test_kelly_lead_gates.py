@@ -130,3 +130,17 @@ def test_lead_proceed_requires_both_sets():
     assert lead.verdict(good, good)["proceed"] is True
     assert lead.verdict(good, bad)["proceed"] is False  # paper contradicts live
     assert lead.verdict(bad, bad)["proceed"] is False
+
+
+def test_lead_paper_rows_are_scored_at_the_ask_not_the_mid(tmp_path):
+    pc = tmp_path / "paper_trades.csv"
+    with pc.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["entry_price", "size_usd", "actual_outcome", "pnl_usd", "metric", "signal_time",
+                    "resolution_date", "model_p", "edge_pp", "direction"])
+        # NO: p_win 0.65, ask 0.56, mid entry 0.50, win.
+        w.writerow(["0.50", "20", "1", "20.0", "temperature_2m_max",
+                    "2026-10-16T00:00:00+00:00", "2026-10-16T06:00:00+00:00", "0.35", "0.09", "NO"])
+    out = lead.load_paper(pc)
+    ask = 0.56
+    assert abs(out[0]["pnl"] - (20.0 * (1 / ask - 1) - 20.0 * 0.05 * (1 - ask))) < 1e-9

@@ -40,3 +40,21 @@ def row_fee_usd(row: dict, stake_usd: float, price: float) -> float:
         except (TypeError, ValueError):
             pass
     return taker_fee_usd(stake_usd, price)
+
+
+def executable_cost(row: dict) -> float | None:
+    """The price a BUY of this paper row would actually have paid: the traded
+    side's ASK, recovered as p_win - edge_pp (edge_pp is p_win minus the ask,
+    see SignalGenerator). PaperTrader logs entry_price at the MID, so scoring a
+    paper row at entry_price assumes half a spread better than live fills get
+    (~0.7c/share measured). Returns None when the row lacks model_p/edge_pp or
+    the recovered value is not a valid price; callers fall back to entry_price.
+    """
+    try:
+        model_p = float(row["model_p"])
+        edge = float(row["edge_pp"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    p_win = model_p if row.get("direction") == "YES" else 1.0 - model_p
+    ask = p_win - edge
+    return ask if 0.0 < ask < 1.0 else None

@@ -287,13 +287,15 @@ def test_signal_generator_floor_defaults_to_config():
 
 
 def test_lowedge_spec_is_prod_recipe_with_only_the_floor_relaxed():
+    import dataclasses
     by = {s.name: s for s in DEFAULT_SPECS}
     low, prod = by["lowedge"], by["prod_mirror"]
     assert low.min_net_ev_pp == 0.0 and prod.min_net_ev_pp is None
-    for f in ("variance_inflation", "variance_inflation_enabled", "mos_enabled",
-              "emos_percell", "model_weights", "calibration_halflife_days",
-              "station_forecast", "station_bias_correction"):
-        assert getattr(low, f) == getattr(prod, f), f
+    # EVERY field, so a ModelSpec field added later can't silently diverge.
+    for f in dataclasses.fields(ModelSpec):
+        if f.name in ("name", "min_net_ev_pp"):
+            continue
+        assert getattr(low, f.name) == getattr(prod, f.name), f.name
 
 
 def test_lowedge_admits_a_sub_threshold_edge_that_production_rejects(tmp_path):

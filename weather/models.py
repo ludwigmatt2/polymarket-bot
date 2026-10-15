@@ -142,8 +142,9 @@ class Signal:
     # Executable edge: P(win) minus what the contract COSTS (the traded side's
     # ask, or the mid-implied price when no book was fetched). Can be negative
     # on a rejected signal whose spread swallowed the model's disagreement —
-    # that is real information, not a bug. Gate-passed signals are always
-    # >= MIN_NET_EV_PP + EDGE_SAFETY_MARGIN_PP.
+    # that is real information, not a bug. Gate-passed PRODUCTION signals are
+    # always >= MIN_NET_EV_PP + EDGE_SAFETY_MARGIN_PP; a shadow track with a
+    # lowered floor (ModelSpec.min_net_ev_pp, e.g. "lowedge") can be below it.
     edge_pp: float
     direction: str          # "YES" or "NO" (which contract to buy)
     ensemble_spread: float

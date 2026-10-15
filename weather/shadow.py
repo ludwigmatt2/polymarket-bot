@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import shutil
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -111,6 +111,9 @@ class ModelSpec:
 # others are deliberately known-different (λ=1.0 must look WORSE — that's the
 # harness proving it can discriminate) plus a near-optimum probe. The proper
 # per-cell EMOS challenger is appended once fit_emos.py produces its table.
+_PROD_MIRROR = ModelSpec("prod_mirror", variance_inflation=VARIANCE_INFLATION, mos_enabled=True,
+                        emos_percell=LIVE_EMOS_PERCELL_ENABLED)
+
 DEFAULT_SPECS: list[ModelSpec] = [
     # Must track weather_bot.py's ACTUAL live construction, including its kill
     # switches — a hardcoded snapshot goes stale the next time production's
@@ -119,8 +122,7 @@ DEFAULT_SPECS: list[ModelSpec] = [
     # silently mirrored the PRE-promotion recipe for a week (caught via
     # compare_tracks.py's drift check — see [[skill_corrector_sentinel_bug]] for
     # the same staleness failure mode). Read live from config, not a literal.
-    ModelSpec("prod_mirror", variance_inflation=VARIANCE_INFLATION, mos_enabled=True,
-              emos_percell=LIVE_EMOS_PERCELL_ENABLED),
+    _PROD_MIRROR,
     ModelSpec("lambda_1_0", variance_inflation=1.0, variance_inflation_enabled=False),
     ModelSpec("lambda_2_5", variance_inflation=2.5),
     ModelSpec("mos_off", variance_inflation=2.0, mos_enabled=False),
@@ -162,8 +164,11 @@ DEFAULT_SPECS: list[ModelSpec] = [
     # unchanged. Rows with edge_pp >= 0.11 duplicate production; the signal is
     # the 3-11pp band production never logs. Judged ONLY by the pre-registered
     # scripts/lowedge_gate.py — do not read this track's total PnL.
-    ModelSpec("lowedge", variance_inflation=VARIANCE_INFLATION, mos_enabled=True,
-              emos_percell=LIVE_EMOS_PERCELL_ENABLED, min_net_ev_pp=0.0),
+    # Derived from prod_mirror (not re-stated) so it cannot go stale when
+    # production's recipe changes. Caveat: like every shadow it keeps an ISOLATED
+    # calibrator that learns only from its own (lower-edge) trades, so its model_p
+    # can drift from production's after the warm-start — see lowedge_gate.py.
+    replace(_PROD_MIRROR, name="lowedge", min_net_ev_pp=0.0),
 ]
 
 

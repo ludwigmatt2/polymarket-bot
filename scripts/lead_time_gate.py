@@ -22,7 +22,9 @@ THE GATE (locked 2026-10-15 before scoring new data — do not loosen):
     P(diff > 0): paper is the larger sample (>= 0.90 needed), live is the real
     money (>= 0.80 needed). Both diffs must be > 0 and live ROI(short) > 0.
   - AMENDED 2026-10-15 (same day, before any post-lock row had resolved,
-    n=0): ROI is NET of the Polymarket taker fee (weather/fees.py,
+    n=0): paper rows are scored at the executable ASK (p_win - edge_pp), not
+    the logged mid entry_price, so paper and live share one price basis; and
+    ROI is NET of the Polymarket taker fee (weather/fees.py,
     0.05*p*(1-p) per share, measured on-chain) for both sets — neither CSV
     subtracts it. The in-sample table above is gross and is context only.
   - Action on PROCEED is also pre-stated: a smaller stake multiplier for lead
@@ -41,7 +43,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from weather.fees import taker_fee_usd  # noqa: E402
+from weather.fees import executable_cost, taker_fee_usd  # noqa: E402
 from weather.paths import DATA_DIR  # noqa: E402
 
 LIVE_LOG = DATA_DIR / "logs" / "live_trades.csv"
@@ -90,11 +92,18 @@ def _load(path: Path, *, live: bool) -> list[dict]:
                     continue
                 if r.get("metric") == "precipitation_sum":
                     continue
-                px = _num(r["entry_price"])
+                # Paper logs entry_price at the MID; a live BUY pays the ASK
+                # (p_win - edge_pp). Score paper rows at the ask so the two sets
+                # are on the same price basis (~0.7c/share). Rows lacking
+                # model_p/edge_pp fall back to entry_price.
+                px = executable_cost(r) or _num(r["entry_price"])
                 stake = _num(r.get("size_usd"))
             pnl = _num(r.get("pnl_usd"))
             if not stake or pnl is None or r.get("actual_outcome", "") == "":
                 continue
+            if not live:
+                # Re-price the gross PnL from the mid entry to the ask.
+                pnl = stake * (1.0 / px - 1.0) if pnl > 0 else -stake
             pnl -= taker_fee_usd(stake, px)
             lead = _lead_hours(r.get("signal_time", ""), r.get("resolution_date", ""))
             if lead is None:
