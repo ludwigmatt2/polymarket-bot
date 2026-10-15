@@ -279,3 +279,9 @@ class PaperTradingStats:
     # (exit_pnl_usd where an exit fired, else pnl_usd) vs hold-to-resolution.
     exit_sim_pnl: float = 0.0
     exit_sim_count: int = 0             # resolved trades that had a simulated exit
+    # Net of the Polymarket taker fee (weather/fees.py). pnl_usd / profit_factor
+    # above stay GROSS so history and the go-live threshold (calibrated on gross
+    # numbers) are comparable; these are the honest after-cost counterparts.
+    total_paper_pnl_net: float = 0.0
+    profit_factor_net: float = 0.0
+    station_profit_factor_net: float = 0.0

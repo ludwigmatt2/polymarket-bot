@@ -27,6 +27,7 @@ from .config import (
     PAPER_TRADE_SIZE_USD,
 )
 from .models import Location, PaperTrade, PaperTradingStats, Signal, _evaluate_outcome
+from .fees import row_fee_usd, taker_fee_usd
 from .relayer import chain_outcome
 from .station_truth import station_outcome
 
@@ -63,6 +64,10 @@ CSV_HEADERS = [
     "restofday",
     # X1 exit simulation (counterfactual only — pnl_usd stays hold-to-resolution):
     "exit_time", "exit_price", "exit_pnl_usd", "exit_reason",
+    # Polymarket taker fee paid on the BUY (weather/fees.py), written at
+    # resolution. pnl_usd stays GROSS of it; net = pnl_usd - fee_usd. Appended
+    # last so older rows parse (_load_all backfills "").
+    "fee_usd",
 ]
 
 # Brier score for an uninformed 50/50 forecast (climatology baseline)
@@ -183,6 +188,7 @@ class PaperTrader:
         target["actual_outcome"] = int(actual_outcome)
         target["resolved_at"] = now
         target["pnl_usd"] = round(pnl, 4)
+        target["fee_usd"] = round(taker_fee_usd(size_usd, entry_price), 4)
         target["brier_score"] = round(brier, 4)
 
         self._rewrite_all(trades)
@@ -311,6 +317,7 @@ class PaperTrader:
             t["actual_outcome"] = int(outcome)
             t["resolved_at"] = now.isoformat()
             t["pnl_usd"] = round(pnl, 4)
+            t["fee_usd"] = round(taker_fee_usd(size_usd, entry_price), 4)
             t["brier_score"] = round(_brier(model_p, outcome), 4)
             t["label_source"] = label_source
             resolved += 1
@@ -420,6 +427,9 @@ class PaperTrader:
                 exit_sim_pnl += float(t["pnl_usd"])
         briers = [float(t["brier_score"]) for t in resolved if t.get("brier_score") not in (None, "")]
         edges = [float(t["edge_pp"]) for t in resolved]
+        # After-cost counterpart of pnls (same rows, same order).
+        pnls_net = [float(t["pnl_usd"]) - row_fee_usd(t, float(t["size_usd"]), float(t["entry_price"]))
+                    for t in resolved if t.get("pnl_usd") not in (None, "")]
 
         wins = [p for p in pnls if p > 0]
         losses = [abs(p) for p in pnls if p < 0]
@@ -460,13 +470,14 @@ class PaperTrader:
         station = [t for t in resolved
                    if t.get("label_source") in ("station", "onchain")
                    and str(t.get("signal_time", "")) >= GATE_ERA_START]
-        st_pnls, st_model_sq, st_market_sq, st_sizes = [], [], [], []
+        st_pnls, st_pnls_net, st_model_sq, st_market_sq, st_sizes = [], [], [], [], []
         first_signal = last_signal = None
         for t in station:
             try:
                 outcome = float(t["actual_outcome"])
                 ep = float(t["entry_price"])
                 st_pnls.append(float(t["pnl_usd"]))
+                st_pnls_net.append(float(t["pnl_usd"]) - row_fee_usd(t, float(t["size_usd"]), ep))
                 st_sizes.append(float(t["size_usd"]))
                 st_model_sq.append((float(t["model_p"]) - outcome) ** 2)
                 # The market's own forecast is the YES price at entry: for a NO
@@ -496,6 +507,14 @@ class PaperTrader:
             eq += p
             pk = max(pk, eq)
             st_dd = max(st_dd, (pk - eq) / st_capital)
+
+        def _pf(vals: list[float]) -> float:
+            w = sum(v for v in vals if v > 0)
+            l = -sum(v for v in vals if v < 0)
+            return (w / l) if l else (float("inf") if w else 0.0)
+
+        pf_net = _pf(pnls_net)
+        st_pf_net = _pf(st_pnls_net)
 
         failure_reasons = []
         if n_station < GATE_MIN_STATION_RESOLVED:
@@ -529,6 +548,9 @@ class PaperTrader:
             days_elapsed=days_elapsed,
             exit_sim_pnl=round(exit_sim_pnl, 2),
             exit_sim_count=exit_sim_count,
+            total_paper_pnl_net=round(sum(pnls_net), 2),
+            profit_factor_net=round(pf_net, 3) if pf_net != float("inf") else pf_net,
+            station_profit_factor_net=round(st_pf_net, 3) if st_pf_net != float("inf") else st_pf_net,
         )
 
     def print_dashboard(self) -> None:
@@ -540,14 +562,16 @@ class PaperTrader:
         print(f"  Profit factor:     {stats.profit_factor:.2f}")
         print(f"  Brier Skill Score: {stats.brier_skill_score:+.3f}  (vs climatology; display only)")
         print(f"  Mean Brier:        {stats.mean_brier_score:.4f}  (0.25 = random)")
-        print(f"  Total paper PnL:   ${stats.total_paper_pnl:.2f}")
+        print(f"  Total paper PnL:   ${stats.total_paper_pnl:.2f}  "
+              f"(net of taker fee: ${stats.total_paper_pnl_net:.2f}, PF {stats.profit_factor_net:.2f})")
         print(f"  Avg edge:          {stats.avg_edge_pp:.1%}")
         print(f"  Max drawdown:      {stats.max_drawdown_pct:.1%}  (limit: {MAX_PAPER_DRAWDOWN_PCT:.0%})")
         print()
         print("  ── Re-live gate (station-labeled trades only) ──")
         print(f"  Station resolved:  {stats.station_resolved}  (need ≥ {GATE_MIN_STATION_RESOLVED})")
         print(f"  Days elapsed:      {stats.days_elapsed}  (need ≥ {GATE_MIN_DAYS_ELAPSED})")
-        print(f"  Station PF:        {stats.station_profit_factor:.2f}  (need ≥ {MIN_PROFIT_FACTOR})")
+        print(f"  Station PF:        {stats.station_profit_factor:.2f}  (need ≥ {MIN_PROFIT_FACTOR}; "
+              f"net of fee {stats.station_profit_factor_net:.2f}, informational)")
         print(f"  Model vs market:   Brier {stats.station_model_brier:.4f} vs {stats.station_market_brier:.4f}"
               f"  ({'model BEATS market' if stats.station_model_brier < stats.station_market_brier else 'model does NOT beat market'})")
         if stats.exit_sim_count:

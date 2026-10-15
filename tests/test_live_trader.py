@@ -189,6 +189,17 @@ class TestDailyPnl:
 
         assert trader.daily_pnl() == pytest.approx(7.50)
 
+    def test_daily_pnl_is_net_of_recorded_fee(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        today = datetime.now(timezone.utc).date().isoformat()
+        _write_live_trades(trader._log_path, [
+            {"pnl_usd": "10.00", "fee_usd": "0.40", "actual_outcome": "1",
+             "resolved_at": f"{today}T14:00:00+00:00"},
+            {"pnl_usd": "-5.00", "fee_usd": "", "actual_outcome": "0",  # legacy row, no fee
+             "resolved_at": f"{today}T14:00:00+00:00"},
+        ])
+        assert trader.daily_pnl() == pytest.approx(4.60)
+
     def test_daily_pnl_zero_without_resolved_rows(self, tmp_path):
         trader = _make_trader(tmp_path)
         today = datetime.now(timezone.utc).date().isoformat()

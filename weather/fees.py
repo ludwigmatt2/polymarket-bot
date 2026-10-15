@@ -26,3 +26,17 @@ def taker_fee_usd(stake_usd: float, price: float) -> float:
     if not (0.0 < price < 1.0) or stake_usd <= 0:
         return 0.0
     return stake_usd * FEE_RATE * (1.0 - price)
+
+
+def row_fee_usd(row: dict, stake_usd: float, price: float) -> float:
+    """Fee for a logged trade row: the recorded `fee_usd` when the bot wrote one
+    (rows resolved after the fee column was added), else recomputed from stake and
+    price. Lets net PnL be computed uniformly over history that predates the
+    column, without rewriting it."""
+    raw = row.get("fee_usd")
+    if raw not in (None, ""):
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            pass
+    return taker_fee_usd(stake_usd, price)

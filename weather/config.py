@@ -6,7 +6,7 @@ All thresholds and constants live here — no magic numbers in other modules.
 import os
 
 # ── Signal quality thresholds ──────────────────────────────────────────────────
-MIN_NET_EV_PP = 0.08            # Gate 4: minimum edge after subtracting round-trip fees
+MIN_NET_EV_PP = 0.08            # Gate 4: minimum edge after the EDGE_SAFETY_MARGIN_PP haircut (taker fee NOT included — see note at EDGE_SAFETY_MARGIN_PP)
                                 # Raised 0.04→0.08 (Jun 2026): 5-10% gross-edge trades earned
                                 # only +28.6% ROI vs +50.8% for >20% edge (577-trade dataset).
 # Gate 4.5: edge CEILING — reject signals claiming MORE gross edge than this.
@@ -123,15 +123,27 @@ MIN_YES_ENTRY_PRICE = 0.15
 BLOCKED_YES_CITIES: list[str] = ["Tokyo"]
 
 # ── Edge safety margin ─────────────────────────────────────────────────────────
-# Polymarket charges NO fees on these markets, positions are held to resolution,
-# and redemption is free — the old "ROUND_TRIP_FEE=0.04" was fiction. What the
-# haircut actually pays for is MODEL ERROR / adverse selection: when the model
-# disagrees with the market, part of that gap is the model being wrong, and the
-# marginal trades are where miscalibration lives (Jul-7 audit calibration curve).
-# Reduced 4pp → 3pp at the Jul-8 paper reset; to be tuned empirically from the
-# realized-vs-modeled edge curve once ~150+ station-resolved trades exist.
-# Execution costs are handled explicitly elsewhere (Gate 5.5 spread cap + the
-# edge-preserving FAK price cap), NOT by this margin.
+# CORRECTION 2026-10-15: Polymarket DOES charge a taker fee on these markets —
+# 0.05 * p * (1-p) per share on the BUY (~1.2c/share, ~2.4% of stake; measured
+# on-chain over 215 live fills, corr 1.00 with p(1-p); see weather/fees.py).
+# Redemption is free and positions are held to resolution, so it is one-sided
+# (BUY only). The earlier "NO fees" note was wrong and every CSV pnl_usd is
+# GROSS of it; fee_usd is now recorded alongside and net = pnl_usd - fee_usd.
+#
+# This margin is NOT fee-aware and deliberately stays that way: replaying a
+# fee-aware Gate 4 (edge - margin - fee >= MIN_NET_EV_PP) over resolved trades
+# would have dropped 30-44% of signals — mostly the 0.11-0.125 edge band that
+# piles up right at the threshold — and the DROPPED trades were net-profitable
+# (paper n=234, +9.5% ROI net; live n=63, +$15 net, 49% win) while the kept ones
+# were worse. Do not "fix" this by subtracting the fee here without new evidence.
+#
+# What the 3pp haircut pays for is MODEL ERROR / adverse selection: when the
+# model disagrees with the market, part of that gap is the model being wrong,
+# and the marginal trades are where miscalibration lives (Jul-7 audit
+# calibration curve). Reduced 4pp → 3pp at the Jul-8 paper reset; to be tuned
+# empirically from the realized-vs-modeled edge curve once ~150+
+# station-resolved trades exist. Execution slippage is handled elsewhere
+# (Gate 5.5 spread cap + the edge-preserving FAK price cap).
 EDGE_SAFETY_MARGIN_PP = 0.03
 
 # Measure edge against the price a BUY actually PAYS — the traded side's best ask

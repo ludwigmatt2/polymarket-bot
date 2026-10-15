@@ -29,6 +29,7 @@ from .config import (
     MAX_SLIPPAGE,
     MIN_NET_EV_PP,
 )
+from .fees import taker_fee_usd
 from .models import Signal
 from .paper_trader import PaperTrader, _brier
 from .secrets import _LEGACY_SIG_MAP
@@ -91,6 +92,10 @@ _CSV_HEADERS = [
     # is APPLIED to raw_p at inference, so it must be TRAINED on raw_p — logging
     # the calibrated+shrunk model_p here poisoned the scale (Jul 7 audit).
     "raw_p",
+    # Polymarket taker fee paid on the BUY (weather/fees.py), written at
+    # resolution. pnl_usd stays GROSS of it; net = pnl_usd - fee_usd. Appended
+    # last so existing files parse (rewritten with the full header on resolve).
+    "fee_usd",
 ]
 
 # Public Data API — on-chain positions per wallet address (no auth required).
@@ -407,7 +412,9 @@ class LiveTrader:
             for row in csv.DictReader(f):
                 if row.get("resolved_at", "").startswith(today) and row.get("pnl_usd"):
                     try:
-                        total += float(row["pnl_usd"])
+                        # Net of the taker fee (fee_usd is written at resolution;
+                        # "" on rows resolved before the column existed).
+                        total += float(row["pnl_usd"]) - float(row.get("fee_usd") or 0.0)
                     except ValueError:
                         pass
         return total
@@ -751,6 +758,7 @@ class LiveTrader:
             t["actual_outcome"] = int(outcome)
             t["resolved_at"] = now.isoformat()
             t["pnl_usd"] = round(pnl, 4)
+            t["fee_usd"] = round(taker_fee_usd(filled_size * filled_price, filled_price), 4)
             t["brier_score"] = round(_brier(model_p, outcome), 4)
 
             res_date_str = t.get("resolution_date", "")

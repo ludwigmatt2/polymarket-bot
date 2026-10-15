@@ -509,3 +509,35 @@ class TestGateEraScoping:
         mid = sorted(r["signal_time"] for r in rows)[20]
         monkeypatch.setattr(pt, "GATE_ERA_START", mid)
         assert 0 < trader.compute_stats().station_resolved < 40
+
+
+class TestTakerFee:
+    """pnl_usd stays GROSS; fee_usd is recorded at resolution and net = pnl - fee."""
+
+    def test_resolve_trade_records_fee_and_keeps_pnl_gross(self, tmp_path):
+        from weather.fees import taker_fee_usd
+        trader = _make_trader(tmp_path)
+        row = {f: "" for f in CSV_HEADERS}
+        row.update({"trade_id": "f001", "market_id": "m", "market_title": "t",
+                    "signal_time": datetime.now(timezone.utc).isoformat(),
+                    "entry_price": 0.40, "model_p": 0.60, "direction": "YES",
+                    "size_usd": 20.0, "size_factor": 1.0, "edge_pp": 0.1,
+                    "ensemble_spread": 0.05, "confidence_score": 0.7,
+                    "resolution_date": datetime.now(timezone.utc).isoformat()})
+        with open(trader.log_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=CSV_HEADERS, extrasaction="ignore")
+            w.writeheader(); w.writerow(row)
+        trader.resolve_trade("f001", True)
+        saved = trader._load_all()[0]
+        assert float(saved["pnl_usd"]) == pytest.approx(20.0 * (1 / 0.40 - 1))  # gross
+        assert float(saved["fee_usd"]) == pytest.approx(taker_fee_usd(20.0, 0.40))
+
+    def test_stats_net_fields_use_recorded_or_recomputed_fee(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        _add_resolved_trades(trader, 10, win_rate=0.5)  # rows predate fee_usd -> recomputed
+        s = trader.compute_stats()
+        fee_each = 25.0 * 0.05 * (1 - 0.30)
+        assert s.total_paper_pnl_net == pytest.approx(s.total_paper_pnl - 10 * fee_each, abs=0.05)
+        assert s.profit_factor_net < s.profit_factor
+        # The go-live gate itself still reads the GROSS station PF.
+        assert s.station_profit_factor_net <= s.station_profit_factor or s.station_resolved == 0
