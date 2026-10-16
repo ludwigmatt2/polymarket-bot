@@ -38,6 +38,17 @@ and the bankroll path are NET of the Polymarket taker fee (weather/fees.py,
 it). Realized edge is reported net of fee per share too. A fee of ~2.4% of
 stake is as large as the whole realized edge, so a gross replay would call
 sizing optimal where the net one may not.
+CONTROL (added 2026-10-16, before any post-lock fill had resolved): equal-weight
+vs Kelly. The question "should capital be spread evenly across the signals found
+instead of Kelly-sized per trade" is a SHAPE question, independent of the level
+s* above. Counterfactual: same number of fills, same TOTAL deployed capital, but
+every fill gets the window's mean stake. flat_delta = mean_stake * sum(net_return_i)
+- sum(net_pnl_i) (positive = equal-weight would have earned more). Context at any
+n; the verdict needs n >= MIN_N and a day-clustered bootstrap P(flat_delta > 0) >=
+FLAT_P_MIN (0.80). PROCEED here only means "evaluate equal-weight sizing next
+(shadow first)", never an automatic change. In-sample (2026-10-15) stake size and
+return were uncorrelated (-0.03) and equal-weight ROI beat Kelly-weighted ROI by
+~1.3pp — the reason this control exists.
 Caveats baked in: no bankroll feedback beyond the compounding above, concurrent
 open positions are treated as sequential, and BANKROLL_START is the wallet
 equity measured on-chain 2026-10-15 (pUSD 76.50 + open positions 12.68).
@@ -66,6 +77,7 @@ BANKROLL_START = 89.0
 MIN_N = 250
 S_REDUCE = 0.70
 BOOT_P_MIN = 0.80
+FLAT_P_MIN = 0.80
 BOOT_N = 2000
 BOOT_SEED = 1
 GRID = [round(0.05 * i, 2) for i in range(0, 31)]  # 0.00 .. 1.50
@@ -131,6 +143,29 @@ def _boot_s_star(rows: list[dict]) -> list[float]:
     return out
 
 
+def flat_delta(rows: list[dict]) -> float:
+    """Equal-weight minus Kelly net PnL at identical total deployed capital."""
+    usable = [r for r in rows if r["stake"] > 0]
+    if not usable:
+        return 0.0
+    mean_stake = sum(r["stake"] for r in usable) / len(usable)
+    flat = mean_stake * sum(r["pnl"] / r["stake"] for r in usable)
+    return flat - sum(r["pnl"] for r in usable)
+
+
+def _boot_flat_p(rows: list[dict]) -> float:
+    by_day: dict[str, list[dict]] = defaultdict(list)
+    for r in rows:
+        by_day[r["res"][:10]].append(r)
+    days = list(by_day.values())
+    rng = random.Random(BOOT_SEED)
+    ok = 0
+    for _ in range(BOOT_N):
+        sample = [r for d in (rng.choice(days) for _ in days) for r in d]
+        ok += flat_delta(sample) > 0
+    return ok / BOOT_N
+
+
 def evaluate(rows: list[dict]) -> dict:
     """Pure gate logic over rows already restricted to signal_time >= LOCK_DATE."""
     res = {"n": len(rows), "answerable": False}
@@ -145,13 +180,16 @@ def evaluate(rows: list[dict]) -> dict:
         realized_edge=wins / n - statistics.mean(r["px"] + fee_per_share(r["px"]) for r in rows),
         claimed_edge=statistics.mean(claimed) if claimed else None,
         curve={s: log_growth(sorted(rows, key=lambda r: r["res"]), s) for s in (0.25, 0.5, 0.75, 1.0, 1.25)},
+        flat_delta=flat_delta(rows),
     )
     if n < MIN_N:
         return res
     boots = _boot_s_star(rows)
     res.update(answerable=True,
                s_median=statistics.median(boots),
-               p_reduce=sum(1 for s in boots if s <= S_REDUCE) / len(boots))
+               p_reduce=sum(1 for s in boots if s <= S_REDUCE) / len(boots),
+               flat_p=_boot_flat_p(rows))
+    res["flat_preferred"] = res["flat_delta"] > 0 and res["flat_p"] >= FLAT_P_MIN
     res["proceed"] = res["p_reduce"] >= BOOT_P_MIN
     res["kelly_fraction"] = round(KELLY_FRACTION * res["s_median"], 2)
     return res
@@ -167,13 +205,19 @@ def main() -> None:
         print(f"  context: claimed edge {ce}, realized edge (net of fee) {r['realized_edge']*100:+.1f}pp")
         print(f"  context: hindsight growth-optimal multiplier s* = {r['s_star']:.2f}")
         print("  context: log-growth by multiplier: " +
-              "  ".join(f"{s:.2f}x={g:+.3f}" for s, g in r["curve"].items()) + "\n")
+              "  ".join(f"{s:.2f}x={g:+.3f}" for s, g in r["curve"].items()))
+        print(f"  context: equal-weight minus Kelly net PnL at equal deployment: "
+              f"{r['flat_delta']:+.2f} USD\n")
     if not r["answerable"]:
         print("VERDICT: not answerable yet. Nothing to turn on — live_trades.csv already "
               "records everything this needs. Do NOT act on the context numbers above.")
         return
     print(f"  bootstrap median s* = {r['s_median']:.2f}; "
           f"P(s* <= {S_REDUCE}) = {r['p_reduce']:.2f} (need >= {BOOT_P_MIN:.2f})")
+    print(f"  equal-weight control: bootstrap P(equal-weight beats Kelly) = {r['flat_p']:.2f} "
+          f"(need >= {FLAT_P_MIN:.2f})  ->  "
+          + ("EVALUATE equal-weight sizing next (shadow first)" if r["flat_preferred"]
+             else "Kelly shape not beaten out of sample"))
     if r["proceed"]:
         extra = (" NOTE: s*≈0 means no realized edge at all — the honest response is "
                  "'stop live sizing', not 'size smaller'.") if r["s_median"] <= 0.05 else ""

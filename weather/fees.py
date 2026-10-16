@@ -49,7 +49,15 @@ def executable_cost(row: dict) -> float | None:
     paper row at entry_price assumes half a spread better than live fills get
     (~0.7c/share measured). Returns None when the row lacks model_p/edge_pp or
     the recovered value is not a valid price; callers fall back to entry_price.
+    A recorded `exec_price` (written by PaperTrader since 2026-10-16) wins over
+    the reconstruction.
     """
+    try:
+        recorded = float(row.get("exec_price") or 0.0)
+        if 0.0 < recorded < 1.0:
+            return recorded
+    except (TypeError, ValueError):
+        pass
     try:
         model_p = float(row["model_p"])
         edge = float(row["edge_pp"])
@@ -58,3 +66,16 @@ def executable_cost(row: dict) -> float | None:
     p_win = model_p if row.get("direction") == "YES" else 1.0 - model_p
     ask = p_win - edge
     return ask if 0.0 < ask < 1.0 else None
+
+
+def fill_price(row: dict) -> float:
+    """The price a logged paper row was (or is to be) scored at: the recorded
+    executable ask when present and valid, else the logged entry_price (the mid,
+    for rows written before exec_price existed)."""
+    try:
+        recorded = float(row.get("exec_price") or 0.0)
+        if 0.0 < recorded < 1.0:
+            return recorded
+    except (TypeError, ValueError):
+        pass
+    return float(row["entry_price"])

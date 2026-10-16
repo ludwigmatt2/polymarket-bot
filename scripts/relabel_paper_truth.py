@@ -40,6 +40,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from weather.fees import fill_price  # noqa: E402
 from weather.paper_trader import _brier, _local_event_date, _trade_pnl  # noqa: E402
 from weather.paths import DATA_DIR  # noqa: E402
 from weather.station_truth import station_outcome  # noqa: E402
@@ -114,7 +115,7 @@ def relabel(rows: list[dict], sleep_s: float = 0.25) -> dict:
             res_dt = datetime.fromisoformat(row["resolution_date"])
             threshold = float(row["threshold"])
             threshold_high = float(row["threshold_high"]) if row.get("threshold_high") else None
-            entry = float(row["entry_price"])
+            entry = fill_price(row)  # exec ask when recorded, else the mid
             size = float(row["size_usd"])
             model_p = float(row["model_p"])
         except (KeyError, ValueError):

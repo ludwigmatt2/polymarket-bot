@@ -31,6 +31,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from weather.config import GATE_ERA_START  # noqa: E402
+from weather.fees import fill_price  # noqa: E402
 from weather.paper_trader import _brier, _trade_pnl  # noqa: E402
 from weather.paths import DATA_DIR  # noqa: E402
 from weather.relayer import chain_outcome  # noqa: E402
@@ -137,7 +138,7 @@ def main() -> None:
             continue
 
         try:
-            entry = float(row["entry_price"])
+            entry = fill_price(row)  # exec ask when recorded, else the mid
             size = float(row["size_usd"])
             model_p = float(row["model_p"])
         except (KeyError, ValueError):

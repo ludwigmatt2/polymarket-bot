@@ -541,3 +541,69 @@ class TestTakerFee:
         assert s.profit_factor_net < s.profit_factor
         # The go-live gate itself still reads the GROSS station PF.
         assert s.station_profit_factor_net <= s.station_profit_factor or s.station_resolved == 0
+
+
+class TestExecPrice:
+    """entry_price stays the MID (market-probability input of the Brier gate);
+    pnl_usd / fee_usd are scored at the executable ask recorded as exec_price."""
+
+    def _signal(self, exec_price):
+        sig = MagicMock()
+        sig.quality_gate_passed = True
+        sig.size_factor = 1.0
+        sig.direction = "NO"
+        sig.market_p = 0.40          # mid YES -> mid NO = 0.60
+        sig.exec_price = exec_price  # NO ask
+        sig.model_p = 0.30
+        sig.edge_pp = 0.09
+        sig.ensemble_spread = 0.05
+        sig.confidence_score = 0.7
+        sig.signal_time = datetime.now(timezone.utc)
+        sig.running_obs_c = None
+        sig.restofday = False
+        sig.market.market_id = "m_exec"
+        sig.market.title = "t"
+        sig.market.resolution_date = datetime.now(timezone.utc) + timedelta(days=1)
+        sig.market.metric = "temperature_2m_max"
+        sig.market.threshold = 20.0
+        sig.market.threshold_high = None
+        sig.market.direction = "above"
+        sig.market.location.lat = 1.0
+        sig.market.location.lon = 2.0
+        sig.market.location.timezone = "UTC"
+        sig.market.station_icao = "KXXX"
+        sig.market.station_country = "US"
+        sig.market.resolve_unit = "C"
+        sig.prob_result.raw_p = 0.3
+        sig.prob_result.model_breakdown = {"m": 0.3}
+        return sig
+
+    def test_log_trade_records_ask_and_keeps_mid_entry_price(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        trader.log_trade(self._signal(exec_price=0.64))
+        row = trader._load_all()[0]
+        assert float(row["entry_price"]) == pytest.approx(0.60)   # mid, unchanged
+        assert float(row["exec_price"]) == pytest.approx(0.64)    # the ask
+
+    def test_missing_ask_leaves_exec_price_blank(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        trader.log_trade(self._signal(exec_price=0.0))
+        assert trader._load_all()[0]["exec_price"] == ""
+
+    def test_resolve_scores_pnl_and_fee_at_the_ask(self, tmp_path):
+        from weather.fees import taker_fee_usd
+        trader = _make_trader(tmp_path)
+        trader.log_trade(self._signal(exec_price=0.64))
+        row = trader._load_all()[0]
+        # NO bet; actual_outcome False => NO wins.
+        trader.resolve_trade(row["trade_id"], False)
+        saved = trader._load_all()[0]
+        size = float(saved["size_usd"])
+        assert float(saved["pnl_usd"]) == pytest.approx(size * (1 / 0.64 - 1), abs=1e-3)
+        assert float(saved["fee_usd"]) == pytest.approx(taker_fee_usd(size, 0.64), abs=1e-3)
+
+    def test_legacy_rows_without_exec_price_still_score_at_entry(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        _add_resolved_trades(trader, 4, win_rate=0.5)  # no exec_price column values
+        s = trader.compute_stats()
+        assert s.resolved_trades == 4 and s.total_paper_pnl_net < s.total_paper_pnl

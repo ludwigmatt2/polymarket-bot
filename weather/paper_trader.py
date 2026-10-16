@@ -27,7 +27,7 @@ from .config import (
     PAPER_TRADE_SIZE_USD,
 )
 from .models import Location, PaperTrade, PaperTradingStats, Signal, _evaluate_outcome
-from .fees import row_fee_usd, taker_fee_usd
+from .fees import fill_price, row_fee_usd, taker_fee_usd
 from .relayer import chain_outcome
 from .station_truth import station_outcome
 
@@ -68,6 +68,11 @@ CSV_HEADERS = [
     # resolution. pnl_usd stays GROSS of it; net = pnl_usd - fee_usd. Appended
     # last so older rows parse (_load_all backfills "").
     "fee_usd",
+    # Executable ask at signal time (the price a live BUY pays). entry_price stays
+    # the MID (the model-vs-market Brier gate needs a probability, not a cost);
+    # pnl_usd / fee_usd are computed at exec_price when present, else entry_price.
+    # "" on rows written before 2026-10-16 (those are mid-priced).
+    "exec_price",
 ]
 
 # Brier score for an uninformed 50/50 forecast (climatology baseline)
@@ -131,6 +136,7 @@ class PaperTrader:
             lon=signal.market.location.lon,
             location_tz=signal.market.location.timezone or "UTC",
             raw_p=signal.prob_result.raw_p,
+            exec_price=float(getattr(signal, "exec_price", 0.0) or 0.0),
             model_breakdown_json=json.dumps(signal.prob_result.model_breakdown),
             station_icao=signal.market.station_icao,
             station_country=signal.market.station_country,
@@ -180,7 +186,8 @@ class PaperTrader:
         model_p = float(target["model_p"])
 
         bet_wins = actual_outcome if direction == "YES" else not actual_outcome
-        pnl = _trade_pnl(size_usd, entry_price, bet_wins)
+        paid = fill_price(target)  # executable ask when recorded, else the mid
+        pnl = _trade_pnl(size_usd, paid, bet_wins)
 
         brier = _brier(model_p, actual_outcome)
         now = datetime.now(timezone.utc).isoformat()
@@ -188,7 +195,7 @@ class PaperTrader:
         target["actual_outcome"] = int(actual_outcome)
         target["resolved_at"] = now
         target["pnl_usd"] = round(pnl, 4)
-        target["fee_usd"] = round(taker_fee_usd(size_usd, entry_price), 4)
+        target["fee_usd"] = round(taker_fee_usd(size_usd, paid), 4)
         target["brier_score"] = round(brier, 4)
 
         self._rewrite_all(trades)
@@ -312,12 +319,13 @@ class PaperTrader:
             size_usd = float(t["size_usd"])
             model_p = float(t["model_p"])
             bet_wins = outcome if t["direction"] == "YES" else not outcome
-            pnl = _trade_pnl(size_usd, entry_price, bet_wins)
+            paid = fill_price(t)  # executable ask when recorded, else the mid
+            pnl = _trade_pnl(size_usd, paid, bet_wins)
 
             t["actual_outcome"] = int(outcome)
             t["resolved_at"] = now.isoformat()
             t["pnl_usd"] = round(pnl, 4)
-            t["fee_usd"] = round(taker_fee_usd(size_usd, entry_price), 4)
+            t["fee_usd"] = round(taker_fee_usd(size_usd, paid), 4)
             t["brier_score"] = round(_brier(model_p, outcome), 4)
             t["label_source"] = label_source
             resolved += 1
@@ -376,7 +384,7 @@ class PaperTrader:
                 continue  # one exit per trade
             e = by_key[key]
             try:
-                entry = float(t["entry_price"])
+                entry = fill_price(t)  # shares were bought at the ask when recorded
                 size = float(t["size_usd"])
             except (KeyError, ValueError):
                 continue
@@ -428,7 +436,7 @@ class PaperTrader:
         briers = [float(t["brier_score"]) for t in resolved if t.get("brier_score") not in (None, "")]
         edges = [float(t["edge_pp"]) for t in resolved]
         # After-cost counterpart of pnls (same rows, same order).
-        pnls_net = [float(t["pnl_usd"]) - row_fee_usd(t, float(t["size_usd"]), float(t["entry_price"]))
+        pnls_net = [float(t["pnl_usd"]) - row_fee_usd(t, float(t["size_usd"]), fill_price(t))
                     for t in resolved if t.get("pnl_usd") not in (None, "")]
 
         wins = [p for p in pnls if p > 0]
@@ -477,7 +485,7 @@ class PaperTrader:
                 outcome = float(t["actual_outcome"])
                 ep = float(t["entry_price"])
                 st_pnls.append(float(t["pnl_usd"]))
-                st_pnls_net.append(float(t["pnl_usd"]) - row_fee_usd(t, float(t["size_usd"]), ep))
+                st_pnls_net.append(float(t["pnl_usd"]) - row_fee_usd(t, float(t["size_usd"]), fill_price(t)))
                 st_sizes.append(float(t["size_usd"]))
                 st_model_sq.append((float(t["model_p"]) - outcome) ** 2)
                 # The market's own forecast is the YES price at entry: for a NO
@@ -621,6 +629,7 @@ class PaperTrader:
                 "cumulative_pnl": "",
                 "cumulative_brier": "",
                 "raw_p": trade.raw_p,
+                "exec_price": (round(trade.exec_price, 4) if trade.exec_price > 0.0 else ""),
                 "model_breakdown_json": trade.model_breakdown_json,
                 "station_icao": trade.station_icao,
                 "station_country": trade.station_country,

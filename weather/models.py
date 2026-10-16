@@ -226,6 +226,10 @@ class PaperTrade:
     # (Phase 4) can be scored from history. raw_p is pre-calibration, pre-shrinkage.
     raw_p: float = 0.5
     model_breakdown_json: str = ""   # json.dumps(prob_result.model_breakdown)
+    # Executable ask at signal time (0.0 = not captured). entry_price stays the
+    # MID — it is the market-probability input of the model-vs-market Brier gate —
+    # while PnL and the taker fee are computed at THIS price, like a live BUY.
+    exec_price: float = 0.0
     actual_outcome: bool | None = None
     resolved_at: datetime | None = None
     pnl_usd: float | None = None

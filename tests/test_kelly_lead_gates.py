@@ -144,3 +144,35 @@ def test_lead_paper_rows_are_scored_at_the_ask_not_the_mid(tmp_path):
     out = lead.load_paper(pc)
     ask = 0.56
     assert abs(out[0]["pnl"] - (20.0 * (1 / ask - 1) - 20.0 * 0.05 * (1 - ask))) < 1e-9
+
+
+def _sized(i, stake, win):
+    """Even-odds fill: win returns +stake, loss -stake (net of nothing; fee-free test rows)."""
+    day = 16 + i % 20
+    return {"stake": stake, "px": 0.5, "pnl": stake if win else -stake, "gross_win": win, "edge": 0.13,
+            "t": f"2026-10-{day:02d}T08:00:00+00:00", "res": f"2026-10-{day:02d}T20:{i % 60:02d}:00+00:00"}
+
+
+def test_flat_delta_positive_when_big_stakes_lose():
+    # Big stakes lose, small ones win: equal weight at the same total capital wins.
+    rows = [_sized(i, 8.0, win=False) if i % 2 else _sized(i, 2.0, win=True) for i in range(40)]
+    assert kelly.flat_delta(rows) > 0
+
+
+def test_flat_delta_negative_when_big_stakes_win():
+    rows = [_sized(i, 8.0, win=True) if i % 2 else _sized(i, 2.0, win=False) for i in range(40)]
+    assert kelly.flat_delta(rows) < 0
+
+
+def test_flat_delta_is_zero_for_uniform_stakes():
+    rows = [_sized(i, 4.0, win=i % 3 != 0) for i in range(30)]
+    assert abs(kelly.flat_delta(rows)) < 1e-9
+
+
+def test_flat_verdict_needs_n_and_confidence():
+    small = kelly.evaluate([_sized(i, 8.0 if i % 2 else 2.0, win=bool(i % 2 == 0)) for i in range(kelly.MIN_N - 1)])
+    assert "flat_p" not in small and small["flat_delta"] > 0       # context only below n
+    big = kelly.evaluate([_sized(i, 8.0 if i % 2 else 2.0, win=bool(i % 2 == 0)) for i in range(kelly.MIN_N)])
+    assert big["answerable"] and big["flat_preferred"] is True
+    good = kelly.evaluate([_sized(i, 8.0 if i % 2 else 2.0, win=bool(i % 2)) for i in range(kelly.MIN_N)])
+    assert good["flat_preferred"] is False

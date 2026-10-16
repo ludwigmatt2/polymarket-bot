@@ -32,3 +32,18 @@ def test_executable_cost_none_when_unrecoverable():
     assert executable_cost({"direction": "NO"}) is None
     assert executable_cost({"model_p": "", "edge_pp": "0.1", "direction": "NO"}) is None
     assert executable_cost({"model_p": "0.9", "edge_pp": "-0.5", "direction": "YES"}) is None  # ask > 1
+
+
+def test_executable_cost_prefers_recorded_exec_price():
+    row = {"exec_price": "0.64", "model_p": "0.35", "edge_pp": "0.09", "direction": "NO"}
+    assert executable_cost(row) == 0.64          # not the 0.56 reconstruction
+    row["exec_price"] = ""
+    assert abs(executable_cost(row) - 0.56) < 1e-12
+
+
+def test_fill_price_prefers_exec_price_then_entry():
+    from weather.fees import fill_price
+    assert fill_price({"exec_price": "0.64", "entry_price": "0.60"}) == 0.64
+    assert fill_price({"exec_price": "", "entry_price": "0.60"}) == 0.60
+    assert fill_price({"entry_price": "0.60"}) == 0.60
+    assert fill_price({"exec_price": "1.5", "entry_price": "0.60"}) == 0.60  # invalid ask ignored
