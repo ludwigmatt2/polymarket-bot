@@ -96,6 +96,10 @@ _CSV_HEADERS = [
     # resolution. pnl_usd stays GROSS of it; net = pnl_usd - fee_usd. Appended
     # last so existing files parse (rewritten with the full header on resolve).
     "fee_usd",
+    # Non-empty = the row is NOT part of this wallet's books (e.g. "no_buy_on_wallet":
+    # bought from an earlier wallet, so its PnL never touched the current balance).
+    # Stats readers skip these rows; the row itself is kept for the record.
+    "exclude_reason",
 ]
 
 # Public Data API — on-chain positions per wallet address (no auth required).

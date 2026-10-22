@@ -10,6 +10,9 @@ Default is a dry run: reports how many rows would be filled and, with --wallet, 
 every resolved row's recomputed cost against the wallet's actual BUY spend
 (data-api.polymarket.com/activity) and flags |diff| > --tol per trade.
 
+Rows with no BUY on --wallet (earlier-wallet trades) get exclude_reason set and are
+skipped by the Telegram stats.
+
 Usage (VPS; stop the bot first -- it rewrites this file at resolution):
   venv/bin/python scripts/reconcile_live_fees.py --wallet 0x...          # dry run + check
   venv/bin/python scripts/reconcile_live_fees.py --wallet 0x... --apply  # backup + write
@@ -58,6 +61,19 @@ def backfill(rows: list[dict]) -> int:
     return n
 
 
+def flag_off_wallet(rows: list[dict], spend: dict[str, float]) -> int:
+    """Mark resolved, filled rows whose market has NO buy on this wallet: their PnL
+    never touched the current balance (earlier wallet), so stats must skip them.
+    Only call with a COMPLETE activity fetch. Returns rows newly flagged."""
+    n = 0
+    for r in rows:
+        if (r.get("resolved_at") and _f(r.get("filled_size")) > 0 and not r.get("exclude_reason")
+                and r.get("market_id") not in spend):
+            r["exclude_reason"] = "no_buy_on_wallet"
+            n += 1
+    return n
+
+
 def fetch_buy_spend(wallet: str) -> dict[str, float]:
     """conditionId -> total USDC the wallet paid on BUYs (fee included)."""
     spend: dict[str, float] = defaultdict(float)
@@ -102,10 +118,12 @@ def main() -> None:
         reader = csv.DictReader(fh)
         fields = list(reader.fieldnames or [])
         rows = list(reader)
-    if "fee_usd" not in fields:
-        fields.append("fee_usd")
+    for col in ("fee_usd", "exclude_reason"):
+        if col not in fields:
+            fields.append(col)
 
     n = backfill(rows)
+    flagged = 0
     resolved = [r for r in rows if r.get("resolved_at") and _f(r.get("filled_size")) > 0]
     gross = sum(_f(r["pnl_usd"]) for r in resolved)
     fees = sum(_f(r["fee_usd"]) for r in resolved)
@@ -113,7 +131,10 @@ def main() -> None:
     print(f"gross PnL ${gross:+.2f}  fees ${fees:.2f}  net ${gross - fees:+.2f}")
 
     if args.wallet:
-        bad = reconcile(rows, fetch_buy_spend(args.wallet), args.tol)
+        spend = fetch_buy_spend(args.wallet)
+        flagged = flag_off_wallet(rows, spend)
+        print(f"{flagged} resolved rows have no buy on this wallet -> exclude_reason=no_buy_on_wallet")
+        bad = reconcile([r for r in rows if not r.get("exclude_reason")], spend, args.tol)
         print(f"on-chain check: {len(bad)} trades off by > ${args.tol}")
         for b in bad[:20]:
             print("  ", b)
@@ -121,7 +142,7 @@ def main() -> None:
     if not args.apply:
         print("dry run -- pass --apply to write")
         return
-    if not n:
+    if not (n or flagged):
         print("nothing to write")
         return
     shutil.copy2(args.csv, args.csv.with_suffix(".csv.bak"))

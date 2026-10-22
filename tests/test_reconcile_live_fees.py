@@ -29,3 +29,11 @@ def test_reconcile_flags_only_deviations_beyond_tolerance():
     exact = 10 * 0.40 + rows[0]["fee_usd"]
     assert rl.reconcile(rows, {"0xabc": exact}, 0.01) == []
     assert len(rl.reconcile(rows, {"0xabc": exact + 0.5}, 0.01)) == 1
+
+
+def test_flag_off_wallet_marks_only_resolved_rows_without_a_buy():
+    rows = [_row(market_id="0xon"), _row(market_id="0xold"), _row(market_id="0xopen", resolved_at="")]
+    n = rl.flag_off_wallet(rows, {"0xon": 4.0})
+    assert n == 1
+    assert rows[1]["exclude_reason"] == "no_buy_on_wallet"
+    assert not rows[0].get("exclude_reason") and not rows[2].get("exclude_reason")

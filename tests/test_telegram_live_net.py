@@ -3,7 +3,7 @@ import csv
 
 import telegram_bot as tb
 
-FIELDS = ["signal_time", "resolved_at", "size_usd", "filled_size", "filled_price", "pnl_usd", "fee_usd", "error"]
+FIELDS = ["signal_time", "resolved_at", "size_usd", "filled_size", "filled_price", "pnl_usd", "fee_usd", "error", "exclude_reason"]
 
 
 def _write(path, rows):
@@ -75,3 +75,10 @@ def test_return_on_deposits_is_wallet_based(monkeypatch):
 def test_withdrawals_count_as_returned_capital(monkeypatch):
     ws = _wallet(monkeypatch, deposited=100.0, withdrawn=30.0, pusd=90.0, deployed=0.0, pnl=20.0)
     assert abs(ws["wallet_gain"] - 20.0) < 1e-9          # 90 + 30 - 100
+
+
+def test_excluded_rows_never_count(tmp_path, monkeypatch):
+    rows = [dict(signal_time="2026-07-06", resolved_at="2026-08-21T00:00:00", size_usd=4, filled_size=10,
+                 filled_price=0.4, pnl_usd=1.3, fee_usd=0.05, exclude_reason="no_buy_on_wallet")]
+    ls = _stats(tmp_path, monkeypatch, rows)
+    assert ls["all_time_pnl"] == 0 and ls["total"] == 0

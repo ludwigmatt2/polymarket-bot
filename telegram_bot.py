@@ -602,7 +602,8 @@ def read_live_stats(uid: int) -> dict:
         return {}
     era_start = _live_era_start(uid)
     with csv_path.open() as f:
-        all_rows = [r for r in csv.DictReader(f) if not r.get("error")]
+        all_rows = [r for r in csv.DictReader(f)
+                    if not r.get("error") and not r.get("exclude_reason")]
     rows = [r for r in all_rows if r.get("signal_time", "") >= era_start]
 
     # Balance reconciliation (live_wallet_stats) needs the TRUE all-time realized
