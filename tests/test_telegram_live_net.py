@@ -50,3 +50,28 @@ def test_all_time_pnl_for_ledger_balance_is_net(tmp_path, monkeypatch):
                  filled_price=0.4, pnl_usd=6.0, fee_usd=0.12)]  # before era start
     ls = _stats(tmp_path, monkeypatch, rows)
     assert ls["resolved"] == 0 and abs(ls["all_time_pnl"] - 5.88) < 1e-9
+
+
+def _wallet(monkeypatch, deposited, withdrawn, pusd, deployed, pnl):
+    import weather.live_ledger as ll
+    import weather.relayer as rl
+    import weather.secrets as sec
+    monkeypatch.setattr(ll, "totals", lambda p: {"deposited": deposited, "withdrawn": withdrawn,
+                                                 "net": deposited - withdrawn})
+    monkeypatch.setattr(sec, "get_user_creds", lambda uid: {"funder_address": "0xabc"})
+    monkeypatch.setattr(rl, "pusd_balance", lambda a, strict=False: pusd)
+    monkeypatch.setattr(rl, "usdce_balance", lambda a, strict=False: 0.0)
+    ls = {"total_pnl": pnl, "all_time_pnl": pnl, "deployed": deployed, "pending": 3}
+    return tb.live_wallet_stats(1, ls)
+
+
+def test_return_on_deposits_is_wallet_based(monkeypatch):
+    ws = _wallet(monkeypatch, deposited=100.0, withdrawn=0.0, pusd=108.0, deployed=13.0, pnl=39.58)
+    assert abs(ws["wallet_gain"] - 21.0) < 1e-9          # 108 + 13 - 100
+    assert abs(ws["total_return_pct"] - 21.0) < 1e-9
+    assert ws["return_pct"] == ws["total_return_pct"]     # one definition everywhere
+
+
+def test_withdrawals_count_as_returned_capital(monkeypatch):
+    ws = _wallet(monkeypatch, deposited=100.0, withdrawn=30.0, pusd=90.0, deployed=0.0, pnl=20.0)
+    assert abs(ws["wallet_gain"] - 20.0) < 1e-9          # 90 + 30 - 100

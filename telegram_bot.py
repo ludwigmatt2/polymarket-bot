@@ -717,8 +717,15 @@ def live_wallet_stats(uid: int, ls: dict | None = None) -> dict:
         total_value = ledger_balance
         free_cash   = ledger_balance - deployed
     available  = free_cash
-    return_pct = (realized / deposited * 100) if deposited > 0 else None
-    total_return_pct = ((total_value - deposited) / deposited * 100) if deposited > 0 else None
+    # Return ON DEPOSITS: what the money put in has earned = (value now + what was
+    # taken out - what was put in) / put in. Wallet-based, so fees, earlier attempts
+    # and open positions are all already in it; it is the number that answers "how
+    # much more do I have than I paid in". `return_pct` used to be era PnL / ALL-time
+    # deposits (era numerator over a lifetime base, gross of fees) -- it now aliases
+    # this so every consumer (alerts, digest) shows the same figure.
+    wallet_gain = total_value + withdrawn - deposited
+    total_return_pct = (wallet_gain / deposited * 100) if deposited > 0 else None
+    return_pct = total_return_pct
     return {
         "deposited": deposited, "withdrawn": withdrawn,
         "deployed": deployed, "realized_pnl": realized,
@@ -727,6 +734,7 @@ def live_wallet_stats(uid: int, ls: dict | None = None) -> dict:
         "free_cash": free_cash, "total_value": total_value,
         "wallet_balance": total_value, "available": available,
         "return_pct": return_pct, "total_return_pct": total_return_pct,
+        "wallet_gain": wallet_gain,
         "era_roi": ls.get("era_roi"), "resolved_cost": ls.get("resolved_cost", 0.0),
         "fees": ls.get("fees", 0.0),
         "pnl_today": ls.get("pnl_today", 0.0), "pnl_week": ls.get("pnl_week", 0.0),
@@ -815,18 +823,16 @@ def _fmt_status_live(uid: int) -> str:
                 "scheduled scan.\nFund with /deposit.")
 
     lines = [header + "\n"]
-    if ls.get("era_roi") is not None:
-        # NET of the taker fee, on the capital actually staked in settled trades
-        # (stake + fee). The old "ROI on deposits" divided gross PnL by deposits,
-        # which overstated both numerator (no fees) and meaning (capital recycles).
-        # The wallet-level result (value vs deposits, on-chain) is shown beside it.
-        lines.append(f"📈 *{ls['era_roi']:+.1f}% net ROI this era*"
-                     f"   (${ws['realized_pnl']:+,.2f} after ${ls.get('fees', 0.0):,.2f} fees)")
-        if ws.get("total_return_pct") is not None:
-            lines.append(f"💼 Wallet {ws['total_return_pct']:+.1f}% on ${ws['deposited']:,.2f} deposited")
+    if ws.get("total_return_pct") is not None:
+        # Headline = return on the money deposited (wallet value + withdrawals - deposits).
+        lines.append(f"📈 *{ws['total_return_pct']:+.1f}% return on deposits*"
+                     f"   (${ws.get('wallet_gain', 0.0):+,.2f} on ${ws['deposited']:,.2f})")
+        if ls.get("era_roi") is not None:
+            lines.append(f"Era net PnL ${ws['realized_pnl']:+,.2f} after ${ls.get('fees', 0.0):,.2f} fees"
+                         f" · {ls['era_roi']:+.1f}% per $ staked")
     else:
         lines.append(f"📈 Realized PnL: *${ws['realized_pnl']:+,.2f}*"
-                     f"   _(no settled trades yet this era)_")
+                     f"   _(no deposits recorded)_")
     lines.append(f"\n{ls['resolved']} resolved · {ls['pending']} open · {ls['total']} total")
     if ls["win_rate"] is not None:
         lines.append(f"Win rate:      {ls['win_rate']:.1f}%  ({ls['wins']}W / {ls['losses']}L)")
@@ -940,9 +946,6 @@ def _fmt_wallet_live(uid: int) -> str:
         lines.append(f"Deployed right now:   ${ws['deployed']:,.2f}")
         return "\n".join(lines)
     ret_str = ""
-    if ws["total_return_pct"] is not None:
-        sign = "+" if ws["total_return_pct"] >= 0 else ""
-        ret_str = f"  ({sign}{ws['total_return_pct']:.1f}% all-in)"
     balance_tag = "_(verified on-chain)_" if ws["onchain_verified"] else "⚠️ _(couldn't reach chain — ledger estimate)_"
     # Tree sums exactly: free cash + positions = total value. No figure is double
     # counted, and 'Free cash' is the real deployable number (was mis-shown as a
@@ -954,11 +957,18 @@ def _fmt_wallet_live(uid: int) -> str:
     if ws["withdrawn"] > 0:
         dep_line += f" · withdrawn ${ws['withdrawn']:,.2f}"
     lines.append(dep_line)
-    lines.append(f"\n📊 *Realized PnL (live)*")
-    era_line = f"This era:  *${ws['realized_pnl']:+,.2f}* _(net of fees)_"
-    if ws.get("era_roi") is not None:
-        era_line += f"  ({ws['era_roi']:+.1f}% ROI on settled)"
+    if ws.get("total_return_pct") is not None:
+        gain = ws.get("wallet_gain", ws["total_value"] + ws["withdrawn"] - ws["deposited"])
+        lines.append(f"\n📈 *Return on deposits*")
+        lines.append(f"Gain:  *${gain:+,.2f}*  ({ws['total_return_pct']:+.1f}% on ${ws['deposited']:,.2f})"
+                     + ("  _(value + withdrawn - deposited)_" if ws["withdrawn"] > 0 else ""))
+    lines.append(f"\n📊 *Realized PnL (live, net of fees)*")
+    era_line = f"This era:  *${ws['realized_pnl']:+,.2f}*"
+    if ws.get("fees"):
+        era_line += f"  _(after ${ws['fees']:,.2f} fees)_"
     lines.append(era_line)
+    if ws.get("era_roi") is not None:
+        lines.append(f"Per $ staked: {ws['era_roi']:+.1f}%  _(net PnL / settled stake + fee)_")
     # Surface the TRUE all-time realized only when it differs from this era's — a
     # prior go-live attempt's result lives here and must never be relabelled as the
     # current era's (Aug-30: the era's +$19.86 was captioned "All-time", hiding a
@@ -2678,10 +2688,10 @@ async def check_alerts(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     lines.append(f"_...and {len(resolved) - 5} more_")
 
                 ws = live_wallet_stats(uid)
-                lines.append(f"\n📊 *All-time (live): ${ws['realized_pnl']:+,.2f}*")
+                lines.append(f"\n📊 *This era (live, net): ${ws['realized_pnl']:+,.2f}*")
                 if ws["return_pct"] is not None:
                     sign = "+" if ws["return_pct"] >= 0 else ""
-                    lines.append(f"   Return:  {sign}{ws['return_pct']:.1f}%")
+                    lines.append(f"   Return on deposits:  {sign}{ws['return_pct']:.1f}%")
                 if abs(ws["pnl_today"]) > 0:
                     lines.append(f"   Today:   ${ws['pnl_today']:+.2f}")
                 if ws["pending_count"] > 0:
