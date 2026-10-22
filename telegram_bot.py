@@ -51,6 +51,7 @@ from weather.paths import DATA_DIR
 from weather import permissions as perms
 from weather import withdrawal_policy as wpol
 from weather.audit import audit_log, read_audit
+from weather.fees import row_fee_usd
 from weather.config import (
     GATE_ERA_START,
     WITHDRAW_COOLING_OFF_HOURS,
@@ -570,13 +571,32 @@ def _live_era_start(uid: int) -> str:
     without a code change. Falls back to "" (no filtering) if never set."""
     return _load_users().get(uid, {}).get("live_confirmed_at", "") or ""
 
+def _live_row_fee(r: dict) -> float:
+    """Taker fee a filled live row paid (recorded fee_usd, else recomputed)."""
+    try:
+        size, price = float(r.get("filled_size") or 0), float(r.get("filled_price") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return row_fee_usd(r, size * price, price) if size > 0 else 0.0
+
+
+def _live_net_pnl(r: dict) -> float:
+    """Resolved live row's PnL NET of the taker fee. live_trades.csv pnl_usd is
+    gross; the wallet pays the fee on the BUY, so every figure shown to the user
+    (and the ledger fallback balance) must use this, not pnl_usd."""
+    return float(r.get("pnl_usd") or 0) - _live_row_fee(r)
+
+
 def read_live_stats(uid: int) -> dict:
     """Real-money stats from live_trades.csv, scoped to the CURRENT live era
     (since the most recent /mymode live confirmation) — a prior go-live attempt
     that was paused and restarted must not bleed into today's numbers (Aug 20
     2026: the failed Jul 7-8 attempt's -$11.79 was showing up as "All-time" the
     moment a fresh go-live had zero new trades). Errored rows (order never
-    placed) are excluded."""
+    placed) are excluded.
+
+    ALL PnL here is NET of the taker fee (see _live_net_pnl); resolved_cost
+    includes the fees so era_roi is net PnL / (stake + fee)."""
     csv_path = _live_trades_csv_path(uid)
     if not csv_path.exists():
         return {}
@@ -590,29 +610,30 @@ def read_live_stats(uid: int) -> dict:
     # a prior era, so era-scoping this figure would overstate the balance, not
     # just the display. Only the display-facing total_pnl below is era-scoped.
     all_time_resolved = [r for r in all_rows if r.get("resolved_at")]
-    all_time_pnl = sum(float(r["pnl_usd"]) for r in all_time_resolved if r.get("pnl_usd"))
+    all_time_pnl = sum(_live_net_pnl(r) for r in all_time_resolved if r.get("pnl_usd"))
 
     resolved = [r for r in rows if r.get("resolved_at")]
-    wins   = [r for r in resolved if r.get("pnl_usd") and float(r["pnl_usd"]) > 0]
-    losses = [r for r in resolved if r.get("pnl_usd") and float(r["pnl_usd"]) < 0]
-    gross_win  = sum(float(r["pnl_usd"]) for r in wins)
-    gross_loss = abs(sum(float(r["pnl_usd"]) for r in losses))
+    wins   = [r for r in resolved if r.get("pnl_usd") and _live_net_pnl(r) > 0]
+    losses = [r for r in resolved if r.get("pnl_usd") and _live_net_pnl(r) < 0]
+    gross_win  = sum(_live_net_pnl(r) for r in wins)
+    gross_loss = abs(sum(_live_net_pnl(r) for r in losses))
     pf         = gross_win / gross_loss if gross_loss > 0 else None
-    total_pnl  = sum(float(r["pnl_usd"]) for r in resolved if r.get("pnl_usd"))
+    total_pnl  = sum(_live_net_pnl(r) for r in resolved if r.get("pnl_usd"))
+    fees       = sum(_live_row_fee(r) for r in resolved if r.get("pnl_usd"))
     # ROI on the capital actually put to work in bets that have SETTLED this era —
     # the honest "how good is the edge" figure. Denominator is the cost basis of
     # resolved trades only; open positions haven't returned anything yet, so
     # including their stake would dilute a real result with undecided bets. This is
     # a return-on-capital-risked measure, distinct from return_pct (realized PnL
     # over all-time deposits), which mixes an era numerator with an all-time base.
-    resolved_cost = sum(float(r["size_usd"]) for r in resolved if r.get("size_usd"))
+    resolved_cost = sum(float(r["size_usd"]) for r in resolved if r.get("size_usd")) + fees
     deployed   = sum(float(r["size_usd"]) for r in rows
                      if not r.get("resolved_at") and r.get("size_usd"))
     today_str  = datetime.utcnow().strftime("%Y-%m-%d")
     week_start = (datetime.utcnow() - timedelta(days=7)).isoformat()
-    pnl_today  = sum(float(r["pnl_usd"]) for r in resolved
+    pnl_today  = sum(_live_net_pnl(r) for r in resolved
                      if r.get("pnl_usd") and r.get("resolved_at", "")[:10] == today_str)
-    pnl_week   = sum(float(r["pnl_usd"]) for r in resolved
+    pnl_week   = sum(_live_net_pnl(r) for r in resolved
                      if r.get("pnl_usd") and r.get("resolved_at", "") >= week_start)
     return {
         "total": len(rows),
@@ -623,6 +644,7 @@ def read_live_stats(uid: int) -> dict:
         "win_rate": len(wins) / len(resolved) * 100 if resolved else None,
         "profit_factor": pf,
         "total_pnl": total_pnl,
+        "fees": fees,
         "all_time_pnl": all_time_pnl,
         "resolved_cost": resolved_cost,
         "era_roi": (total_pnl / resolved_cost * 100) if resolved_cost > 0 else None,
@@ -706,6 +728,7 @@ def live_wallet_stats(uid: int, ls: dict | None = None) -> dict:
         "wallet_balance": total_value, "available": available,
         "return_pct": return_pct, "total_return_pct": total_return_pct,
         "era_roi": ls.get("era_roi"), "resolved_cost": ls.get("resolved_cost", 0.0),
+        "fees": ls.get("fees", 0.0),
         "pnl_today": ls.get("pnl_today", 0.0), "pnl_week": ls.get("pnl_week", 0.0),
         "pending_count": ls.get("pending", 0),
     }
@@ -792,16 +815,15 @@ def _fmt_status_live(uid: int) -> str:
                 "scheduled scan.\nFund with /deposit.")
 
     lines = [header + "\n"]
-    if ls.get("era_roi") is not None and ws.get("return_pct") is not None:
-        # ROI on the capital DEPOSITED into the wallet (Startkapital) this era — the
-        # number that answers "what am I earning on the money I put in". Base is
-        # all-time deposits, not the recycled per-bet stake (resolved_cost): once
-        # capital is reused the cumulative stake exceeds the balance and reads as a
-        # confusing denominator. `era_roi is not None` still gates on "settled trades
-        # exist this era" so an unsettled era shows the fallback line, not +0.0%.
-        sign = "+" if ws["return_pct"] >= 0 else ""
-        lines.append(f"📈 *{sign}{ws['return_pct']:.1f}% ROI this era*"
-                     f"   (${ws['realized_pnl']:+,.2f} on ${ws['deposited']:,.2f} deposited)")
+    if ls.get("era_roi") is not None:
+        # NET of the taker fee, on the capital actually staked in settled trades
+        # (stake + fee). The old "ROI on deposits" divided gross PnL by deposits,
+        # which overstated both numerator (no fees) and meaning (capital recycles).
+        # The wallet-level result (value vs deposits, on-chain) is shown beside it.
+        lines.append(f"📈 *{ls['era_roi']:+.1f}% net ROI this era*"
+                     f"   (${ws['realized_pnl']:+,.2f} after ${ls.get('fees', 0.0):,.2f} fees)")
+        if ws.get("total_return_pct") is not None:
+            lines.append(f"💼 Wallet {ws['total_return_pct']:+.1f}% on ${ws['deposited']:,.2f} deposited")
     else:
         lines.append(f"📈 Realized PnL: *${ws['realized_pnl']:+,.2f}*"
                      f"   _(no settled trades yet this era)_")
@@ -933,7 +955,7 @@ def _fmt_wallet_live(uid: int) -> str:
         dep_line += f" · withdrawn ${ws['withdrawn']:,.2f}"
     lines.append(dep_line)
     lines.append(f"\n📊 *Realized PnL (live)*")
-    era_line = f"This era:  *${ws['realized_pnl']:+,.2f}*"
+    era_line = f"This era:  *${ws['realized_pnl']:+,.2f}* _(net of fees)_"
     if ws.get("era_roi") is not None:
         era_line += f"  ({ws['era_roi']:+.1f}% ROI on settled)"
     lines.append(era_line)
@@ -2641,12 +2663,12 @@ async def check_alerts(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if live_res_new is not None and get_user_mode(uid) == "live":
             resolved = live_res_new[0].get("resolved", [])
             if resolved:
-                batch_pnl = sum(float(t.get("pnl_usd") or 0) for t in resolved)
+                batch_pnl = sum(_live_net_pnl(t) for t in resolved)
                 e         = "✅" if batch_pnl >= 0 else "❌"
-                lines     = [f"{e} 🟢 *{len(resolved)} LIVE trade(s) resolved* — *${batch_pnl:+.2f}* _(real money)_\n"]
+                lines     = [f"{e} 🟢 *{len(resolved)} LIVE trade(s) resolved* — *${batch_pnl:+.2f}* _(real money, net of fees)_\n"]
 
                 for t in resolved[:5]:
-                    pnl   = float(t.get("pnl_usd") or 0)
+                    pnl   = _live_net_pnl(t)
                     em    = "✅" if pnl > 0 else "❌"
                     title = t.get("market_title", "?")
                     if " - " in title:
@@ -3046,9 +3068,11 @@ def _build_digest(uid: int) -> str | None:
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
     settled = [r for r in rows
                if r.get("resolved_at") and r["resolved_at"] >= cutoff and r.get("pnl_usd")]
-    wins = sum(1 for r in settled if float(r["pnl_usd"]) > 0)
-    losses = sum(1 for r in settled if float(r["pnl_usd"]) < 0)
-    pnl_24h = sum(float(r["pnl_usd"]) for r in settled)
+    # Live rows: PnL net of the taker fee (matches the wallet); paper stays as logged.
+    _pn = _live_net_pnl if live else (lambda r: float(r["pnl_usd"]))
+    wins = sum(1 for r in settled if _pn(r) > 0)
+    losses = sum(1 for r in settled if _pn(r) < 0)
+    pnl_24h = sum(_pn(r) for r in settled)
     pending = [r for r in rows if not r.get("resolved_at") and r.get("size_usd")]
 
     if ws.get("deposited", 0) <= 0 and not rows:
