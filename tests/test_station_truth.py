@@ -258,3 +258,22 @@ def test_station_outcome_no_data(monkeypatch):
     monkeypatch.setattr(station_truth, "daily_value", lambda *a, **k: (None, None))
     assert station_truth.station_outcome(
         "KLGA", "US", "F", date(2026, 7, 4), "temperature_2m_max", 35.5, 36.1, "range") == (None, None, None)
+
+
+# Oct-23 rules rewrite: METAR/aviationweather.gov, whole °C everywhere (incl. US).
+def _metar_desc() -> str:
+    from pathlib import Path
+    return (Path(__file__).parent / "fixtures" / "metar_rules_nyc.txt").read_text()
+
+
+def test_parse_station_metar_rules_us_city_is_celsius():
+    st = station_parser.station_from_description(_metar_desc())
+    assert st == {"icao": "KLGA", "country": "", "unit": "C"}
+
+
+def test_parse_station_metar_url_only_and_paren_fallback():
+    url_only = "Source: https://aviationweather.gov/api/data/metar?ids=EGLC&format=raw&hours=27"
+    assert station_parser.station_from_description(url_only)["icao"] == "EGLC"
+    paren = "highest temperature reported at London City Airport (EGLC) in the hourly temperature remark"
+    assert station_parser.station_from_description(paren)["icao"] == "EGLC"
+    assert station_parser.station_from_description("Hong Kong Observatory daily extract") is None

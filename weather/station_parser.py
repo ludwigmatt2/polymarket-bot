@@ -27,9 +27,14 @@ _WU_URL = re.compile(
 # Same METAR observations underneath, so the WU→IEM truth chain still applies;
 # the URL carries no country segment — callers fall back to the station registry.
 _NOAA_URL = re.compile(r"weather\.gov/wrh/timeseries\?site=([A-Za-z0-9]{4})", re.IGNORECASE)
+# Oct-23 rules rewrite: markets resolve off the raw METAR feed, e.g.
+# https://aviationweather.gov/api/data/metar?ids=EGLC&format=raw&... (no WU/NOAA
+# URL at all, no country segment). The station is also named "(EGLC)" in the text.
+_AWC_URL = re.compile(r"aviationweather\.gov/api/data/metar\?[^\s]*?ids=([A-Za-z0-9]{4})", re.IGNORECASE)
+_PAREN_ICAO = re.compile(r"\((?-i:([A-Z]{4}))\)")
 # Precision the market resolves on, and unit. Do NOT infer from country when the
 # description is explicit — London (gb/…/EGLC) resolves in FAHRENHEIT.
-_UNIT = re.compile(r"in degrees (Fahrenheit|Celsius)", re.IGNORECASE)
+_UNIT = re.compile(r"(?:in|whole) degrees (Fahrenheit|Celsius)", re.IGNORECASE)
 
 
 def station_from_description(desc: str | None) -> dict | None:
@@ -42,10 +47,13 @@ def station_from_description(desc: str | None) -> dict | None:
     if m:
         country, icao = m.group(1).upper(), m.group(2).upper()
     else:
-        n = _NOAA_URL.search(desc)
-        if not n:
+        n = _NOAA_URL.search(desc) or _AWC_URL.search(desc)
+        if n:
+            country, icao = "", n.group(1).upper()
+        elif "hourly temperature remark" in desc and (p := _PAREN_ICAO.search(desc)):
+            country, icao = "", p.group(1)
+        else:
             return None
-        country, icao = "", n.group(1).upper()
     u = _UNIT.search(desc)
     if u:
         unit = "F" if u.group(1).lower().startswith("f") else "C"
