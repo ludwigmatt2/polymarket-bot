@@ -602,7 +602,28 @@ class PaperTrader:
                 print(f"    · {reason}")
         print("══════════════════════════════════════════════════════════════\n")
 
+    def _migrate_header(self) -> None:
+        """Rewrite the CSV when its header lags CSV_HEADERS. Appending a row with a new
+        trailing column under an old header leaves that value keyless on read (the
+        exclude_reason tag was lost this way on the VPS, Oct 25)."""
+        if not self.log_path.exists():
+            return
+        with open(self.log_path, newline="") as f:
+            header = next(csv.reader(f), [])
+        if not header or header == CSV_HEADERS:
+            return
+        with open(self.log_path, newline="") as f:
+            rows = list(csv.DictReader(f, restkey="_extra"))
+        for row in rows:
+            extra = row.pop("_extra", None)
+            for col, val in zip([c for c in CSV_HEADERS if c not in header], extra or []):
+                row[col] = val
+            for col in CSV_HEADERS:
+                row.setdefault(col, "")
+        self._rewrite_all(rows)
+
     def _append_trade(self, trade: PaperTrade) -> None:
+        self._migrate_header()
         is_new = not self.log_path.exists()
         self.log_path.parent.mkdir(exist_ok=True)
         with open(self.log_path, "a", newline="") as f:

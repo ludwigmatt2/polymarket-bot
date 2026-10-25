@@ -624,3 +624,25 @@ class TestExecPrice:
         _add_resolved_trades(trader, 4, win_rate=0.5)  # no exec_price column values
         s = trader.compute_stats()
         assert s.resolved_trades == 4 and s.total_paper_pnl_net < s.total_paper_pnl
+
+
+class TestHeaderMigration:
+    def test_old_header_migrated_and_orphan_tag_recovered(self, tmp_path):
+        import csv as _csv
+        from weather.paper_trader import CSV_HEADERS
+        trader = _make_trader(tmp_path)
+        old = [h for h in CSV_HEADERS if h != "exclude_reason"]
+        with open(trader.log_path, "w", newline="") as f:
+            w = _csv.writer(f)
+            w.writerow(old)
+            w.writerow(["t_old"] + [""] * (len(old) - 1))
+            # row appended by new code under the old header: tag is the extra field
+            w.writerow(["t_orphan"] + [""] * (len(old) - 1) + ["expansion_unvalidated"])
+        sig = TestExecPrice()._signal(exec_price=0.64)
+        trader.log_trade(sig)
+        rows = {r["trade_id"]: r for r in trader._load_all()}
+        assert rows["t_orphan"]["exclude_reason"] == "expansion_unvalidated"
+        assert rows["t_old"]["exclude_reason"] == ""
+        assert len(rows) == 3
+        with open(trader.log_path, newline="") as f:
+            assert next(_csv.reader(f)) == CSV_HEADERS

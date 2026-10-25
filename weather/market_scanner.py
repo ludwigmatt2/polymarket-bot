@@ -23,6 +23,7 @@ from pathlib import Path
 _log = logging.getLogger(__name__)
 
 from .config import (
+    LIVE_PAPER_ONLY_STATIONS,
     MAX_DAYS_TO_RESOLUTION,
     MIN_FETCHED_FOR_PARSE_ALARM,
     MIN_MARKET_LIQUIDITY_USD,
@@ -254,7 +255,17 @@ class WeatherMarketScanner:
         near = [wm for wm in tradeable
                 if (wm.resolution_date.replace(tzinfo=wm.resolution_date.tzinfo or timezone.utc)
                     - now).total_seconds() < 48 * 3600]
-        self._fetch_books_bulk(near)
+        # Two tiers: live-eligible stations first at full speed; paper-only expansion
+        # stations after that, slow and only <30 h out. 1,260 books at 8 workers hit
+        # Cloudflare 1015 / HTTP 429 on /book on the VPS (Oct 25) and starved live.
+        paper_only = [wm for wm in near if (wm.station_icao or "").upper() in LIVE_PAPER_ONLY_STATIONS]
+        live_tier = [wm for wm in near if wm not in paper_only]
+        paper_only = [wm for wm in paper_only
+                      if (wm.resolution_date.replace(tzinfo=wm.resolution_date.tzinfo or timezone.utc)
+                          - now).total_seconds() < 30 * 3600]
+        self._fetch_books_bulk(live_tier)
+        self._fetch_books_bulk(paper_only, max_workers=2, pause=0.15)
+        near = live_tier + paper_only
         print(f"    tradeable after filters: {len(tradeable)} / {len(parsed)} "
               f"(books: {len(near)} near-term markets in {_time.monotonic() - t0:.0f}s)")
         self.last_funnel = {
@@ -568,7 +579,8 @@ class WeatherMarketScanner:
 
         return True
 
-    def _fetch_books_bulk(self, markets: list[WeatherMarket], max_workers: int = 8) -> None:
+    def _fetch_books_bulk(self, markets: list[WeatherMarket], max_workers: int = 8,
+                          pause: float = 0.0) -> None:
         """Populate both sides' book fields for `markets` concurrently. Each
         worker thread holds its own ClobClient (requests sessions aren't
         thread-safe); one failed book leaves that market's fields at their
@@ -585,6 +597,8 @@ class WeatherMarketScanner:
             return tl.clob
 
         def _one(wm: WeatherMarket) -> None:
+            if pause:
+                _time.sleep(pause)
             summary = self._fetch_book_summary(wm.yes_token_id, _client())
             wm.book_depth_usd = summary.get("depth_usd", 0.0)
             wm.yes_best_ask = summary.get("best_ask", 0.0)
@@ -593,6 +607,8 @@ class WeatherMarketScanner:
                 if attr in summary:
                     setattr(wm, attr, summary[attr])
             # NO-side book: the side the bot's (overwhelmingly NO) orders consume.
+            if pause:
+                _time.sleep(pause)
             no_summary = self._fetch_book_summary(wm.no_token_id, _client())
             wm.no_book_depth_usd = no_summary.get("depth_usd", 0.0)
             wm.no_best_ask = no_summary.get("best_ask", 0.0)
