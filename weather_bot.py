@@ -1065,8 +1065,10 @@ def main() -> None:
                         default="paper", help="Operating mode (default: paper)")
     parser.add_argument("--interval", type=int, default=3600,
                         help="Re-scan interval in seconds for paper/live mode (default: 3600)")
-    parser.add_argument("--bankroll", type=float, default=500.0,
-                        help="Live trading bankroll in USD for Kelly sizing (default: 500)")
+    parser.add_argument("--bankroll", type=float, default=float("inf"),
+                        help="Optional CAP on the live Kelly bankroll in USD. Default: no cap — "
+                             "sizing follows real equity (free USDC + open-position cost). "
+                             "(Was 500, which silently capped sizing after the Oct-22 deposit.)")
     parser.add_argument("--city", type=str, default=None,
                         help="Filter markets by city name (debug mode only)")
     parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR,

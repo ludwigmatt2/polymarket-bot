@@ -24,6 +24,7 @@ from .config import (
     LIVE_EXCLUDED_METRICS,
     LIVE_GATE_LATCHES,
     LIVE_MIN_ENTRY_PRICE,
+    LIVE_TOPUP_MAX_FILL_FRAC,
     MAX_DAY_EXPOSURE_PCT,
     MAX_LIVE_TRADE_USD,
     MAX_SLIPPAGE,
@@ -310,9 +311,13 @@ class LiveTrader:
             lat_s, lon_s = str(lat), str(lon)
         return f"{lat_s}:{lon_s}:{metric}:{str(resolution_date)[:10]}"
 
-    def _has_open_event(self, event_key: str) -> bool:
-        """True if an open (unresolved) live trade already covers this event."""
+    def _has_open_event(self, event_key: str, exclude_market_id: str | None = None) -> bool:
+        """True if an open (unresolved) live trade already covers this event.
+        `exclude_market_id` lets a top-up of the SAME market through (it is the
+        position we're growing, not a second bin of the ladder)."""
         for row in self._load_open_live_trades():
+            if exclude_market_id and row.get("market_id") == exclude_market_id:
+                continue
             k = self._event_key_of(row.get("lat"), row.get("lon"),
                                    row.get("metric", ""), row.get("resolution_date", ""))
             if k == event_key:
@@ -464,9 +469,17 @@ class LiveTrader:
                 "— halting until tomorrow"
             )
 
+        # Duplicate guard, with a top-up exception: a FAK fills only the book depth
+        # under its price cap, so a thin book can leave a position far below its
+        # Kelly target (London Oct 24: $1.15 of ~$18). If the existing stake is
+        # under LIVE_TOPUP_MAX_FILL_FRAC of today's target, the shortfall may be
+        # bought on a later scan instead of being locked out until resolution.
+        topup_stake = 0.0
         if self._is_duplicate(signal):
-            self._log_skip(signal, "duplicate")
-            return None
+            topup_stake = self._topup_base_stake(signal)
+            if topup_stake <= 0.0:
+                self._log_skip(signal, "duplicate")
+                return None
 
         # Metric exclusion: min-temp resolves off a station reading the grid
         # forecast systematically misses. Block live money while the paper track
@@ -489,7 +502,8 @@ class LiveTrader:
         # of the event is skipped, this scan and while a position stays open.
         event = self._event_key_of(signal.market.location.lat, signal.market.location.lon,
                                    signal.market.metric, signal.market.resolution_date.isoformat())
-        if event in self._events_this_scan or self._has_open_event(event):
+        if event in self._events_this_scan or self._has_open_event(
+                event, exclude_market_id=signal.market.market_id if topup_stake else None):
             self._log_skip(signal, "one_bin_per_event")
             return None
 
@@ -503,6 +517,13 @@ class LiveTrader:
             return None
 
         size_usd = self.kelly_size_usd(signal)
+        if topup_stake:
+            # Only buy the shortfall; total position stays within the Kelly target
+            # (and therefore the per-trade cap).
+            size_usd -= topup_stake
+            if size_usd < 1.0:
+                self._log_skip(signal, f"duplicate:topup_not_needed:{topup_stake:.2f}")
+                return None
 
         # Pre-trade balance guard — never size above currently-available USDC.
         # fetch_balance() reads real on-chain collateral, but a prior order's debit
@@ -538,6 +559,10 @@ class LiveTrader:
         # when the resulting stake stays within the per-trade cap; otherwise skip.
         min_size = signal.market.min_order_size
         if min_size > 0 and n_contracts < min_size:
+            if topup_stake:
+                # A min-size bump would overshoot the target; skip rather than overbuy.
+                self._log_skip(signal, "duplicate:topup_below_min_size")
+                return None
             bumped_usd = min_size * ep
             if bumped_usd <= _get_max_trade_usd():
                 n_contracts = round(min_size, 2)
@@ -674,7 +699,10 @@ class LiveTrader:
         self._committed_this_scan += usd_spent
         self._events_this_scan.add(event)
         self._day_committed_this_scan[day] = self._day_committed_this_scan.get(day, 0.0) + usd_spent
-        self._log_trade(signal, order_id, usd_spent, ep, filled, filled_price, order_status)
+        if topup_stake:
+            self._merge_topup(signal, usd_spent, filled)
+        else:
+            self._log_trade(signal, order_id, usd_spent, ep, filled, filled_price, order_status)
 
         return {
             "order_id": order_id,
@@ -684,6 +712,7 @@ class LiveTrader:
             "filled_price": filled_price,
             "price": filled_price,  # alias used by weather_bot.py display
             "status": order_status,
+            "topup": bool(topup_stake),
         }
 
     def auto_resolve(self, weather_client=None, model=None, positions=None) -> tuple[int, int]:
@@ -987,6 +1016,52 @@ class LiveTrader:
     @staticmethod
     def _idempotency_key(signal: Signal) -> str:
         return f"{signal.market.market_id}:{signal.direction}:{date.today().isoformat()}"
+
+    def _topup_base_stake(self, signal: Signal) -> float:
+        """USD already held in this market+direction if a top-up is allowed, else 0.
+
+        Allowed only when (a) the position is a settled record in the trade log (an
+        idempotency key still at "pending" means a submit whose outcome is unknown —
+        never add to that) and (b) the stake is below LIVE_TOPUP_MAX_FILL_FRAC of
+        the current Kelly target."""
+        try:
+            keys = json.loads(self._idempotency_path.read_text()) if self._idempotency_path.exists() else {}
+        except (json.JSONDecodeError, OSError):
+            return 0.0
+        if keys.get(self._idempotency_key(signal)) == "pending":
+            return 0.0
+        stake = 0.0
+        for row in self._load_open_live_trades():
+            if row.get("market_id") == signal.market.market_id and row.get("direction") == signal.direction:
+                try:
+                    stake += float(row.get("size_usd") or 0.0)
+                except ValueError:
+                    pass
+        if stake <= 0.0:
+            return 0.0
+        target = self.kelly_size_usd(signal)
+        return stake if stake < LIVE_TOPUP_MAX_FILL_FRAC * target else 0.0
+
+    def _merge_topup(self, signal: Signal, usd_spent: float, filled: float) -> None:
+        """Fold a top-up fill into the market's existing open row (stake and shares
+        added, price = volume-weighted), preserving one row per position for
+        resolution, stats and the exposure caps."""
+        with open(self._log_path, newline="") as f:
+            rows = list(csv.DictReader(f))
+        for r in rows:
+            if (r.get("market_id") == signal.market.market_id and r.get("direction") == signal.direction
+                    and r.get("actual_outcome") in (None, "")):
+                size = float(r.get("size_usd") or 0.0) + usd_spent
+                shares = float(r.get("filled_size") or 0.0) + filled
+                r["size_usd"] = round(size, 2)
+                r["filled_size"] = round(shares, 4)
+                r["filled_price"] = round(size / shares, 4) if shares > 0 else r.get("filled_price", "")
+                break
+        else:  # no open row (resolved/removed in between): record it as a fresh row
+            self._log_trade(signal, "topup", usd_spent, signal.entry_price, filled,
+                            usd_spent / filled if filled else signal.entry_price, "matched")
+            return
+        atomic_write_csv(self._log_path, _CSV_HEADERS, rows)
 
     def _is_duplicate(self, signal: Signal) -> bool:
         """Return True if this market+direction already has an open/unresolved trade."""

@@ -188,11 +188,15 @@ PAPER_BANKROLL_USD = 1000.0
 # probability compounds the damage — the forward calibration curve showed raw_p
 # in [0,0.10) resolving YES 34.9% of the time.
 KELLY_FRACTION = 0.25
-MAX_LIVE_TRADE_USD = float(os.environ.get("MAX_LIVE_TRADE_USD", "25.0"))  # overrideable via env or /setmaxbet
+MAX_LIVE_TRADE_USD = float(os.environ.get("MAX_LIVE_TRADE_USD", "50.0"))  # overrideable via env or /setmaxbet
 # Kill switch: halt for the day when resolved losses exceed
 # max(DAILY_LOSS_LIMIT_PCT × bankroll, 2 × max order) — the floor keeps a small
 # bankroll from tripping on a single normal-sized losing trade.
 DAILY_LOSS_LIMIT_PCT = 0.05
+# Top-up: a FAK only fills the depth under its price cap, so thin books leave
+# positions far below their Kelly target. A later scan may buy the shortfall when
+# the existing stake is under this fraction of the current target.
+LIVE_TOPUP_MAX_FILL_FRAC = float(os.environ.get("LIVE_TOPUP_MAX_FILL_FRAC", "0.75"))
 MAX_SLIPPAGE = float(os.environ.get("MAX_SLIPPAGE", "0.03"))  # market-buy price cap above entry (thin books)
 # Exposure caps: one bin per event (adjacent bins of the same temperature ladder
 # share the same forecast error — the bot would otherwise concentrate NO bets

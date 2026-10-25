@@ -130,6 +130,14 @@ def _make_signal(
     )
 
 
+@pytest.fixture(autouse=True)
+def _pin_trade_cap(monkeypatch):
+    """Existing tests encode the $25 per-trade cap (kill-switch limits, min-size
+    bump ceiling); production is $50 since Oct 25. Pin it so they test their own
+    logic."""
+    monkeypatch.setattr("weather.live_trader.MAX_LIVE_TRADE_USD", 25.0)
+
+
 def _make_trader(tmp_path: Path, bankroll: float = 500.0) -> LiveTrader:
     """LiveTrader with I/O isolated to tmp_path and fill delay disabled."""
     paper = MagicMock()
@@ -1199,7 +1207,7 @@ class TestSkipLogging:
 
     def test_duplicate_is_logged(self, tmp_path):
         trader = _make_trader(tmp_path)
-        trader._client = _make_mock_client(filled=20.0)
+        trader._client = _make_mock_client(filled=70.0)  # ~$24.5: a full-size position
         sig = _make_signal()
         trader.execute_signal(sig)          # first fills
         trader.execute_signal(sig)          # second is a duplicate → skip
@@ -1304,3 +1312,59 @@ class TestPriceFloorOnExecutableAsk:
         assert sig.exec_price == 0.0
         assert sig.entry_price == pytest.approx(0.35)
         assert trader.execute_signal(sig) is None
+
+
+class TestTopUp:
+    """A thin book can leave a FAK fill far below the Kelly target; a later scan
+    may buy the shortfall into the SAME row instead of being locked out."""
+
+    def _rows(self, trader):
+        return list(csv.DictReader(open(trader._log_path)))
+
+    def test_underfilled_position_is_topped_up_into_same_row(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        sig = _make_signal()
+        trader._client = _make_mock_client(filled=10.0)        # $3.50 of a ~$20+ target
+        first = trader.execute_signal(sig)
+        assert first["topup"] is False
+        trader.reset_scan_commitments()                         # next scan
+        trader._client = _make_mock_client(filled=30.0)
+        second = trader.execute_signal(sig)
+        assert second is not None and second["topup"] is True
+        rows = self._rows(trader)
+        assert len(rows) == 1                                   # merged, not a 2nd row
+        assert float(rows[0]["filled_size"]) == pytest.approx(40.0)
+        assert float(rows[0]["size_usd"]) == pytest.approx(3.50 + 10.50)
+        # the top-up only buys the shortfall: total never exceeds the Kelly target
+        assert float(rows[0]["size_usd"]) <= trader.kelly_size_usd(sig) + 0.01
+
+    def test_adequately_filled_position_is_still_a_duplicate(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        sig = _make_signal()
+        trader._client = _make_mock_client(filled=70.0)         # ~target
+        trader.execute_signal(sig)
+        trader._client = _make_mock_client(filled=30.0)
+        assert trader.execute_signal(sig) is None
+        trader._client.create_and_post_market_order.assert_not_called()
+        assert len(self._rows(trader)) == 1
+
+    def test_pending_key_never_topped_up(self, tmp_path):
+        """A submit whose outcome is unknown must not be added to."""
+        trader = _make_trader(tmp_path)
+        sig = _make_signal()
+        trader._client = _make_mock_client(filled=10.0)
+        trader.execute_signal(sig)
+        trader._write_idempotency_key(sig, "pending")
+        trader._client = _make_mock_client(filled=30.0)
+        assert trader.execute_signal(sig) is None
+        trader._client.create_and_post_market_order.assert_not_called()
+
+    def test_topup_does_not_bypass_one_bin_per_event_for_other_markets(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        a = _make_signal()
+        trader._client = _make_mock_client(filled=10.0)
+        trader.execute_signal(a)
+        trader.reset_scan_commitments()
+        b = _make_signal(market_id="other-bin")                 # same event, different bin
+        trader._client = _make_mock_client(filled=30.0)
+        assert trader.execute_signal(b) is None
