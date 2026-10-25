@@ -109,6 +109,15 @@ def run_scan(
     _t_eval = time.time()
     signals = [generator.evaluate(m) for m in markets]
     print(f"({time.time() - _t_eval:.0f}s)", end=" ", flush=True)
+    # Calibration side channel for every evaluated station market (not just the
+    # few that pass the gates) — measures per-station model skill without trading.
+    try:
+        from weather.expansion_log import LOG_NAME, log_scan
+        n_cal = log_scan(signals, log_dir / LOG_NAME)
+        if n_cal:
+            print(f"  [calib-log] {n_cal} new market rows")
+    except Exception as e:  # noqa: BLE001 — must never break the scan
+        print(f"  [calib-log] failed (scan unaffected): {e}", file=sys.stderr)
     actionable = [s for s in signals if s.quality_gate_passed]
     rejected = [s for s in signals if not s.quality_gate_passed]
     # Execute strongest edges first: with a small bankroll the in-scan budget can
@@ -1102,6 +1111,11 @@ def main() -> None:
 
         resolved_count, skipped = paper.auto_resolve(client, model=model)
         print(f"  Paper: auto-resolved {resolved_count} trade(s).  {skipped} skipped.")
+        try:
+            from weather.expansion_log import LOG_NAME, resolve_rows
+            print(f"  Calib-log: labeled {resolve_rows(log_dir / LOG_NAME)} market row(s).")
+        except Exception as e:  # noqa: BLE001
+            print(f"  Calib-log resolve failed: {e}", file=sys.stderr)
         if resolved_count:
             paper.print_dashboard()
             _write_resolved_file(paper, resolved_count, log_dir)
