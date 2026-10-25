@@ -248,6 +248,19 @@ class TestKillSwitch:
         with pytest.raises(RuntimeError, match="Daily loss limit hit"):
             trader.execute_signal(_make_signal())
 
+    def test_kill_switch_stays_at_50_when_max_order_is_50(self, monkeypatch, tmp_path):
+        """Raising the per-trade cap to $50 must not double the daily loss allowance:
+        the floor is its own constant, not 2x max order."""
+        monkeypatch.setattr("weather.live_trader.MAX_LIVE_TRADE_USD", 50.0)
+        trader = _make_trader(tmp_path, bankroll=670.0)   # 5% = 33.5 < floor 50
+        today = datetime.now(timezone.utc).date().isoformat()
+        _write_live_trades(trader._log_path, [
+            {"submitted_at": f"{today}T10:00:00+00:00", "pnl_usd": "-55.00",
+             "actual_outcome": "0", "resolved_at": f"{today}T14:00:00+00:00"},
+        ])
+        with pytest.raises(RuntimeError, match="Daily loss limit hit"):
+            trader.execute_signal(_make_signal())
+
     def test_kill_switch_allows_small_loss(self, tmp_path):
         """Loss under the threshold must not raise."""
         trader = _make_trader(tmp_path, bankroll=500.0)

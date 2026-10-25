@@ -193,6 +193,10 @@ MAX_LIVE_TRADE_USD = float(os.environ.get("MAX_LIVE_TRADE_USD", "50.0"))  # over
 # max(DAILY_LOSS_LIMIT_PCT × bankroll, 2 × max order) — the floor keeps a small
 # bankroll from tripping on a single normal-sized losing trade.
 DAILY_LOSS_LIMIT_PCT = 0.05
+# Absolute floor for the kill switch. Was implicitly 2 × max order ($50 at the old
+# $25 cap); pinned explicitly so raising MAX_LIVE_TRADE_USD to $50 (Oct 25) did not
+# silently double the daily loss allowance to $100.
+DAILY_LOSS_FLOOR_USD = float(os.environ.get("DAILY_LOSS_FLOOR_USD", "50.0"))
 # Top-up: a FAK only fills the depth under its price cap, so thin books leave
 # positions far below their Kelly target. A later scan may buy the shortfall when
 # the existing stake is under this fraction of the current target.

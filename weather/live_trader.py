@@ -18,6 +18,7 @@ from typing import Any
 
 from ._io import atomic_write_csv, atomic_write_json
 from .config import (
+    DAILY_LOSS_FLOOR_USD,
     DAILY_LOSS_LIMIT_PCT,
     EDGE_SAFETY_MARGIN_PP,
     KELLY_FRACTION,
@@ -458,11 +459,11 @@ class LiveTrader:
         if not self.is_unlocked():
             raise RuntimeError("Go-live gates not passed — run: python weather_bot.py dashboard")
 
-        # Daily loss kill switch. The floor of 2× max order keeps a small
+        # Daily loss kill switch. The absolute floor keeps a small
         # bankroll from halting on one normal-sized losing trade (5% of $65
         # is $3.25 — less than a single stake).
         today_pnl = self.daily_pnl()
-        loss_limit = max(self.bankroll_usd * DAILY_LOSS_LIMIT_PCT, 2.0 * _get_max_trade_usd())
+        loss_limit = max(self.bankroll_usd * DAILY_LOSS_LIMIT_PCT, DAILY_LOSS_FLOOR_USD)
         if today_pnl < -loss_limit:
             raise RuntimeError(
                 f"Daily loss limit hit: {today_pnl:.2f} USD (limit {loss_limit:.2f}) "
