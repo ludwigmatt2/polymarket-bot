@@ -54,6 +54,12 @@ def local_event_date(res_dt: datetime, tz_name: str) -> date:
         tz = timezone.utc
     if res_dt.tzinfo is None:
         res_dt = res_dt.replace(tzinfo=timezone.utc)
+    # Polymarket's temperature endDate is 12:00Z of the NAMED day. For zones at
+    # UTC+12 or later (Wellington, NZDT +13) that instant is already the next local
+    # day, so converting would label/resolve the wrong day (NZWN: 8/76 mismatches).
+    utc = res_dt.astimezone(timezone.utc)
+    if (utc.hour, utc.minute, utc.second) == (12, 0, 0):
+        return utc.date()
     return res_dt.astimezone(tz).date()
 
 

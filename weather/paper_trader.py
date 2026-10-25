@@ -695,15 +695,11 @@ RESOLVE_SETTLE_BUFFER_HOURS = float(os.environ.get("RESOLVE_SETTLE_BUFFER_HOURS"
 
 
 def _local_event_date(res_dt: datetime, loc_tz: str):
-    """The event's calendar date in the station's LOCAL timezone — the day the
-    market resolves on. resolution_date is stored in UTC, which can differ from the
-    local date near UTC midnight, so both the settle gate and the value fetch must
-    use this, not res_dt.date()."""
-    try:
-        tz = ZoneInfo(loc_tz)
-    except Exception:
-        tz = timezone.utc
-    return res_dt.astimezone(tz).date()
+    """The event's calendar date — the day the market resolves on (see
+    station_obs.local_event_date for the 12:00Z / UTC+12 rule). Both the settle gate
+    and the value fetch must use this, not res_dt.date()."""
+    from .station_obs import local_event_date
+    return local_event_date(res_dt, loc_tz)
 
 
 def _settle_ready(res_dt: datetime, loc_tz: str, now: datetime) -> bool:

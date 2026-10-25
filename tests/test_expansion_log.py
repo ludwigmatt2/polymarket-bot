@@ -37,3 +37,16 @@ def test_resolve_prefers_chain_then_report(tmp_path, monkeypatch):
     assert rep[0]["n"] == 2 and rep[0]["onchain_frac"] == 1.0
     assert rep[0]["brier_model"] < rep[0]["brier_market"]
     assert abs(rep[0]["bias"]) < 0.11
+
+
+def test_event_date_for_utc_plus_13_uses_named_day():
+    from datetime import date
+    from weather.paper_trader import _local_event_date
+    from weather.station_obs import local_event_date
+    res = datetime(2026, 10, 25, 12, 0, tzinfo=timezone.utc)
+    assert local_event_date(res, "Pacific/Auckland") == date(2026, 10, 25)
+    assert _local_event_date(res, "Pacific/Auckland") == date(2026, 10, 25)
+    assert local_event_date(res, "America/Los_Angeles") == date(2026, 10, 25)
+    # non-12:00Z deadlines still convert to local time
+    odd = datetime(2026, 10, 25, 20, 0, tzinfo=timezone.utc)
+    assert local_event_date(odd, "Pacific/Auckland") == date(2026, 10, 26)
