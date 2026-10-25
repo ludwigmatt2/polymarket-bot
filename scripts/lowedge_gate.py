@@ -102,7 +102,7 @@ def _read(path: Path) -> list[dict]:
               "roster deploy and needs SHADOW_TRACKS_ENABLED=1)\n")
         return []
     with path.open() as f:
-        return list(csv.DictReader(f))
+        return [r for r in csv.DictReader(f) if not r.get("exclude_reason")]
 
 
 def score_row(r: dict) -> dict | None:

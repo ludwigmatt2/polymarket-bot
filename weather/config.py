@@ -302,6 +302,28 @@ MOS_ENABLED = True
 # re-enable. Empty set = trade every metric.
 LIVE_EXCLUDED_METRICS = frozenset({"temperature_2m_min"})
 
+# ── Station expansion (Oct 2026, docs/STATION_EXPANSION_PLAN.md) ────────────────
+# 34 stations added to the registry on top of the original 14. They trade PAPER
+# ONLY until promoted (>=30 resolved paper trades at the station, PF > 1, no
+# obvious sigma bias). Promote by removing an ICAO from LIVE_PAPER_ONLY_STATIONS
+# via env (comma-separated override replaces the default; empty string = none) --
+# no deploy needed. EXPANSION_STATIONS is the FIXED set whose paper rows are
+# tagged exclude_reason="expansion_unvalidated" so the pre-registered gates
+# (scripts/*_gate.py, compute_stats) keep reading the original 14 only; it must
+# NOT shrink on promotion.
+EXPANSION_STATIONS = frozenset({
+    "EDDM", "EFHK", "EHAM", "EPWA", "FACT", "KAUS", "KDEN", "KHOU", "KLAX", "KORD",
+    "KSEA", "KSFO", "LIMC", "LTAC", "LTFM", "MMMX", "MPMG", "NZWN", "OEJN", "OPKC",
+    "RCSS", "RKPK", "RPLL", "SAEZ", "SBGR", "UUWW", "VILK", "WMKK", "ZBAA", "ZGGG",
+    "ZHHH", "ZSQD", "ZUCK", "ZUUU",
+})
+EXPANSION_EXCLUDE_REASON = "expansion_unvalidated"
+_paper_only_env = os.environ.get("LIVE_PAPER_ONLY_STATIONS")
+LIVE_PAPER_ONLY_STATIONS = (
+    EXPANSION_STATIONS if _paper_only_env is None
+    else frozenset(x.strip().upper() for x in _paper_only_env.split(",") if x.strip())
+)
+
 # ── Live price floor (Sep 2026) ────────────────────────────────────────────────
 # Cheap contracts are a structural loser, the same shape as the min-temp leak: the
 # model systematically overprices a region the market prices correctly. The ensemble

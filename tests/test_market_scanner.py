@@ -213,6 +213,7 @@ class TestZeroMarketsAlarm:
         scanner = _make_scanner_with_geocode()
         # Patch _gamma_search_keywords to return empty list (simulates Gamma returning 0 events)
         monkeypatch.setattr(scanner, "_gamma_search_keywords", lambda: [])
+        monkeypatch.setattr(scanner, "_gamma_tag_feed", lambda: [])
 
         with caplog.at_level(logging.WARNING, logger="weather.market_scanner"):
             result = scanner._search_keywords()
@@ -236,6 +237,7 @@ class TestZeroMarketsAlarm:
         scanner = _make_scanner_with_geocode()
         fake_market = _make_gamma_market()
         monkeypatch.setattr(scanner, "_gamma_search_keywords", lambda: [fake_market])
+        monkeypatch.setattr(scanner, "_gamma_tag_feed", lambda: [])
 
         with caplog.at_level(logging.WARNING, logger="weather.market_scanner"):
             result = scanner._search_keywords()
@@ -369,3 +371,64 @@ class TestEventDayExpiry:
         monkeypatch.setattr(station_obs, "is_event_day", lambda *a, **k: True)
         scanner = _make_scanner_with_geocode()
         assert scanner._filter_tradeable([self._wm(station="")]) == []
+
+
+class TestTagFeed:
+    """Weather tag feed is a second discovery source (station expansion Phase 1)."""
+
+    def test_tag_only_markets_added_and_deduped(self, monkeypatch):
+        scanner = _make_scanner_with_geocode()
+        kw = _make_gamma_market(condition_id="a")
+        monkeypatch.setattr(scanner, "_gamma_search_keywords", lambda: [kw])
+        monkeypatch.setattr(scanner, "_gamma_tag_feed",
+                            lambda: [_make_gamma_market(condition_id="a"),
+                                     _make_gamma_market(condition_id="b")])
+        assert sorted(m.market_id for m in scanner._search_keywords()) == ["a", "b"]
+
+    def test_pagination_stops_on_short_page(self, monkeypatch):
+        import io, json as _json
+        import weather.market_scanner as ms
+        urls = []
+
+        def fake_open(req, timeout=0):
+            urls.append(req.full_url)
+            n = 100 if len(urls) == 1 else 1
+            events = [{"title": "t", "slug": "s", "markets": [
+                {"conditionId": f"c{len(urls)}_{i}", "outcomePrices": "[0.5,0.5]"}]} for i in range(n)]
+            return io.BytesIO(_json.dumps(events).encode())
+
+        monkeypatch.setattr(ms.urllib.request, "urlopen", fake_open)
+        out = _make_scanner_with_geocode()._gamma_tag_feed()
+        assert len(urls) == 2 and "offset=100" in urls[1]
+        assert len(out) == 101
+
+    def test_feed_failure_returns_partial(self, monkeypatch):
+        import weather.market_scanner as ms
+
+        def boom(req, timeout=0):
+            raise OSError("down")
+
+        monkeypatch.setattr(ms.urllib.request, "urlopen", boom)
+        assert _make_scanner_with_geocode()._gamma_tag_feed() == []
+
+
+class TestMetarRulesBoilerplate:
+    """Oct-23 rules text: example degrees and 'Weather Underground' must not read as
+    a threshold / direction conflict (dropped every hot-station market)."""
+
+    DESC = (
+        "T01390133 is 13.9°C; T10171022 is −1.7°C.\n"
+        "18/12 is 18°C; M11/M17 is −11°C.\n"
+        "For example, 13.9°C counts as 14°C; 17.4°C counts as 17°C.\n"
+        "the Weather Underground Daily Observations table will be used. next higher whole degree."
+    )
+
+    def test_far_threshold_and_underground_not_a_conflict(self):
+        sc = _make_scanner_with_geocode()
+        assert sc._description_agrees(self.DESC, "temperature_2m_max", 29.0, None, "above")
+        assert sc._description_agrees(self.DESC, "temperature_2m_max", 29.0, None, "below")
+
+    def test_real_conflict_still_caught(self):
+        sc = _make_scanner_with_geocode()
+        assert not sc._description_agrees(
+            "Resolves YES if the high is above 40°C.", "temperature_2m_max", 20.0, None, "above")

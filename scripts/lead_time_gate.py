@@ -88,6 +88,8 @@ def _load(path: Path, *, live: bool) -> list[dict]:
                 size, px = _num(r.get("filled_size")), _num(r.get("filled_price"))
                 stake = size * px if size and px else None
             else:
+                if r.get("exclude_reason"):  # expansion stations: outside the gate population
+                    continue
                 if _num(r.get("entry_price")) is None or _num(r["entry_price"]) < PAPER_MIN_ENTRY:
                     continue
                 if r.get("metric") == "precipitation_sum":

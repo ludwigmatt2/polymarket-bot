@@ -176,6 +176,9 @@ class _GammaMarket:
 
 
 _GAMMA_SEARCH_URL = "https://gamma-api.polymarket.com/public-search"
+_GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
+_TAG_FEED_PAGE = 100
+_TAG_FEED_MAX_PAGES = 15  # hard stop; ~410 events today = 5 pages
 
 
 class WeatherMarketScanner:
@@ -266,6 +269,15 @@ class WeatherMarketScanner:
         """Query Polymarket for each weather keyword, deduplicate by condition_id."""
         markets = self._gamma_search_keywords()
 
+        # Second source: the weather tag feed lists every station's events, incl. the
+        # ones no WEATHER_SEARCH_TERMS keyword reaches. Deduped by conditionId; the
+        # keyword results stay as fallback if the feed fails.
+        seen = {m.market_id for m in markets if m.market_id}
+        for m in self._gamma_tag_feed():
+            if m.market_id and m.market_id not in seen:
+                seen.add(m.market_id)
+                markets.append(m)
+
         if len(markets) == 0:
             _log.warning(
                 "Zero markets returned from gamma search (terms: %s). "
@@ -279,6 +291,32 @@ class WeatherMarketScanner:
                 "reason": "zero_markets_returned",
             }], _ALARM_FIELDS)
 
+        return markets
+
+    def _gamma_tag_feed(self) -> list[_GammaMarket]:
+        """Page /events?tag_slug=weather&closed=false until an empty page."""
+        markets: list[_GammaMarket] = []
+        seen_ids: set[str] = set()
+        for page in range(_TAG_FEED_MAX_PAGES):
+            url = (f"{_GAMMA_EVENTS_URL}?tag_slug=weather&closed=false"
+                   f"&limit={_TAG_FEED_PAGE}&offset={page * _TAG_FEED_PAGE}&order=volume24hr")
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    events = json.loads(resp.read())
+            except Exception as e:
+                print(f"    warning: tag-feed page {page} failed: {e}", flush=True)
+                break
+            if not events:
+                break
+            for event in events:
+                for m in event.get("markets", []):
+                    cid = m.get("conditionId", "")
+                    if cid and cid not in seen_ids:
+                        seen_ids.add(cid)
+                        markets.append(_GammaMarket(m, event))
+            if len(events) < _TAG_FEED_PAGE:
+                break
         return markets
 
     def _gamma_search_keywords(self) -> list[_GammaMarket]:
@@ -474,12 +512,21 @@ class WeatherMarketScanner:
         # boilerplate includes "(eg, 9.1°C)" in every daily-temp description, which is
         # not a threshold and must not count as conflicting evidence.
         description = re.sub(r"\((?:e\.?g\.?|example)[^)]*\)", "", description, flags=re.IGNORECASE)
+        # Oct-23 METAR rules text carries worked examples ("T01390133 is 13.9°C",
+        # "18/12 is 18°C", "For example, 13.9°C counts as 14°C ...") that are not
+        # thresholds. Left in, every market whose threshold is >3°C from those
+        # examples (all hot-station markets) was dropped as a title/description conflict.
+        description = re.sub(r"For example,[^\n]*", "", description)
+        description = re.sub(r"\bT\d{8} is [^\n]*", "", description)
+        description = re.sub(r"\b\d+/M?\d+ is [^.\n]*(?:;[^.\n]*)?\.", "", description)
 
         desc = description.lower()
 
         # Check direction agreement when description has explicit above/below language
-        above_kw = any(w in desc for w in ("above", "exceed", "greater than", "more than", "higher than", "at least"))
-        below_kw = any(w in desc for w in ("below", "less than", "under", "lower than", "fewer than"))
+        # Word-boundary match: bare "under" is a substring of "Weather Underground",
+        # which the Oct-23 rules name as the fallback source in every market.
+        above_kw = bool(re.search(r"\b(?:above|exceed|greater than|more than|higher than|at least)\b", desc))
+        below_kw = bool(re.search(r"\b(?:below|less than|under|lower than|fewer than)\b", desc))
         if above_kw and not below_kw and direction == "below":
             return False
         if below_kw and not above_kw and direction == "above":

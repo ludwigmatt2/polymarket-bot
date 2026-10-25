@@ -63,6 +63,43 @@ _STATION_REGISTRY: dict[str, tuple[str, str, str, float, float, str | None]] = {
     "CYYZ": ("CA_ON_ASOS", "CYYZ", "America/Toronto", 43.6772, -79.6306, "71624"),  # Toronto / Pearson (°C)
     # Jul-10 registry expansion (scripts/discover_stations.py — IEM+WU verified):
     "ZGSZ": ("CN__ASOS", "ZGSZ", "Asia/Shanghai", 22.5500, 114.1000, "59493"),  # Shenzhen Bao'an (°C)
+    # Oct-25 expansion: 34 stations, paper-only until promoted (config.EXPANSION_STATIONS,
+    # LIVE_PAPER_ONLY_STATIONS). IEM + aviationweather METAR verified; wmo None = not
+    # looked up yet (never guess).
+    "EDDM": ("DE__ASOS", "EDDM", "Europe/Berlin", 48.3583, 11.8092, None),  # Munich
+    "EFHK": ("FI__ASOS", "EFHK", "Europe/Helsinki", 60.3172, 24.9633, None),  # Helsinki
+    "EHAM": ("NL__ASOS", "EHAM", "Europe/Amsterdam", 52.3154, 4.7902, None),  # Amsterdam
+    "EPWA": ("PL__ASOS", "EPWA", "Europe/Warsaw", 52.1628, 20.9611, None),  # Warsaw
+    "FACT": ("ZA__ASOS", "FACT", "Africa/Johannesburg", -33.9667, 18.6, None),  # Cape Town
+    "KAUS": ("TX_ASOS", "AUS", "America/Chicago", 30.183, -97.6799, None),  # Austin
+    "KDEN": ("CO_ASOS", "DEN", "America/Denver", 39.8328, -104.6575, None),  # Denver
+    "KHOU": ("TX_ASOS", "HOU", "America/Chicago", 29.6375, -95.2824, None),  # Houston
+    "KLAX": ("CA_ASOS", "LAX", "America/Los_Angeles", 33.9382, -118.3865, None),  # Los Angeles
+    "KORD": ("IL_ASOS", "ORD", "America/Chicago", 41.9602, -87.9316, None),  # Chicago
+    "KSEA": ("WA_ASOS", "SEA", "America/Los_Angeles", 47.4447, -122.3144, None),  # Seattle
+    "KSFO": ("CA_ASOS", "SFO", "America/Los_Angeles", 37.619, -122.3749, None),  # San Francisco
+    "LIMC": ("IT__ASOS", "LIMC", "Europe/Rome", 45.63, 8.7231, None),  # Milan
+    "LTAC": ("TR__ASOS", "LTAC", "Europe/Istanbul", 40.1281, 32.9951, None),  # Ankara
+    "LTFM": ("TR__ASOS", "LTFM", "Europe/Istanbul", 41.2629, 28.7413, None),  # Istanbul
+    "MMMX": ("MX__ASOS", "MMMX", "America/Mexico_City", 19.4363, -99.0721, None),  # Mexico City
+    "MPMG": ("PA__ASOS", "MPMG", "America/Panama", 8.9833, -79.5167, None),  # Panama City
+    "NZWN": ("NF__ASOS", "NZWN", "Pacific/Auckland", -41.3272, 174.8053, None),  # Wellington
+    "OEJN": ("SA__ASOS", "OEJN", "Asia/Riyadh", 21.6598, 39.1222, None),  # Jeddah
+    "OPKC": ("PK__ASOS", "OPKC", "Asia/Karachi", 24.8456, 67.1614, None),  # Karachi
+    "RCSS": ("TW__ASOS", "RCSS", "Asia/Taipei", 25.0694, 121.5517, None),  # Taipei
+    "RKPK": ("KR__ASOS", "RKPK", "Asia/Seoul", 35.1795, 128.9382, None),  # Busan
+    "RPLL": ("PH__ASOS", "RPLL", "Asia/Manila", 14.5069, 121.0042, None),  # Manila
+    "SAEZ": ("AR__ASOS", "SAEZ", "America/Argentina/Buenos_Aires", -34.8222, -58.5358, None),  # Buenos Aires
+    "SBGR": ("BR__ASOS", "SBGR", "America/Sao_Paulo", -23.4321, -46.4695, None),  # Sao Paulo
+    "UUWW": ("RU__ASOS", "UUWW", "Europe/Moscow", 55.5915, 37.2615, None),  # Moscow
+    "VILK": ("IN__ASOS", "VILK", "Asia/Kolkata", 26.7606, 80.8893, None),  # Lucknow
+    "WMKK": ("MY__ASOS", "WMKK", "Asia/Kuala_Lumpur", 2.7167, 101.7, None),  # Kuala Lumpur
+    "ZBAA": ("CN__ASOS", "ZBAA", "Asia/Shanghai", 40.0741, 116.587, None),  # Beijing
+    "ZGGG": ("CN__ASOS", "ZGGG", "Asia/Shanghai", 23.3964, 113.3008, None),  # Guangzhou
+    "ZHHH": ("CN__ASOS", "ZHHH", "Asia/Shanghai", 30.62, 114.13, None),  # Wuhan
+    "ZSQD": ("CN__ASOS", "ZSQD", "Asia/Shanghai", 36.0667, 120.3333, None),  # Qingdao
+    "ZUCK": ("CN__ASOS", "ZUCK", "Asia/Chongqing", 29.52, 106.48, None),  # Chongqing
+    "ZUUU": ("CN__ASOS", "ZUUU", "Asia/Chongqing", 30.6667, 104.0167, None),  # Chengdu
 }
 
 

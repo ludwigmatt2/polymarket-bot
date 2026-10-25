@@ -585,6 +585,23 @@ class TestExecPrice:
         assert float(row["entry_price"]) == pytest.approx(0.60)   # mid, unchanged
         assert float(row["exec_price"]) == pytest.approx(0.64)    # the ask
 
+    def test_expansion_station_row_is_tagged_and_excluded_from_stats(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        sig = self._signal(exec_price=0.64)
+        sig.market.station_icao = "EDDM"
+        trader.log_trade(sig)
+        row = trader._load_all()[0]
+        assert row["exclude_reason"] == "expansion_unvalidated"
+        trader.resolve_trade(row["trade_id"], False)
+        assert trader.compute_stats().resolved_trades == 0
+
+    def test_original_station_row_is_untagged(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        sig = self._signal(exec_price=0.64)
+        sig.market.station_icao = "KLGA"
+        trader.log_trade(sig)
+        assert trader._load_all()[0]["exclude_reason"] == ""
+
     def test_missing_ask_leaves_exec_price_blank(self, tmp_path):
         trader = _make_trader(tmp_path)
         trader.log_trade(self._signal(exec_price=0.0))

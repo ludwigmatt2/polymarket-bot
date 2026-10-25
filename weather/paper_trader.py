@@ -19,6 +19,8 @@ from zoneinfo import ZoneInfo
 from ._io import atomic_write_csv
 from .config import (
     DAILY_LOSS_LIMIT_PCT,
+    EXPANSION_EXCLUDE_REASON,
+    EXPANSION_STATIONS,
     GATE_ERA_START,
     GATE_MIN_DAYS_ELAPSED,
     GATE_MIN_STATION_RESOLVED,
@@ -73,6 +75,10 @@ CSV_HEADERS = [
     # pnl_usd / fee_usd are computed at exec_price when present, else entry_price.
     # "" on rows written before 2026-10-16 (those are mid-priced).
     "exec_price",
+    # Gate-population tag: "expansion_unvalidated" on rows from stations added in the
+    # Oct-2026 expansion (config.EXPANSION_STATIONS). compute_stats and the
+    # pre-registered gate scripts skip tagged rows. "" on all older rows.
+    "exclude_reason",
 ]
 
 # Brier score for an uninformed 50/50 forecast (climatology baseline)
@@ -407,6 +413,8 @@ class PaperTrader:
         # harvest — see [[longshot_retired]]) never enter the record: they'd
         # corrupt both the topline and the re-live gate if counted.
         trades = [t for t in trades if t.get("scan_source") != "longshot"]
+        # Expansion stations are tagged out of the pre-registered gate population.
+        trades = [t for t in trades if not t.get("exclude_reason")]
         resolved = [t for t in trades if t.get("actual_outcome") in ("0", "1", 0, 1)]
 
         total = len(trades)
@@ -639,6 +647,8 @@ class PaperTrader:
                 "scan_source": trade.scan_source,
                 "restofday": trade.restofday,
                 "exit_time": "", "exit_price": "", "exit_pnl_usd": "", "exit_reason": "",
+                "exclude_reason": (EXPANSION_EXCLUDE_REASON
+                                   if (trade.station_icao or "").upper() in EXPANSION_STATIONS else ""),
             })
 
     def _load_all(self) -> list[dict]:

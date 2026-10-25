@@ -101,6 +101,8 @@ def _load_band() -> list[dict]:
     for r in rows:
         if r.get("actual_outcome") not in ("0", "1"):
             continue
+        if r.get("exclude_reason"):  # expansion stations are outside the gate population
+            continue
         if (r.get("scan_source") or "") == "longshot":
             continue
         ep = _num(r.get("entry_price"))

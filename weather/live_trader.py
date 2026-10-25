@@ -25,6 +25,7 @@ from .config import (
     LIVE_EXCLUDED_METRICS,
     LIVE_GATE_LATCHES,
     LIVE_MIN_ENTRY_PRICE,
+    LIVE_PAPER_ONLY_STATIONS,
     LIVE_TOPUP_MAX_FILL_FRAC,
     MAX_DAY_EXPOSURE_PCT,
     MAX_LIVE_TRADE_USD,
@@ -487,6 +488,13 @@ class LiveTrader:
         # keeps recording, so a fix can be proven before we re-enable.
         if signal.market.metric in LIVE_EXCLUDED_METRICS:
             self._log_skip(signal, f"excluded_metric:{signal.market.metric}")
+            return None
+
+        # Station expansion: newly added stations are paper-only until promoted
+        # (LIVE_PAPER_ONLY_STATIONS, env-overridable). Paper keeps logging.
+        icao = (signal.market.station_icao or "").upper()
+        if icao in LIVE_PAPER_ONLY_STATIONS:
+            self._log_skip(signal, f"paper_only_station:{icao}")
             return None
 
         # Price floor: cheap contracts are a structural loser (the ensemble tail is

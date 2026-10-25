@@ -1067,6 +1067,20 @@ class TestExposureCaps:
         # a non-excluded (max-temp) signal in the same scan still trades
         assert trader.execute_signal(_make_signal(market_id="mkt_max")) is not None
 
+    def test_paper_only_station_skips_live_order(self, tmp_path, monkeypatch):
+        import weather.live_trader as lt_mod
+        monkeypatch.setattr(lt_mod, "LIVE_PAPER_ONLY_STATIONS", frozenset({"EDDM"}))
+        trader = _make_trader(tmp_path)
+        trader._client = _make_mock_client(filled=15.0)
+        trader.reset_scan_commitments()
+        sig = _make_signal(market_id="mkt_new")
+        sig.market.station_icao = "EDDM"
+        assert trader.execute_signal(sig) is None
+        trader._client.create_and_post_market_order.assert_not_called()
+        # promoted (removed from the set) -> trades
+        monkeypatch.setattr(lt_mod, "LIVE_PAPER_ONLY_STATIONS", frozenset())
+        assert trader.execute_signal(_make_signal(market_id="mkt_new2")) is not None
+
     def test_day_exposure_cap_blocks_new_orders(self, tmp_path):
         trader = _make_trader(tmp_path, bankroll=40.0)  # day cap = 40 × 0.40 = $16
         sig = _make_signal(market_id="mkt_new")
