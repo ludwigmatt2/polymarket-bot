@@ -248,6 +248,18 @@ def fetch_balance_for_creds(creds: dict) -> float:
     return _read_collateral_balance(client)
 
 
+def live_ineligible_reason(market) -> str | None:
+    """Why a market can never go live (excluded metric / paper-only station), else
+    None. Single source for execute_signal's skips AND the Telegram scan summary, so
+    'actionable' there can be read as 'live-capable'."""
+    if market.metric in LIVE_EXCLUDED_METRICS:
+        return f"excluded_metric:{market.metric}"
+    icao = (getattr(market, "station_icao", "") or "").upper()
+    if icao in LIVE_PAPER_ONLY_STATIONS:
+        return f"paper_only_station:{icao}"
+    return None
+
+
 class LiveTrader:
     def __init__(
         self,
@@ -483,18 +495,12 @@ class LiveTrader:
                 self._log_skip(signal, "duplicate")
                 return None
 
-        # Metric exclusion: min-temp resolves off a station reading the grid
-        # forecast systematically misses. Block live money while the paper track
-        # keeps recording, so a fix can be proven before we re-enable.
-        if signal.market.metric in LIVE_EXCLUDED_METRICS:
-            self._log_skip(signal, f"excluded_metric:{signal.market.metric}")
-            return None
-
-        # Station expansion: newly added stations are paper-only until promoted
-        # (LIVE_PAPER_ONLY_STATIONS, env-overridable). Paper keeps logging.
-        icao = (signal.market.station_icao or "").upper()
-        if icao in LIVE_PAPER_ONLY_STATIONS:
-            self._log_skip(signal, f"paper_only_station:{icao}")
+        # Metric exclusion (min-temp: station low the grid forecast misses) and
+        # paper-only stations (Oct-2026 expansion, until promoted): no live money,
+        # while the paper track keeps recording so a fix/promotion can be proven.
+        reason = live_ineligible_reason(signal.market)
+        if reason:
+            self._log_skip(signal, reason)
             return None
 
         # Price floor: cheap contracts are a structural loser (the ensemble tail is

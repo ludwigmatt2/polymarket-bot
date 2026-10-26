@@ -79,6 +79,8 @@ CSV_HEADERS = [
     # Oct-2026 expansion (config.EXPANSION_STATIONS). compute_stats and the
     # pre-registered gate scripts skip tagged rows. "" on all older rows.
     "exclude_reason",
+    # Ensemble mean / member std (°C) at signal time ("" on older rows).
+    "fc_mean", "fc_member_std",
 ]
 
 # Brier score for an uninformed 50/50 forecast (climatology baseline)
@@ -92,6 +94,20 @@ def _trade_pnl(size_usd: float, entry_price: float, bet_wins: bool) -> float:
 
 def _brier(model_p: float, outcome: bool) -> float:
     return (model_p - float(outcome)) ** 2
+
+
+def fc_stats(signal) -> tuple[float | None, float | None]:
+    """(ensemble mean, member std) in °C from the signal's forecast, None if absent."""
+    try:
+        members = signal.forecast.all_members
+        n = len(members)
+        if n < 2:
+            return None, None
+        mean = sum(members) / n
+        std = (sum((v - mean) ** 2 for v in members) / n) ** 0.5
+        return round(mean, 2), round(std, 2)
+    except Exception:  # noqa: BLE001 — logging aid only
+        return None, None
 
 
 class PaperTrader:
@@ -143,6 +159,8 @@ class PaperTrader:
             location_tz=signal.market.location.timezone or "UTC",
             raw_p=signal.prob_result.raw_p,
             exec_price=float(getattr(signal, "exec_price", 0.0) or 0.0),
+            fc_mean=fc_stats(signal)[0],
+            fc_member_std=fc_stats(signal)[1],
             model_breakdown_json=json.dumps(signal.prob_result.model_breakdown),
             station_icao=signal.market.station_icao,
             station_country=signal.market.station_country,
@@ -668,6 +686,8 @@ class PaperTrader:
                 "scan_source": trade.scan_source,
                 "restofday": trade.restofday,
                 "exit_time": "", "exit_price": "", "exit_pnl_usd": "", "exit_reason": "",
+                "fc_mean": "" if trade.fc_mean is None else trade.fc_mean,
+                "fc_member_std": "" if trade.fc_member_std is None else trade.fc_member_std,
                 "exclude_reason": (EXPANSION_EXCLUDE_REASON
                                    if (trade.station_icao or "").upper() in EXPANSION_STATIONS else ""),
             })

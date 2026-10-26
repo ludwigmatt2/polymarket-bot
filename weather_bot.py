@@ -40,7 +40,7 @@ from weather.market_scanner import WeatherMarketScanner
 from weather.city_bias import CityBiasCorrector
 from weather.paths import DATA_DIR
 from weather.models import Signal
-from weather.live_trader import LiveTrader, check_geoblock
+from weather.live_trader import LiveTrader, check_geoblock, live_ineligible_reason
 from weather.paper_trader import PaperTrader
 from weather.position_monitor import PositionMonitor, print_divergences, print_flags
 from weather.price_tracker import PriceTracker
@@ -431,10 +431,17 @@ def _build_funnel(
         }
         for s in sorted(rejected, key=lambda x: abs(x.edge_pp), reverse=True)[:10]
     ]
+    non_live: dict[str, int] = {}
+    for s in actionable:
+        r = live_ineligible_reason(s.market)
+        if r:
+            non_live[r.split(":")[0]] = non_live.get(r.split(":")[0], 0) + 1
     return {
         **scanner.last_funnel,
         "evaluated": len(signals),
         "actionable": len(actionable),
+        "actionable_live": len(actionable) - sum(non_live.values()),
+        "non_live": non_live,
         "rejections": dict(sorted(rejections.items(), key=lambda x: -x[1])),
         "top_rejected": top_rejected,
     }
@@ -455,6 +462,7 @@ def _write_signals_file(
                 "model_p": s.model_p,
                 "mkt_p": s.market_p,
                 "direction": s.direction,
+                "live_eligible": live_ineligible_reason(s.market) is None,
                 "resolution_date": s.market.resolution_date.isoformat() if s.market.resolution_date else None,
             }
             for s in sorted(actionable, key=lambda x: x.edge_pp, reverse=True)

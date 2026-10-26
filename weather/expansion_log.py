@@ -15,6 +15,7 @@ from pathlib import Path
 
 from ._io import atomic_write_csv
 from .config import EXPANSION_STATIONS
+from .paper_trader import fc_stats
 
 LOG_NAME = "expansion_calibration.csv"
 FIELDS = [
@@ -22,6 +23,7 @@ FIELDS = [
     "threshold_high", "weather_direction", "resolve_unit", "station_country",
     "location_tz", "resolution_date", "lead_h", "model_p", "raw_p", "market_p",
     "rejection", "actual_outcome", "label_source", "resolved_at",
+    "fc_mean", "fc_member_std",
 ]
 # Event-day end + settle buffer before a station reading is trusted.
 _SETTLE_H = 30
@@ -33,6 +35,12 @@ def log_scan(signals, path: Path, now: datetime | None = None) -> int:
     day = now.date().isoformat()
     seen: set[tuple[str, str]] = set()
     if path.exists():
+        with open(path, newline="") as f:
+            header = next(csv.reader(f), [])
+        if header != FIELDS:  # columns added since the file was created
+            with open(path, newline="") as f:
+                old = list(csv.DictReader(f))
+            atomic_write_csv(path, FIELDS, old)
         with open(path, newline="") as f:
             seen = {(r["market_id"], r["logged_at"][:10]) for r in csv.DictReader(f)}
     rows = []
@@ -57,6 +65,8 @@ def log_scan(signals, path: Path, now: datetime | None = None) -> int:
             "market_p": round(float(s.market_p), 4),
             "rejection": (s.rejection_reason or "").split(":")[0],
             "actual_outcome": "", "label_source": "", "resolved_at": "",
+            "fc_mean": "" if fc_stats(s)[0] is None else fc_stats(s)[0],
+            "fc_member_std": "" if fc_stats(s)[1] is None else fc_stats(s)[1],
         })
     if not rows:
         return 0

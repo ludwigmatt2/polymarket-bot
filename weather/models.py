@@ -230,6 +230,10 @@ class PaperTrade:
     # MID — it is the market-probability input of the model-vs-market Brier gate —
     # while PnL and the taker fee are computed at THIS price, like a live BUY.
     exec_price: float = 0.0
+    # Ensemble mean / member std (°C) at signal time, so a miss can be checked against
+    # the measured value (bias) instead of only the bucket-hit fraction.
+    fc_mean: float | None = None
+    fc_member_std: float | None = None
     actual_outcome: bool | None = None
     resolved_at: datetime | None = None
     pnl_usd: float | None = None

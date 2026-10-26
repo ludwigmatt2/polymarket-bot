@@ -1095,6 +1095,16 @@ def fmt_positions(uid: int) -> str:
 def fmt_signals(signals: list[dict], uid: int) -> str:
     if not signals:
         return "No signals from last scan."
+    # Live mode: show only what can actually trade live. Paper-only stations and
+    # min-temp are hidden (counted in the footer) — "actionable" used to include
+    # them, so scans read as "4 signals, 0 trades" with nothing wrong.
+    hidden = 0
+    if get_user_mode(uid) == "live":
+        shown = [s for s in signals if s.get("live_eligible", True)]
+        hidden = len(signals) - len(shown)
+        signals = shown
+        if not signals:
+            return f"No live-capable signals from last scan. _({hidden} paper-only / min-temp hidden)_"
     scanned_at = ""
     f = _signals_path(uid)
     if f.exists():
@@ -1112,6 +1122,8 @@ def fmt_signals(signals: list[dict], uid: int) -> str:
         lines.append(f"   Model {model_p:.1%} vs Mkt {mkt_p:.1%}")
     if len(signals) > 10:
         lines.append(f"\n_...and {len(signals) - 10} more_")
+    if hidden:
+        lines.append(f"\n_+{hidden} paper-only / min-temp signal(s) hidden_")
     return "\n".join(lines)
 
 
@@ -3037,7 +3049,13 @@ async def _auto_scan(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         funnel = {}
     header = [f"🔍 *Scan complete* · _{meta.get('scanned_at', '')}_"]
     if funnel.get("evaluated") is not None:
-        header.append(f"Evaluated: {funnel['evaluated']} · Actionable: {funnel.get('actionable', 0)}")
+        if get_user_mode(ADMIN_ID) == "live" and "actionable_live" in funnel:
+            nl = funnel.get("non_live", {})
+            extra = (f" _(+{funnel.get('actionable', 0) - funnel['actionable_live']} paper-only/min-temp)_"
+                     if nl else "")
+            header.append(f"Evaluated: {funnel['evaluated']} · Live-capable: {funnel['actionable_live']}{extra}")
+        else:
+            header.append(f"Evaluated: {funnel['evaluated']} · Actionable: {funnel.get('actionable', 0)}")
     trade_label = "New live trades" if get_user_mode(ADMIN_ID) == "live" else "New paper trades"
     header.append(f"{trade_label}: *{new_trades}*")
     # Surface an unresolved order block in the heartbeat itself. The push alert
