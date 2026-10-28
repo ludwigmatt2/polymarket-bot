@@ -79,7 +79,25 @@ def is_deployed(wallet: str) -> bool:
     return code not in ("0x", "0x0")
 
 
+_CHAIN_OUTCOME_CACHE: dict[str, bool] = {}
+
+
 def chain_outcome(condition_id: str) -> bool | None:
+    """Memoized wrapper: a settled payout is immutable, so cache hits (never None)
+    for the life of the process. The auto-resolve pass asks about the same market
+    from the main track, 10 shadow tracks and the calibration log (~1.5s per RPC
+    pair) — uncached that alone exceeded the 300s job timeout."""
+    key = condition_id.lower()
+    hit = _CHAIN_OUTCOME_CACHE.get(key)
+    if hit is not None:
+        return hit
+    out = _chain_outcome_uncached(condition_id)
+    if out is not None:
+        _CHAIN_OUTCOME_CACHE[key] = out
+    return out
+
+
+def _chain_outcome_uncached(condition_id: str) -> bool | None:
     """A binary market's resolved outcome read directly from the ConditionalTokens
     contract's payoutNumerators — Polymarket's actual on-chain settlement, not a
     weather-truth proxy. True = the "Yes" token (index 0) won, False = "No" (index
