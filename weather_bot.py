@@ -1119,11 +1119,6 @@ def main() -> None:
 
         resolved_count, skipped = paper.auto_resolve(client, model=model)
         print(f"  Paper: auto-resolved {resolved_count} trade(s).  {skipped} skipped.")
-        try:
-            from weather.expansion_log import LOG_NAME, resolve_rows
-            print(f"  Calib-log: labeled {resolve_rows(log_dir / LOG_NAME)} market row(s).")
-        except Exception as e:  # noqa: BLE001
-            print(f"  Calib-log resolve failed: {e}", file=sys.stderr)
         if resolved_count:
             paper.print_dashboard()
             _write_resolved_file(paper, resolved_count, log_dir)
@@ -1169,6 +1164,14 @@ def main() -> None:
                     print(f"  [shadow] resolved " + " ".join(f"{k}={v}" for k, v in shres.items() if v))
             except Exception as e:  # noqa: BLE001
                 print(f"  [shadow] resolve harness error (production unaffected): {e}", file=sys.stderr)
+
+        # Side-channel calibration labeling runs LAST and time-boxed: it once ran before
+        # live resolve/claim and, on a 3.5k-market backlog, timed the whole job out.
+        try:
+            from weather.expansion_log import LOG_NAME, resolve_rows
+            print(f"  Calib-log: labeled {resolve_rows(log_dir / LOG_NAME, budget_s=120)} market row(s).")
+        except Exception as e:  # noqa: BLE001
+            print(f"  Calib-log resolve failed: {e}", file=sys.stderr)
 
         return
 

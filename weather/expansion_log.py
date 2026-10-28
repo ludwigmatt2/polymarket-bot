@@ -10,6 +10,7 @@ and bias are measurable without trading. Rows carry expansion=1/0 so the origina
 from __future__ import annotations
 
 import csv
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -80,8 +81,15 @@ def log_scan(signals, path: Path, now: datetime | None = None) -> int:
     return len(rows)
 
 
-def resolve_rows(path: Path, now: datetime | None = None, max_rows: int = 3000) -> int:
-    """Label unresolved rows: on-chain payout first, else the station reading."""
+def resolve_rows(path: Path, now: datetime | None = None, max_rows: int = 3000,
+                 budget_s: float | None = None) -> int:
+    """Label unresolved rows: on-chain payout first, else the station reading.
+
+    `budget_s` caps wall-clock time: the first backlog is ~3.5k markets of
+    sequential RPC calls, which blew the 300s auto-resolve timeout and — because the
+    CSV is only written at the end — labeled nothing, every hour. Stop at the budget
+    and persist what is done; the next pass continues.
+    """
     from .paper_trader import _local_event_date
     from .relayer import chain_outcome
     from .station_truth import station_outcome
@@ -94,7 +102,10 @@ def resolve_rows(path: Path, now: datetime | None = None, max_rows: int = 3000) 
     cache: dict = {}
     chain_cache: dict[str, bool | None] = {}
     done = 0
+    deadline = time.monotonic() + budget_s if budget_s else None
     for r in rows:
+        if deadline is not None and time.monotonic() > deadline:
+            break
         if r["actual_outcome"] != "" or done >= max_rows:
             continue
         res = datetime.fromisoformat(r["resolution_date"])

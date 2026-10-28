@@ -644,6 +644,12 @@ class LiveTrader:
         # between submit and the post-write, the reservation still blocks a
         # duplicate order on the next run. Roll back if submit itself fails.
         self._write_idempotency_key(signal, "pending")
+        # POLY_1271 "signature does not match order hash" is intermittent; the hash
+        # depends on neg_risk/tick_size, so record them per attempt to compare
+        # failures against successes (scan_errors.log).
+        print(f"[order-attempt] {signal.market.market_id[:10]} {signal.direction} "
+              f"neg_risk={signal.market.neg_risk!r} tick={tick_size} "
+              f"cap={price_cap} usd={amount_usd}", file=sys.stderr)
         try:
             # FAK market BUY: fill available depth at/under price_cap immediately,
             # kill the remainder. Partial fills are fine — reconciled from the
