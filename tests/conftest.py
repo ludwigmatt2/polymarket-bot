@@ -75,3 +75,15 @@ def dashboard_server() -> str:
 def _module_available(name: str) -> bool:
     import importlib.util
     return importlib.util.find_spec(name) is not None
+
+
+import pytest as _pytest
+
+
+@_pytest.fixture(autouse=True)
+def _reset_open_meteo_breaker():
+    """The 429 circuit breaker is module state — never let one test's 429s leak."""
+    from weather import weather_client as _wc
+    _wc._rl_open_until = 0.0
+    yield
+    _wc._rl_open_until = 0.0

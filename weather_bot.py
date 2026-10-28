@@ -107,6 +107,10 @@ def run_scan(
 
     print(f"  [2/3] Evaluating {len(markets)} markets...", end=" ", flush=True)
     _t_eval = time.time()
+    # Live-eligible stations first: if Open-Meteo rate-limits mid-scan the paper-only
+    # expansion stations (evaluated last) absorb the failures, never the live ones.
+    from weather.config import LIVE_PAPER_ONLY_STATIONS as _PAPER_ONLY
+    markets = sorted(markets, key=lambda m: (m.station_icao or "").upper() in _PAPER_ONLY)
     signals = [generator.evaluate(m) for m in markets]
     print(f"({time.time() - _t_eval:.0f}s)", end=" ", flush=True)
     # Calibration side channel for every evaluated station market (not just the

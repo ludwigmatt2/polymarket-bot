@@ -263,8 +263,12 @@ class WeatherMarketScanner:
         paper_only = [wm for wm in paper_only
                       if (wm.resolution_date.replace(tzinfo=wm.resolution_date.tzinfo or timezone.utc)
                           - now).total_seconds() < 30 * 3600]
-        self._fetch_books_bulk(live_tier)
-        self._fetch_books_bulk(paper_only, max_workers=2, pause=0.15)
+        # Time-boxed tiers: live first (it places orders), paper-only gets what is
+        # left. Neither may eat the whole scan timeout.
+        skip_live = self._fetch_books_bulk(live_tier, budget_s=240)
+        skip_paper = self._fetch_books_bulk(paper_only, max_workers=2, pause=0.15, budget_s=90)
+        if skip_live or skip_paper:
+            print(f"    book fetch budget hit: skipped live={skip_live} paper-only={skip_paper}")
         near = live_tier + paper_only
         print(f"    tradeable after filters: {len(tradeable)} / {len(parsed)} "
               f"(books: {len(near)} near-term markets in {_time.monotonic() - t0:.0f}s)")
@@ -580,13 +584,22 @@ class WeatherMarketScanner:
         return True
 
     def _fetch_books_bulk(self, markets: list[WeatherMarket], max_workers: int = 8,
-                          pause: float = 0.0) -> None:
+                          pause: float = 0.0, budget_s: float | None = None) -> int:
         """Populate both sides' book fields for `markets` concurrently. Each
         worker thread holds its own ClobClient (requests sessions aren't
         thread-safe); one failed book leaves that market's fields at their
-        defaults — same degradation as the old sequential path."""
+        defaults — same degradation as the old sequential path.
+
+        `budget_s` caps wall-clock time: the SDK shares ONE http2 connection across
+        threads, so a slow /book serialises every worker (Oct 28 stack dump) and an
+        unbounded tier ran past the scan kill-timeout, starving live orders.
+        Markets not reached in time keep their defaults (volume fallback). Returns
+        the number of markets skipped."""
         import concurrent.futures
         import threading
+
+        deadline = _time.monotonic() + budget_s if budget_s else None
+        skipped = [0]
 
         tl = threading.local()
 
@@ -597,6 +610,9 @@ class WeatherMarketScanner:
             return tl.clob
 
         def _one(wm: WeatherMarket) -> None:
+            if deadline is not None and _time.monotonic() > deadline:
+                skipped[0] += 1
+                return
             if pause:
                 _time.sleep(pause)
             summary = self._fetch_book_summary(wm.yes_token_id, _client())
@@ -616,6 +632,7 @@ class WeatherMarketScanner:
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
             list(ex.map(_one, markets))
+        return skipped[0]
 
     def _fetch_book_summary(self, yes_token_id: str, client=None) -> dict:
         """B4: Fetch the live CLOB order book for the YES outcome and extract the
