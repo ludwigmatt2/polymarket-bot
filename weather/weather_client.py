@@ -33,6 +33,41 @@ _RL_COOLDOWN_S = 90.0
 _rl_open_until = 0.0
 
 
+def _budget_path():
+    from .paths import DATA_DIR
+    return DATA_DIR / "cache" / "om_budget.json"
+
+
+def budget_used() -> int:
+    """Open-Meteo calls made today (UTC) across all scan processes."""
+    import json
+    try:
+        d = json.loads(_budget_path().read_text())
+        return int(d["n"]) if d.get("date") == datetime.now(timezone.utc).strftime("%Y-%m-%d") else 0
+    except Exception:  # noqa: BLE001 — missing/corrupt counter == unknown, treat as 0
+        return 0
+
+
+def _budget_add(n: int = 1) -> None:
+    import json
+    import os
+    try:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        p = _budget_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        total = budget_used() + n
+        tmp = p.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"date": today, "n": total}))
+        os.replace(tmp, p)
+    except Exception:  # noqa: BLE001 — accounting must never break a fetch
+        pass
+
+
+def paper_only_budget_exhausted() -> bool:
+    from .config import OPEN_METEO_DAILY_BUDGET, OPEN_METEO_PAPER_ONLY_SHARE
+    return budget_used() >= OPEN_METEO_DAILY_BUDGET * OPEN_METEO_PAPER_ONLY_SHARE
+
+
 def _get_with_retry(url: str, params: dict, timeout: float) -> requests.Response:
     """GET with growing-backoff retries on 429 — Open-Meteo's free tier
     rate-limits per minute; one scan evaluates hundreds of bucket markets and
@@ -44,11 +79,13 @@ def _get_with_retry(url: str, params: dict, timeout: float) -> requests.Response
     if time.monotonic() < _rl_open_until:
         raise requests.exceptions.HTTPError("429 Client Error: Too Many Requests (rate-limit cooldown)")
     r = requests.get(url, params=params, timeout=timeout)
+    _budget_add()
     for delay in _RETRY_DELAYS_S:
         if r.status_code != 429:
             break
         time.sleep(delay)
         r = requests.get(url, params=params, timeout=timeout)
+        _budget_add()
     if r.status_code == 429:
         _rl_open_until = time.monotonic() + _RL_COOLDOWN_S
     r.raise_for_status()

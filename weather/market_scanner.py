@@ -243,6 +243,9 @@ class WeatherMarketScanner:
                 }], _ALARM_FIELDS)
 
         tradeable = self._filter_tradeable(parsed)
+        from .config import SKIP_MIN_TEMP_MARKETS
+        if SKIP_MIN_TEMP_MARKETS:
+            tradeable = [wm for wm in tradeable if wm.metric != "temperature_2m_min"]
         # Fetch live CLOB books only for NEAR-TERM markets (entry ≤48h out or the
         # kept past-endDate event-day ones) — that's where entries actually happen
         # and where Gates 5/5.5 need executable quotes. Far-dated ladders keep the

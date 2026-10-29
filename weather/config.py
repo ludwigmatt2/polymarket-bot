@@ -274,6 +274,15 @@ OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 # Source for Phase 1 historical-skill / MOS error stats. Retained back to ~Jan 2024.
 OPEN_METEO_PREVIOUS_RUNS_URL = "https://previous-runs-api.open-meteo.com/v1/forecast"
 OPEN_METEO_REQUEST_TIMEOUT = 15  # seconds
+# Open-Meteo free tier: ~10k weighted calls/day, reset 00:00 UTC. The 48-station
+# expansion exhausted it by ~19:00 UTC (Oct 28) and every scan afterwards lost its
+# forecasts. Count calls per UTC day; once usage passes the paper-only share, only
+# live-eligible stations may fetch — the rest of the budget is reserved for them.
+OPEN_METEO_DAILY_BUDGET = int(os.environ.get("OPEN_METEO_DAILY_BUDGET", "9000"))
+OPEN_METEO_PAPER_ONLY_SHARE = float(os.environ.get("OPEN_METEO_PAPER_ONLY_SHARE", "0.5"))
+# Min-temp markets are live-excluded (structural airport-vs-grid bias) and cost forecast
+# calls for no live benefit — not scanned at all while set. Kill switch: env =0.
+SKIP_MIN_TEMP_MARKETS = os.environ.get("SKIP_MIN_TEMP_MARKETS", "1") != "0"
 
 # ── Phase 1 — Historical skill / MOS correction ────────────────────────────────
 # Minimum forecast-error observations in a (city, lead, month) cell before the MOS

@@ -111,6 +111,12 @@ def run_scan(
     # expansion stations (evaluated last) absorb the failures, never the live ones.
     from weather.config import LIVE_PAPER_ONLY_STATIONS as _PAPER_ONLY
     markets = sorted(markets, key=lambda m: (m.station_icao or "").upper() in _PAPER_ONLY)
+    from weather.weather_client import budget_used, paper_only_budget_exhausted
+    if paper_only_budget_exhausted():
+        _n0 = len(markets)
+        markets = [m for m in markets if (m.station_icao or "").upper() not in _PAPER_ONLY]
+        print(f"[om-budget] {budget_used()} calls today — skipped {_n0 - len(markets)} paper-only market(s)",
+              end=" ", flush=True)
     signals = [generator.evaluate(m) for m in markets]
     print(f"({time.time() - _t_eval:.0f}s)", end=" ", flush=True)
     # Calibration side channel for every evaluated station market (not just the
