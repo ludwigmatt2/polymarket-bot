@@ -48,19 +48,43 @@ def budget_used() -> int:
         return 0
 
 
-def _budget_add(n: int = 1) -> None:
+def _endpoint_label(url: str) -> str:
+    """'https://ensemble-api.open-meteo.com/v1/ensemble' -> 'ensemble-api/v1/ensemble'."""
+    from urllib.parse import urlparse
+    u = urlparse(url)
+    return f"{u.netloc.split('.open-meteo')[0]}{u.path}"
+
+
+def _budget_add(n: int = 1, url: str = "") -> None:
     import json
     import os
     try:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         p = _budget_path()
         p.parent.mkdir(parents=True, exist_ok=True)
-        total = budget_used() + n
+        try:
+            d = json.loads(p.read_text())
+        except Exception:  # noqa: BLE001
+            d = {}
+        if d.get("date") != today:
+            d = {"date": today, "n": 0, "by": {}}
+        d["n"] = int(d.get("n", 0)) + n
+        if url:
+            by = d.setdefault("by", {})
+            k = _endpoint_label(url)
+            by[k] = int(by.get(k, 0)) + n
         tmp = p.with_suffix(f".{os.getpid()}.tmp")
-        tmp.write_text(json.dumps({"date": today, "n": total}))
+        tmp.write_text(json.dumps(d))
         os.replace(tmp, p)
     except Exception:  # noqa: BLE001 — accounting must never break a fetch
         pass
+
+
+def _om_get(url: str, **kw):
+    """requests.get that is counted against the daily Open-Meteo budget."""
+    r = requests.get(url, **kw)
+    _budget_add(url=url)
+    return r
 
 
 def paper_only_budget_exhausted() -> bool:
@@ -79,13 +103,13 @@ def _get_with_retry(url: str, params: dict, timeout: float) -> requests.Response
     if time.monotonic() < _rl_open_until:
         raise requests.exceptions.HTTPError("429 Client Error: Too Many Requests (rate-limit cooldown)")
     r = requests.get(url, params=params, timeout=timeout)
-    _budget_add()
+    _budget_add(url=url)
     for delay in _RETRY_DELAYS_S:
         if r.status_code != 429:
             break
         time.sleep(delay)
         r = requests.get(url, params=params, timeout=timeout)
-        _budget_add()
+        _budget_add(url=url)
     if r.status_code == 429:
         _rl_open_until = time.monotonic() + _RL_COOLDOWN_S
     r.raise_for_status()
@@ -549,7 +573,7 @@ class WeatherClient:
             "timezone": location.timezone,
         }
         try:
-            r = requests.get(OPEN_METEO_ARCHIVE_URL, params=params, timeout=OPEN_METEO_REQUEST_TIMEOUT)
+            r = _om_get(OPEN_METEO_ARCHIVE_URL, params=params, timeout=OPEN_METEO_REQUEST_TIMEOUT)
             r.raise_for_status()
             data = r.json()
             values = data.get("daily", {}).get(metric, [None])
@@ -577,7 +601,7 @@ class WeatherClient:
             "timezone": location.timezone,
         }
         try:
-            r = requests.get(OPEN_METEO_ARCHIVE_URL, params=params, timeout=OPEN_METEO_REQUEST_TIMEOUT)
+            r = _om_get(OPEN_METEO_ARCHIVE_URL, params=params, timeout=OPEN_METEO_REQUEST_TIMEOUT)
             r.raise_for_status()
             vals = r.json().get("daily", {}).get(metric, [])
             return [float(v) for v in vals if v is not None]
@@ -670,7 +694,7 @@ class WeatherClient:
             "forecast_days": forecast_days,
             "timezone": location.timezone,
         }
-        r = requests.get(OPEN_METEO_ENSEMBLE_URL, params=params, timeout=OPEN_METEO_REQUEST_TIMEOUT)
+        r = _om_get(OPEN_METEO_ENSEMBLE_URL, params=params, timeout=OPEN_METEO_REQUEST_TIMEOUT)
         r.raise_for_status()
         daily = r.json().get("daily", {})
         times = daily.get("time", [])
@@ -720,7 +744,7 @@ class WeatherClient:
                     "end_date": hist_end_month.isoformat(),
                     "daily": metric, "timezone": location.timezone,
                 }
-                r = requests.get(OPEN_METEO_ARCHIVE_URL, params=params_full,
+                r = _om_get(OPEN_METEO_ARCHIVE_URL, params=params_full,
                                  timeout=OPEN_METEO_REQUEST_TIMEOUT)
                 r.raise_for_status()
                 vals = r.json().get("daily", {}).get(metric, [])
@@ -809,7 +833,7 @@ def _geocode_cached(city_name: str) -> Location | None:
     """Cached geocoding — avoids repeated API calls for the same city."""
     params = {"name": city_name, "count": 1, "language": "en", "format": "json"}
     try:
-        r = requests.get(OPEN_METEO_GEOCODING_URL, params=params, timeout=10)
+        r = _om_get(OPEN_METEO_GEOCODING_URL, params=params, timeout=10)
         r.raise_for_status()
         results = r.json().get("results", [])
         if not results:

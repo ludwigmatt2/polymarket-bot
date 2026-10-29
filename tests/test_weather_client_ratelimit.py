@@ -48,3 +48,25 @@ def test_budget_counts_calls_and_gates_paper_only(monkeypatch, tmp_path):
     # a stale (yesterday) counter reads as 0
     (tmp_path / "om_budget.json").write_text(json.dumps({"date": "2000-01-01", "n": 99999}))
     assert wc.budget_used() == 0
+
+
+def test_budget_tracks_per_endpoint(monkeypatch, tmp_path):
+    import json
+    monkeypatch.setattr(wc, "_budget_path", lambda: tmp_path / "om_budget.json")
+    monkeypatch.setattr(wc, "_rl_open_until", 0.0)
+
+    class _OK:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(wc.requests, "get", lambda *a, **k: _OK())
+    wc._get_with_retry("https://ensemble-api.open-meteo.com/v1/ensemble", {}, 1)
+    wc._get_with_retry("https://ensemble-api.open-meteo.com/v1/ensemble", {}, 1)
+    wc._get_with_retry("https://api.open-meteo.com/v1/forecast", {}, 1)
+    wc._om_get("https://archive-api.open-meteo.com/v1/archive", params={})
+    d = json.loads((tmp_path / "om_budget.json").read_text())
+    assert d["n"] == 4
+    assert d["by"] == {"ensemble-api/v1/ensemble": 2, "api/v1/forecast": 1,
+                       "archive-api/v1/archive": 1}
