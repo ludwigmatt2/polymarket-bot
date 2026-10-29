@@ -190,8 +190,13 @@ def run_scan(
                     else:
                         print(f"    – {s.market.title[:55]} | skipped (size too small)")
                 except RuntimeError as e:
+                    # Kill switch / gate / creds hard block: stop placing orders but
+                    # let the scan finish (signals file, fan-out, reconcile). Raising
+                    # here failed the whole scan every hour. ORDER_ISSUE keeps the
+                    # (de-duplicated) Telegram alert.
                     print(f"  LIVE HALT: {e}", file=sys.stderr)
-                    raise
+                    print(f"ORDER_ISSUE: LIVE HALT | {e}", file=sys.stderr)
+                    break
                 except Exception as e:
                     # A real order-submission exception (bad signature, allowance,
                     # network, CLOB rejection...) — caught so one bad signal doesn't
@@ -582,6 +587,7 @@ def mode_intraday(scanner, generator, log_dir: Path = DEFAULT_LOG_DIR,
     paper = PaperTrader(log_path=log_dir / "paper_trades.csv")
 
     geoblocked = False
+    live_halted = False
     if live_trader is not None:
         live_trader.reset_scan_commitments()  # fresh in-tick spend budget
         geo = check_geoblock()
@@ -630,7 +636,7 @@ def mode_intraday(scanner, generator, log_dir: Path = DEFAULT_LOG_DIR,
                 print(f"  NEW INTRADAY TRADE: {sig.direction} {wm.title[:60]} "
                       f"@ {sig.entry_price:.3f} edge={sig.edge_pp:.3f} obs={obs}")
             # Live execution — separate, real USDC → live_trades.csv.
-            if live_trader is not None and not geoblocked:
+            if live_trader is not None and not geoblocked and not live_halted:
                 try:
                     result = live_trader.execute_signal(sig)
                     if result and result.get("filled", 0) > 0:
@@ -640,7 +646,8 @@ def mode_intraday(scanner, generator, log_dir: Path = DEFAULT_LOG_DIR,
                     # unfilled/skipped: quiet — retryable next tick.
                 except RuntimeError as e:
                     print(f"  LIVE HALT: {e}", file=sys.stderr)
-                    raise
+                    print(f"ORDER_ISSUE: LIVE HALT | {e}", file=sys.stderr)
+                    live_halted = True  # keep going: exit sims / paper logging still run
                 except Exception as e:
                     # Same swallowed-exception risk the hourly path had (Aug 23
                     # 2026) — tag it so _intraday_scan's alerting catches it.
