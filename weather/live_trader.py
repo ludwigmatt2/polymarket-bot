@@ -20,10 +20,14 @@ from ._io import atomic_write_csv, atomic_write_json
 from .config import (
     DAILY_LOSS_FLOOR_USD,
     DAILY_LOSS_LIMIT_PCT,
+    DAILY_LOSS_MTM,
+    MTM_CACHE_TTL_S,
     EDGE_SAFETY_MARGIN_PP,
     KELLY_FRACTION,
+    LIVE_BLOCKED_STATIONS,
     LIVE_EXCLUDED_METRICS,
     LIVE_GATE_LATCHES,
+    LIVE_MAX_ENTRY_PRICE,
     LIVE_MIN_ENTRY_PRICE,
     LIVE_PAPER_ONLY_STATIONS,
     LIVE_TOPUP_MAX_FILL_FRAC,
@@ -257,6 +261,8 @@ def live_ineligible_reason(market) -> str | None:
     icao = (getattr(market, "station_icao", "") or "").upper()
     if icao in LIVE_PAPER_ONLY_STATIONS:
         return f"paper_only_station:{icao}"
+    if icao in LIVE_BLOCKED_STATIONS:
+        return f"blocked_station:{icao}"
     return None
 
 
@@ -297,6 +303,8 @@ class LiveTrader:
         self._clob_secret = clob_secret
         self._clob_passphrase = clob_passphrase
         self._client: Any = None
+        self._mtm_tokens: dict[tuple[str, str], str] = {}
+        self._mtm_cache: tuple[float, float] | None = None
         # USD committed by orders placed in the current scan. On-chain USDC debits
         # lag the ~seconds between a scan's orders, so fetch_balance() reads stale
         # (too-high) mid-scan; subtracting this from the fetched balance stops a
@@ -442,6 +450,61 @@ class LiveTrader:
                         pass
         return total
 
+    def _position_bid(self, client: Any, market_id: str, direction: str) -> float | None:
+        """Best bid for the held side of a market, or None if it can't be quoted.
+        The token id isn't stored in the trade log, so it is looked up once per
+        market (tokens never change) and cached."""
+        key = (market_id, direction)
+        token_id = self._mtm_tokens.get(key)
+        if not token_id:
+            for t in client.get_market(market_id).get("tokens", []):
+                if str(t.get("outcome", "")).upper() == direction:
+                    token_id = t.get("token_id", "")
+                    break
+            if not token_id:
+                return None
+            self._mtm_tokens[key] = token_id
+        bids = client.get_order_book(token_id).get("bids", [])
+        # An empty bid side is a real quote: nobody will buy, so it is worth 0.
+        return max((float(b["price"]) for b in bids), default=0.0)
+
+    def unrealized_pnl(self) -> float:
+        """Mark-to-market P&L of all open positions: shares x best bid minus cost,
+        less the taker fee that settlement will book (so it is net like daily_pnl).
+        Gains and losses count at 100%. A position that can't be quoted is carried
+        at cost (contributes 0 gross, only its fee) - an outage can never make the
+        kill switch more permissive than the realized-only number."""
+        now = time.monotonic()
+        if self._mtm_cache and now - self._mtm_cache[0] < MTM_CACHE_TTL_S:
+            return self._mtm_cache[1]
+        total = 0.0
+        client = None
+        for row in self._load_open_live_trades():
+            try:
+                shares = float(row.get("filled_size") or 0.0)
+                price = float(row.get("filled_price") or 0.0)
+            except ValueError:
+                continue
+            if shares <= 0 or price <= 0 or row.get("order_status") == "failed":
+                continue
+            cost = shares * price
+            value = cost  # carry at cost unless a quote comes back
+            try:
+                client = client or self._get_client()
+                bid = self._position_bid(client, row.get("market_id", ""), row.get("direction", ""))
+                if bid is not None:
+                    value = shares * bid
+            except Exception as e:  # noqa: BLE001 - any quote failure -> cost basis
+                print(f"  [mtm] no quote for {row.get('market_id', '')[:10]}: {e}", file=sys.stderr)
+            total += (value - cost) - taker_fee_usd(cost, price)
+        self._mtm_cache = (now, total)
+        return total
+
+    def daily_pnl_mtm(self) -> float:
+        """Realized-today (net of fees) + unrealized on open positions, both at 100%.
+        This is what the daily kill switch reads when DAILY_LOSS_MTM is on."""
+        return self.daily_pnl() + self.unrealized_pnl()
+
     def kelly_size_usd(self, signal: Signal) -> float:
         """Quarter-Kelly stake in USD, capped at MAX_LIVE_TRADE_USD. The win
         probability is haircut by EDGE_SAFETY_MARGIN_PP so sizing believes the
@@ -477,10 +540,17 @@ class LiveTrader:
         # is $3.25 — less than a single stake).
         today_pnl = self.daily_pnl()
         loss_limit = max(self.bankroll_usd * DAILY_LOSS_LIMIT_PCT, DAILY_LOSS_FLOOR_USD)
+        # MTM: open positions valued at the live bid count at 100%, up or down.
+        if DAILY_LOSS_MTM:
+            unrealized = self.unrealized_pnl()
+            today_pnl += unrealized
+        else:
+            unrealized = 0.0
         if today_pnl < -loss_limit:
             raise RuntimeError(
-                f"Daily loss limit hit: {today_pnl:.2f} USD (limit {loss_limit:.2f}) "
-                "— halting until tomorrow"
+                f"Daily loss limit hit: {today_pnl:.2f} USD "
+                f"(realized {today_pnl - unrealized:.2f}, unrealized {unrealized:+.2f}; "
+                f"limit {loss_limit:.2f}) — halting until tomorrow"
             )
 
         # Duplicate guard, with a top-up exception: a FAK fills only the book depth
@@ -509,6 +579,9 @@ class LiveTrader:
         # logging these so a tail fix can be proven before we re-enable.
         if signal.entry_price < LIVE_MIN_ENTRY_PRICE:
             self._log_skip(signal, f"below_price_floor:{signal.entry_price:.3f}")
+            return None
+        if signal.entry_price >= LIVE_MAX_ENTRY_PRICE:
+            self._log_skip(signal, f"above_price_ceiling:{signal.entry_price:.3f}")
             return None
 
         # One bin per event: adjacent buckets of the same temperature ladder are

@@ -222,6 +222,69 @@ class TestDailyPnl:
         assert trader.daily_pnl() == pytest.approx(0.0)
 
 
+class TestMarkToMarketKillSwitch:
+    """Oct 29: a $50 realized loss halted the bot while +$33 of open positions were
+    already up. The switch reads realized + unrealized (best bid), both at 100%."""
+
+    @staticmethod
+    def _mtm_client(bids: dict):
+        client = MagicMock()
+        client.get_market.side_effect = lambda mid: {"tokens": [
+            {"outcome": "Yes", "token_id": f"{mid}-Y"}, {"outcome": "No", "token_id": f"{mid}-N"}]}
+        def book(tid):
+            if bids.get(tid) is None:
+                raise RuntimeError("book down")
+            return {"bids": [{"price": str(p)} for p in bids[tid]]}
+        client.get_order_book.side_effect = book
+        return client
+
+    def _setup(self, tmp_path, realized, open_rows):
+        trader = _make_trader(tmp_path, bankroll=500.0)  # limit 50
+        today = datetime.now(timezone.utc).date().isoformat()
+        rows = [{"market_id": "r", "pnl_usd": str(realized), "actual_outcome": "0",
+                 "resolved_at": f"{today}T14:00:00+00:00"}]
+        rows += open_rows
+        _write_live_trades(trader._log_path, rows)
+        return trader
+
+    @staticmethod
+    def _open(mid, direction, shares, price):
+        return {"market_id": mid, "direction": direction, "filled_size": str(shares),
+                "filled_price": str(price), "order_status": "matched",
+                "pnl_usd": "", "actual_outcome": "", "resolved_at": ""}
+
+    def test_unrealized_gain_offsets_realized_loss_at_100pct(self, tmp_path):
+        # -55 realized would halt; +100 shares bought at .20 now bid .60 = +40 (minus fee)
+        trader = self._setup(tmp_path, -55.0, [self._open("m1", "YES", 100, 0.20)])
+        trader._client = self._mtm_client({"m1-Y": [0.58, 0.60]})
+        assert trader.unrealized_pnl() == pytest.approx(40.0 - 0.0 - 20.0 * 0.05 * 0.8, abs=1e-6)
+        # -55 realized + ~39 unrealized = ~-16, inside the $50 limit
+        assert trader.daily_pnl_mtm() == pytest.approx(-55.0 + 40.0 - 0.8, abs=1e-6)
+        assert trader.daily_pnl_mtm() > -50.0
+
+    def test_unrealized_loss_counts_in_full(self, tmp_path):
+        # realized -30 alone is fine; open NO position bid 0 loses its whole $30 cost
+        trader = self._setup(tmp_path, -30.0, [self._open("m1", "NO", 60, 0.50)])
+        trader._client = self._mtm_client({"m1-N": []})
+        with pytest.raises(RuntimeError, match="Daily loss limit hit"):
+            trader.execute_signal(_make_signal())
+
+    def test_quote_failure_falls_back_to_cost_basis(self, tmp_path):
+        trader = self._setup(tmp_path, -55.0, [self._open("m1", "YES", 100, 0.20)])
+        trader._client = self._mtm_client({"m1-Y": None})
+        # no gain credited: outage never rescues a tripped switch
+        assert trader.unrealized_pnl() <= 0.0
+        with pytest.raises(RuntimeError, match="Daily loss limit hit"):
+            trader.execute_signal(_make_signal())
+
+    def test_flag_off_restores_realized_only(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("weather.live_trader.DAILY_LOSS_MTM", False)
+        trader = self._setup(tmp_path, -55.0, [self._open("m1", "YES", 100, 0.20)])
+        trader._client = self._mtm_client({"m1-Y": [0.60]})
+        with pytest.raises(RuntimeError, match="Daily loss limit hit"):
+            trader.execute_signal(_make_signal())
+
+
 class TestKillSwitch:
     def test_kill_switch_halts_on_daily_loss(self, tmp_path):
         """Resolved loss beyond max(5% bankroll, 2x max order) must raise."""
@@ -1279,7 +1342,8 @@ class TestPriceFloor:
     def test_floor_reads_contract_cost_not_market_p(self, tmp_path, monkeypatch):
         """NO pays 1−market_p, so a HIGH market_p is a CHEAP contract. Direction is
         held constant here: NO at market_p 0.90 costs $0.10 and must be blocked,
-        NO at market_p 0.30 costs $0.70 and must trade. A guard that read market_p
+        NO at market_p 0.45 costs $0.55 and must trade (kept under the 0.65 price
+        ceiling). A guard that read market_p
         instead of entry_price would get both backwards."""
         self._floor(monkeypatch)
         trader = _make_trader(tmp_path)
@@ -1290,8 +1354,8 @@ class TestPriceFloor:
         assert cheap_no.entry_price == pytest.approx(0.10)
         assert trader.execute_signal(cheap_no) is None
         rich_no = _make_signal(market_id="mkt_rich_no", direction="NO",
-                               market_p=0.30, model_p=0.05)
-        assert rich_no.entry_price == pytest.approx(0.70)
+                               market_p=0.45, model_p=0.05)
+        assert rich_no.entry_price == pytest.approx(0.55)
         assert trader.execute_signal(rich_no) is not None
 
     def test_zero_floor_disables_the_guard(self, tmp_path, monkeypatch):
@@ -1302,6 +1366,33 @@ class TestPriceFloor:
         assert trader.execute_signal(
             _make_signal(market_id="mkt_cheap", direction="YES", market_p=0.05)
         ) is not None
+
+
+class TestPriceCeilingAndBlockedStations:
+    def test_entry_at_or_above_ceiling_skips_live_order(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        trader._client = _make_mock_client(filled=15.0)
+        trader.reset_scan_commitments()
+        hi = _make_signal(market_id="mkt_hi", direction="NO", market_p=0.28)  # NO ask ~0.72
+        assert hi.entry_price >= 0.65
+        assert trader.execute_signal(hi) is None
+        trader._client.create_and_post_market_order.assert_not_called()
+        rows = list(csv.DictReader(open(tmp_path / "live_order_skips.csv")))
+        assert rows[-1]["reason"].startswith("above_price_ceiling:")
+
+    def test_entry_below_ceiling_still_trades(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        trader._client = _make_mock_client(filled=15.0)
+        trader.reset_scan_commitments()
+        ok = _make_signal(market_id="mkt_ok", direction="YES", market_p=0.45)
+        assert trader.execute_signal(ok) is not None
+
+    def test_blocked_station_is_live_ineligible(self):
+        from weather.live_trader import live_ineligible_reason
+        m = MagicMock(); m.metric = "temperature_2m_max"; m.station_icao = "rksi"
+        assert live_ineligible_reason(m) == "blocked_station:RKSI"
+        m.station_icao = "KLGA"
+        assert live_ineligible_reason(m) is None
 
 
 class TestPriceFloorOnExecutableAsk:

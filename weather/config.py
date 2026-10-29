@@ -197,6 +197,16 @@ DAILY_LOSS_LIMIT_PCT = 0.05
 # $25 cap); pinned explicitly so raising MAX_LIVE_TRADE_USD to $50 (Oct 25) did not
 # silently double the daily loss allowance to $100.
 DAILY_LOSS_FLOOR_USD = float(os.environ.get("DAILY_LOSS_FLOOR_USD", "50.0"))
+# Mark-to-market kill switch (Oct 29): the day's P&L = realized-today + unrealized on
+# every open position valued at the CLOB best bid (what it would sell for now), gains
+# and losses both counted at 100%. Oct 29: London NO lost $50 realized while +$33 of
+# open positions were already up, so a realized-only switch halted a day that was
+# really ~-$18. Any quote failure falls back to cost basis (unrealized = 0), never
+# to a more permissive number. DAILY_LOSS_MTM=0 restores realized-only.
+DAILY_LOSS_MTM = os.environ.get("DAILY_LOSS_MTM", "1") != "0"
+# Seconds to reuse the open-position marks within one process (a scan can call
+# execute_signal dozens of times; the book doesn't need re-fetching for each).
+MTM_CACHE_TTL_S = float(os.environ.get("MTM_CACHE_TTL_S", "60"))
 # Top-up: a FAK only fills the depth under its price cap, so thin books leave
 # positions far below their Kelly target. A later scan may buy the shortfall when
 # the existing stake is under this fraction of the current target.
@@ -365,6 +375,22 @@ LIVE_PAPER_ONLY_STATIONS = (
 # forward is scripts/price_floor_gate.py — it does not answer before n>=250
 # AND 6 weeks elapsed from its 2026-09-30 lock. 0.0 = no floor at all.
 LIVE_MIN_ENTRY_PRICE = 0.05
+# Price CEILING (Oct 29 backtest, docs in session): entries >= 0.65 are the only band
+# with no edge in all three samples -- live n=26 -77$ (London NO @0.72 = -50$ alone),
+# paper n=18 -15.7%/$ after fee; the model says 75-90% there and realizes 50-67%, and
+# a win pays 0.20-0.35 vs 0.65-0.80 at risk. 0.60-0.65 is positive in both samples so
+# the line is 0.65, not 0.60. Gates on Signal.entry_price (the executable ask).
+# Live-only: paper keeps logging. Env-overridable; 1.0 = no ceiling.
+LIVE_MAX_ENTRY_PRICE = float(os.environ.get("LIVE_MAX_ENTRY_PRICE", "0.65"))
+# Stations that never trade live (paper keeps recording). Seoul/Incheon RKSI went
+# 0-for-10 live while paper wins 13/25 at the same market -- a live-only resolution
+# or station mismatch; blocked until traced. Env override replaces the default;
+# empty string = none.
+_blocked_env = os.environ.get("LIVE_BLOCKED_STATIONS")
+LIVE_BLOCKED_STATIONS = (
+    frozenset({"RKSI"}) if _blocked_env is None
+    else frozenset(x.strip().upper() for x in _blocked_env.split(",") if x.strip())
+)
 
 # ── Lead-time skill decay ──────────────────────────────────────────────────────
 LEAD_TIME_DECAY_PER_DAY = 0.05   # Shrink model_p 5% per day beyond day-1 toward 0.5
