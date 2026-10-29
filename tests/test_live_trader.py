@@ -277,6 +277,20 @@ class TestMarkToMarketKillSwitch:
         with pytest.raises(RuntimeError, match="Daily loss limit hit"):
             trader.execute_signal(_make_signal())
 
+    def test_position_past_resolution_is_carried_at_cost_not_zero(self, tmp_path):
+        """Oct 29 regression: after the resolution time the book is empty, and an
+        empty bid side was marked worthless -> winners booked as total losses."""
+        past = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+        future = (datetime.now(timezone.utc) + timedelta(hours=20)).isoformat()
+        won = self._open("m1", "YES", 100, 0.20); won["resolution_date"] = past
+        live = self._open("m2", "YES", 100, 0.20); live["resolution_date"] = future
+        trader = self._setup(tmp_path, 0.0, [won, live])
+        trader._client = self._mtm_client({"m1-Y": [], "m2-Y": [0.30]})
+        # m1: no quote used (cost basis, fee only); m2: marked at bid .30 = +10
+        fee = 20.0 * 0.05 * 0.8
+        assert trader.unrealized_pnl() == pytest.approx(10.0 - 2 * fee, abs=1e-6)
+        trader._client.get_order_book.assert_called_once()
+
     def test_flag_off_restores_realized_only(self, monkeypatch, tmp_path):
         monkeypatch.setattr("weather.live_trader.DAILY_LOSS_MTM", False)
         trader = self._setup(tmp_path, -55.0, [self._open("m1", "YES", 100, 0.20)])

@@ -468,6 +468,17 @@ class LiveTrader:
         # An empty bid side is a real quote: nobody will buy, so it is worth 0.
         return max((float(b["price"]) for b in bids), default=0.0)
 
+    @staticmethod
+    def _past_resolution(row: dict) -> bool:
+        raw = row.get("resolution_date") or ""
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) >= dt
+
     def unrealized_pnl(self) -> float:
         """Mark-to-market P&L of all open positions: shares x best bid minus cost,
         less the taker fee that settlement will book (so it is net like daily_pnl).
@@ -489,6 +500,14 @@ class LiveTrader:
                 continue
             cost = shares * price
             value = cost  # carry at cost unless a quote comes back
+            if self._past_resolution(row):
+                # Awaiting settlement: market makers pull their quotes after the
+                # resolution time, so the book is empty/404 and "no bid" reads as
+                # worthless (Oct 29: three winners worth +$168 were marked 0 and
+                # the switch halted at -$157). Outcome is decided but not yet
+                # booked - carry at cost, settlement books it to realized.
+                total += -taker_fee_usd(cost, price)
+                continue
             try:
                 client = client or self._get_client()
                 bid = self._position_bid(client, row.get("market_id", ""), row.get("direction", ""))
