@@ -1409,6 +1409,35 @@ class TestPriceCeilingAndBlockedStations:
         assert live_ineligible_reason(m) is None
 
 
+class TestNegRiskResolvedAtOrderTime:
+    """Oct 30: NYC Nov-1 is neg-risk but the scan's book fetch was skipped, so the
+    market carried the default neg_risk=False -> "invalid POLY_1271 signature"."""
+
+    def _order_neg_risk(self, client):
+        opts = client.create_and_post_market_order.call_args.kwargs["options"]
+        return opts.neg_risk
+
+    def test_clob_value_overrides_stale_scanned_flag(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        trader._client = _make_mock_client(filled=15.0)
+        trader._client.get_neg_risk.return_value = True
+        trader.reset_scan_commitments()
+        sig = _make_signal(market_id="mkt_nr", direction="YES", market_p=0.45)
+        assert sig.market.neg_risk is False
+        assert trader.execute_signal(sig) is not None
+        assert self._order_neg_risk(trader._client) is True
+
+    def test_lookup_failure_falls_back_to_scanned_flag(self, tmp_path):
+        trader = _make_trader(tmp_path)
+        trader._client = _make_mock_client(filled=15.0)
+        trader._client.get_neg_risk.side_effect = RuntimeError("clob down")
+        trader.reset_scan_commitments()
+        sig = _make_signal(market_id="mkt_nr2", direction="YES", market_p=0.45)
+        sig.market.neg_risk = True
+        assert trader.execute_signal(sig) is not None
+        assert self._order_neg_risk(trader._client) is True
+
+
 class TestPriceFloorOnExecutableAsk:
     """After GATE_ON_EXECUTABLE_ASK, Signal.entry_price is the traded side's ASK,
     not the mid. The floor must gate on that — a contract whose mid clears $0.40

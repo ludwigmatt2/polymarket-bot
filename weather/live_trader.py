@@ -739,8 +739,9 @@ class LiveTrader:
         # POLY_1271 "signature does not match order hash" is intermittent; the hash
         # depends on neg_risk/tick_size, so record them per attempt to compare
         # failures against successes (scan_errors.log).
+        neg_risk = self._resolve_neg_risk(client, token_id, signal.market.neg_risk)
         print(f"[order-attempt] {signal.market.market_id[:10]} {signal.direction} "
-              f"neg_risk={signal.market.neg_risk!r} tick={tick_size} "
+              f"neg_risk={neg_risk!r} tick={tick_size} "
               f"cap={price_cap} usd={amount_usd}", file=sys.stderr)
         try:
             # FAK market BUY: fill available depth at/under price_cap immediately,
@@ -752,7 +753,7 @@ class LiveTrader:
                     price=price_cap, order_type=OrderType.FAK,
                 ),
                 options=PartialCreateOrderOptions(
-                    tick_size=tick_size, neg_risk=signal.market.neg_risk
+                    tick_size=tick_size, neg_risk=neg_risk
                 ),
                 order_type=OrderType.FAK,
             )
@@ -1236,6 +1237,25 @@ class LiveTrader:
             clob_passphrase=self._clob_passphrase,
         )
         return self._client
+
+    @staticmethod
+    def _resolve_neg_risk(client: Any, token_id: str, scanned: bool) -> bool:
+        """Authoritative neg_risk for signing. The scanned flag is only as good as
+        the book fetch that set it (it defaults False when that fetch is skipped),
+        and a wrong flag signs against the wrong exchange contract -> "invalid
+        POLY_1271 signature". Ask the CLOB (cached by the SDK); fall back to the
+        scanned value only if the lookup fails."""
+        try:
+            live = client.get_neg_risk(token_id)
+        except Exception as e:  # noqa: BLE001 - keep the scanned value
+            print(f"  [neg_risk] lookup failed ({e}); using scanned={scanned!r}", file=sys.stderr)
+            return bool(scanned)
+        if not isinstance(live, bool):
+            return bool(scanned)
+        if live != bool(scanned):
+            print(f"  [neg_risk] scanned={scanned!r} but CLOB says {live!r} - using CLOB",
+                  file=sys.stderr)
+        return live
 
     def _log_skip(self, signal: Signal, reason: str) -> None:
         """Record a qualifying signal that never reached the book (execute_signal

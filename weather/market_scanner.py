@@ -174,6 +174,14 @@ class _GammaMarket:
         self.no_token_id: str = token_ids[1] if len(token_ids) > 1 else ""
         # Minimum tick size required by PartialCreateOrderOptions (must be a string literal)
         self.tick_size: str = _normalize_tick(market.get("orderPriceMinTickSize")) or "0.01"
+        # Neg-risk markets are signed against a different exchange contract; a wrong
+        # flag gives "invalid POLY_1271 signature: signature does not match order
+        # hash". The book fetch refines this, but it is skipped/fails under rate
+        # limits - then the WeatherMarket default (False) used to win (Oct 30).
+        self.neg_risk: bool = bool(
+            market.get("negRisk") or market.get("negativeRisk")
+            or event.get("negRisk") or event.get("enableNegRisk")
+        )
 
 
 _GAMMA_SEARCH_URL = "https://gamma-api.polymarket.com/public-search"
@@ -505,6 +513,7 @@ class WeatherMarketScanner:
             yes_token_id=m.yes_token_id,
             no_token_id=m.no_token_id,
             tick_size=m.tick_size,
+            neg_risk=m.neg_risk,
             station_icao=station_icao,
             station_country=station_country,
             resolve_unit=resolve_unit,
