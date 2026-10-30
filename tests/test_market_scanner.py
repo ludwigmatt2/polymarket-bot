@@ -70,6 +70,79 @@ class TestBookDepthAttached:
         scanner._clob_client = mock_client
         assert scanner._fetch_book_summary("yes-token-123") == {}
 
+    @staticmethod
+    def _api_exc(status):
+        """Stand-in for the SDK's PolyApiException (only `.status_code` is read;
+        status None = socket-level failure). Not imported: other tests stub the SDK
+        module in sys.modules."""
+        class _PolyApiException(Exception):
+            status_code = status
+        return _PolyApiException("boom")
+
+    def test_book_fetch_retries_once_on_socket_error_then_succeeds(self):
+        """Errno 11 on the SDK's shared http2 connection surfaces as a PolyApiException
+        with status_code None; one retry must recover the real book (incl. neg_risk)."""
+        scanner = _make_scanner_with_geocode()
+        client = MagicMock()
+        client.get_order_book.side_effect = [
+            self._api_exc(None),
+            {"asks": [{"price": "0.55", "size": "100"}], "neg_risk": True},
+        ]
+        scanner._clob_client = client
+        with patch("weather.market_scanner._time.sleep") as sleep:
+            summary = scanner._fetch_book_summary("tok")
+        assert client.get_order_book.call_count == 2
+        sleep.assert_called_once()
+        assert summary["neg_risk"] is True and abs(summary["depth_usd"] - 55.0) < 0.01
+
+    def test_book_fetch_retries_on_5xx(self):
+        scanner = _make_scanner_with_geocode()
+        client = MagicMock()
+        client.get_order_book.side_effect = [self._api_exc(502), {"asks": []}]
+        scanner._clob_client = client
+        with patch("weather.market_scanner._time.sleep"):
+            assert scanner._fetch_book_summary("tok") == {"depth_usd": 0.0}
+        assert client.get_order_book.call_count == 2
+
+    def test_book_fetch_does_not_retry_404(self):
+        scanner = _make_scanner_with_geocode()
+        client = MagicMock()
+        client.get_order_book.side_effect = self._api_exc(404)
+        scanner._clob_client = client
+        with patch("weather.market_scanner._time.sleep") as sleep:
+            assert scanner._fetch_book_summary("tok") == {}
+        assert client.get_order_book.call_count == 1
+        sleep.assert_not_called()
+
+    def test_book_fetch_gives_up_after_one_retry_and_logs(self, caplog):
+        scanner = _make_scanner_with_geocode()
+        client = MagicMock()
+        client.get_order_book.side_effect = self._api_exc(None)
+        scanner._clob_client = client
+        with patch("weather.market_scanner._time.sleep"), \
+                caplog.at_level("WARNING", logger="weather.market_scanner"):
+            assert scanner._fetch_book_summary("0123456789abcdef") == {}
+        assert client.get_order_book.call_count == 2  # 1 try + 1 retry, no more
+        assert "book fetch failed token=0123456789ab after 2 attempt(s)" in caplog.text
+
+    def test_book_fetch_404_is_not_warned(self, caplog):
+        scanner = _make_scanner_with_geocode()
+        client = MagicMock()
+        client.get_order_book.side_effect = self._api_exc(404)
+        scanner._clob_client = client
+        with caplog.at_level("WARNING", logger="weather.market_scanner"):
+            scanner._fetch_book_summary("tok")
+        assert caplog.text == ""
+
+    def test_unexpected_parse_error_is_logged_not_silent(self, caplog):
+        scanner = _make_scanner_with_geocode()
+        client = MagicMock()
+        client.get_order_book.return_value = {"asks": [{"price": "x", "size": "1"}]}
+        scanner._clob_client = client
+        with caplog.at_level("WARNING", logger="weather.market_scanner"):
+            assert scanner._fetch_book_summary("tok") == {}
+        assert "book summary failed" in caplog.text
+
     def test_fetch_book_summary_computes_ask_side_usd(self):
         scanner = _make_scanner_with_geocode()
         mock_client = MagicMock()

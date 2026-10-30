@@ -664,7 +664,9 @@ class WeatherMarketScanner:
                     from py_clob_client_v2 import ClobClient
                     self._clob_client = ClobClient(host="https://clob.polymarket.com", chain_id=137)
                 client = self._clob_client
-            ob = client.get_order_book(yes_token_id)
+            ob = self._get_order_book_retrying(client, yes_token_id)
+            if ob is None:
+                return {}
             asks = ob.get("asks", [])
             bids = ob.get("bids", [])
             depth_usd = sum(float(a["price"]) * float(a["size"]) for a in asks) if asks else 0.0
@@ -684,8 +686,39 @@ class WeatherMarketScanner:
             if "neg_risk" in ob:
                 summary["neg_risk"] = bool(ob["neg_risk"])
             return summary
-        except Exception:
+        except Exception as e:  # noqa: BLE001 - a bad book must not break the scan
+            _log.warning("book summary failed token=%s: %r", str(yes_token_id)[:12], e)
             return {}
+
+    @staticmethod
+    def _is_transient_book_error(exc: Exception) -> bool:
+        """Worth one retry: no HTTP status (socket-level failure, e.g. Errno 11 on
+        the SDK's shared HTTP/2 connection) or a 5xx. A 404 is a market whose book
+        is gone — retrying only adds load."""
+        status = getattr(exc, "status_code", None)
+        return status is None or 500 <= status < 600
+
+    def _get_order_book_retrying(self, client, token_id: str, *, retries: int = 1,
+                                 backoff_s: float = 0.2) -> dict | None:
+        """get_order_book with one retry on transient errors. The SDK shares ONE
+        http2 connection across threads and drops ~0.3% of /book calls with
+        [Errno 11]; a failed book silently left depth=0 / neg_risk=False defaults.
+        Returns None (after logging) when the book is unavailable."""
+        for attempt in range(retries + 1):
+            try:
+                return client.get_order_book(token_id)
+            except Exception as e:  # noqa: BLE001
+                if attempt < retries and self._is_transient_book_error(e):
+                    _time.sleep(backoff_s)
+                    continue
+                status = getattr(e, "status_code", None)
+                if status == 404:
+                    _log.debug("no book for token=%s (404)", str(token_id)[:12])
+                else:
+                    _log.warning("book fetch failed token=%s after %d attempt(s): %r",
+                                 str(token_id)[:12], attempt + 1, e)
+                return None
+        return None
 
     def _extract_location(self, title: str) -> Location | None:
         """Try to find a city name in the title and geocode it."""
